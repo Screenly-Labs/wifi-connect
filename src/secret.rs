@@ -25,11 +25,6 @@ impl Secret {
     pub fn expose(&self) -> &str {
         &self.0
     }
-
-    /// Length without revealing the value, for validation messages.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
 }
 
 impl fmt::Debug for Secret {

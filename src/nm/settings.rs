@@ -60,7 +60,7 @@ pub fn ap_settings(p: &ApProfile) -> Settings<'_> {
     let mut wireless: HashMap<&str, Value<'_>> = HashMap::new();
     // `ssid` is `ay` — a byte array, NOT a string. Passing `s` here is the
     // single most common way to get InvalidProperty back from NM.
-    wireless.insert("ssid", Value::from(p.ssid.to_vec()));
+    wireless.insert("ssid", Value::from(p.ssid.as_bytes().to_vec()));
     wireless.insert("mode", Value::from("ap"));
     // 2.4 GHz: every phone has it, and it avoids the regulatory-domain and
     // DFS complications that make 5 GHz AP mode fragile on embedded radios.

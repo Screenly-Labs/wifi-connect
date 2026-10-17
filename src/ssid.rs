@@ -24,10 +24,6 @@ impl Ssid {
         &self.0
     }
 
-    pub fn to_vec(&self) -> Vec<u8> {
-        self.0.clone()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

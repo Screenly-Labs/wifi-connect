@@ -25,7 +25,7 @@ use nmrs::{ConnectionError, NetworkManager, WifiSecurity};
 use tracing::{debug, info, warn};
 
 use super::proxies::{DeviceProxy, DeviceWirelessProxy, WIFI_MODE_AP};
-use super::security::{self, Security};
+use super::security;
 use super::settings::{ApProfile, ap_settings};
 use super::{
     ApConfig, ApHandle, Connectivity, DeviceInfo, JoinFailure, JoinOutcome, JoinRequest,
@@ -88,6 +88,86 @@ impl NmrsControl {
         };
 
         (capabilities, mode, driver)
+    }
+
+    /// Join a network whose SSID is not broadcast.
+    ///
+    /// Built by hand because nmrs's `connect` family cannot set
+    /// `802-11-wireless.hidden`, without which the supplicant never sends a
+    /// directed probe and the association never completes.
+    ///
+    /// The tradeoff is weaker failure reporting: `add_and_activate_connection`
+    /// returns once activation has *started*, not once it has finished, so
+    /// there is no merged device/active-connection signal to read a reason
+    /// from and we can only distinguish success from timeout. Acceptable on
+    /// this path: the user typed the SSID themselves, so they already know
+    /// which network they meant.
+    async fn join_hidden(
+        &self,
+        device: &DeviceInfo,
+        request: &JoinRequest,
+        budget: Duration,
+    ) -> Result<JoinOutcome, NetworkError> {
+        use nmrs::builders::{WifiConnectionBuilder, WifiMode};
+
+        let ssid = request.ssid.to_display_string();
+        let mut builder = WifiConnectionBuilder::new(ssid.clone())
+            .mode(WifiMode::Infrastructure)
+            .hidden(true)
+            .autoconnect(true)
+            .ipv4_auto()
+            .ipv6_auto();
+
+        builder = match (&request.passphrase, &request.identity) {
+            (Some(psk), None) => builder.wpa_psk(psk.expose()),
+            (Some(password), Some(identity)) => builder
+                .try_wpa_eap(nmrs::EapOptions::new(identity.clone(), password.expose()))
+                .map_err(|e| NetworkError::Other(e.to_string()))?,
+            _ => builder.open(),
+        };
+
+        if let Err(e) = self
+            .nm
+            .add_and_activate_connection(builder.build(), Some(&device.interface), None)
+            .await
+        {
+            debug!(error = %e, "hidden network activation failed");
+            return Ok(JoinOutcome::Failed(classify_failure(&e)));
+        }
+
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if self.nm.is_connected(&ssid).await.unwrap_or(false) {
+                return Ok(JoinOutcome::Joined);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(JoinOutcome::Failed(JoinFailure::Timeout));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// Build the credentials nmrs wants from a portal submission.
+fn credentials_for(request: &JoinRequest) -> WifiSecurity {
+    match (&request.passphrase, &request.identity) {
+        (Some(psk), None) => WifiSecurity::WpaPsk {
+            psk: psk.expose().to_string(),
+        },
+        // PEAP/MSCHAPv2 and TTLS/PAP are the 90% of enterprise WiFi.
+        // Certificate-based EAP-TLS needs key and certificate paths that a
+        // captive portal has no way to collect.
+        //
+        // Known limitation, documented in the README: without a
+        // `domain_suffix_match` the supplicant accepts any server
+        // certificate the CA store chains to, so this is not proof against
+        // a determined on-path attacker.
+        (Some(password), Some(identity)) => WifiSecurity::WpaEap {
+            opts: nmrs::EapOptions::new(identity.clone(), password.expose()),
+        },
+        // An identity with no password, or neither: treat as open.
+        // NetworkManager rejects a security section with nothing in it.
+        _ => WifiSecurity::Open,
     }
 }
 
@@ -168,6 +248,24 @@ impl NetworkControl for NmrsControl {
                 interface = %device.interface,
                 "the radio is already in AP mode; a previous run probably crashed"
             );
+        }
+
+        // rfkill. A hardware-blocked radio cannot be turned on in software,
+        // so this has to be its own message: "no access point could be
+        // raised" sends someone hunting a driver bug when the real answer
+        // is a physical switch or a stuck rfkill soft-block.
+        match self.nm.wifi_state().await {
+            Ok(radio) if !radio.hardware_enabled => return Err(NetworkError::RadioBlocked),
+            Ok(radio) if !radio.enabled => {
+                // Soft-blocked, which we are allowed to undo.
+                info!("the WiFi radio is disabled; enabling it");
+                if let Err(e) = self.nm.set_wireless_enabled(true).await {
+                    debug!(error = %e, "could not enable the WiFi radio");
+                    return Err(NetworkError::RadioBlocked);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => debug!(error = %e, "could not read the radio state"),
         }
 
         Ok(DeviceInfo {
@@ -324,32 +422,18 @@ impl NetworkControl for NmrsControl {
     ) -> Result<JoinOutcome, NetworkError> {
         let ssid = request.ssid.to_display_string();
 
-        let credentials = match (&request.passphrase, &request.identity) {
-            (Some(psk), None) => WifiSecurity::WpaPsk {
-                psk: psk.expose().to_string(),
-            },
-            // PEAP/MSCHAPv2 and TTLS/PAP are the 90% of enterprise WiFi.
-            // Certificate-based EAP-TLS needs key and certificate paths
-            // that a captive portal has no way to collect, and is out of
-            // scope: such networks are reported as unsupported rather than
-            // failed at activation.
-            //
-            // Known limitation, documented in the README: without a
-            // `domain_suffix_match` the supplicant will accept any server
-            // certificate the CA store chains to, so PEAP here is not
-            // proof against a determined on-path attacker.
-            (Some(password), Some(identity)) => WifiSecurity::WpaEap {
-                opts: nmrs::EapOptions::new(identity.clone(), password.expose()),
-            },
-            // An identity with no password, or neither: treat as open. NM
-            // rejects a security section with nothing in it.
-            _ => WifiSecurity::Open,
-        };
+        // A hidden network needs `802-11-wireless.hidden = true` in the
+        // profile, or the supplicant never sends a directed probe and the
+        // association simply never completes. nmrs's `connect` family has
+        // no hidden option, so that path builds the profile itself.
+        if request.hidden {
+            return self.join_hidden(device, request, budget).await;
+        }
 
         let attempt = tokio::time::timeout(
             budget,
             self.nm
-                .try_connect(&ssid, Some(&device.interface), credentials),
+                .try_connect(&ssid, Some(&device.interface), credentials_for(request)),
         )
         .await;
 
@@ -413,6 +497,7 @@ impl NetworkControl for NmrsControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nm::security::Security;
 
     /// These three map to genuinely different things a user must do, so
     /// collapsing any of them into "connection failed" loses real

@@ -23,14 +23,6 @@ interface PortalStatus {
   attempts?: number
 }
 
-function readStored(key: string): string | null {
-  try {
-    return localStorage.getItem(key)
-  } catch {
-    return null
-  }
-}
-
 function writeStored(key: string, value: string): void {
   try {
     localStorage.setItem(key, value)
@@ -83,9 +75,12 @@ function initSecurityAwareness(): void {
   if (!(password instanceof HTMLInputElement)) return
 
   const apply = (radio: HTMLInputElement): void => {
-    const security = radio.dataset.security ?? 'wpa-psk'
-    const needsPassphrase = security !== 'open' && security !== 'owe'
-    const needsIdentity = security === 'enterprise'
+    // Server-rendered booleans, decided once in nm::security. Re-deriving
+    // them from the slug here would be a second copy of that rule, and the
+    // two would drift - OWE is encrypted but takes no password, which a
+    // naive check gets wrong.
+    const needsPassphrase = radio.dataset.needsPassphrase !== 'false'
+    const needsIdentity = radio.dataset.needsIdentity === 'true'
 
     password.disabled = !needsPassphrase
     password.required = false

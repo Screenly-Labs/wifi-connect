@@ -117,9 +117,17 @@ fn render_networks(networks: &[WifiNetwork]) -> String {
         // without JavaScript and the common case is one tap.
         let checked = if i == 0 { " checked" } else { "" };
 
+        // The booleans, not just the slug: what a given security type needs
+        // is decided once, in nm::security, and the script reads the answer
+        // rather than re-deriving it from a string. Two copies of that rule
+        // is how OWE ends up prompting for a password that does not exist.
+        let needs_pw = n.security.needs_passphrase();
+        let needs_id = n.security.needs_identity();
+
         out.push_str(&format!(
             "<label class=\"net\">\
-               <input type=\"radio\" name=\"ssid_hex\" value=\"{hex}\" data-security=\"{slug}\" required{checked}>\
+               <input type=\"radio\" name=\"ssid_hex\" value=\"{hex}\" data-security=\"{slug}\" \
+                data-needs-passphrase=\"{needs_pw}\" data-needs-identity=\"{needs_id}\" required{checked}>\
                <span class=\"net__name\">{name}</span>\
                <span class=\"net__meta\">\
                  <span>{label}</span>\

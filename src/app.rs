@@ -295,20 +295,6 @@ async fn portal_loop<N: NetworkControl>(
     }
 }
 
-/// Convenience wrapper used by `main`.
-pub async fn run<N: NetworkControl>(
-    nm: &N,
-    config: &RunConfig,
-    shared: &Shared,
-    joins: mpsc::Receiver<JoinRequest>,
-    cancel: CancellationToken,
-) -> Result<Outcome, NetworkError> {
-    match preflight(nm, config).await? {
-        None => Ok(Outcome::Online),
-        Some(device) => run_portal(nm, &device, config, shared, joins, cancel).await,
-    }
-}
-
 /// Resolve the exit code and log the reason.
 pub fn report(result: &Result<Outcome, NetworkError>) -> i32 {
     match result {

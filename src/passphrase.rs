@@ -96,7 +96,7 @@ mod tests {
         for _ in 0..256 {
             let p = generate();
             assert!(validate(p.expose()).is_ok(), "rejected: {}", p.expose());
-            assert_eq!(p.len(), DEFAULT_LEN);
+            assert_eq!(p.expose().chars().count(), DEFAULT_LEN);
         }
     }
 
