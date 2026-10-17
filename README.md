@@ -33,7 +33,7 @@ things that bit us in production:
 | DHCP / DNS | spawns `dnsmasq` | in-process, no external binaries |
 | Runtime | needs a shell and helpers | one static binary, `FROM scratch`, ~4 MB |
 | Wrong password | frequently just hangs | the portal comes back and says so |
-| Architectures | ARMv6 binary silently dropped in 4.4.6 | every published artifact is executed in CI |
+| Architectures | ARMv6 binary silently dropped in 4.4.6 | amd64, arm64, armv7 **and armv6**, each executed in CI |
 
 The encryption is the headline. A captive portal cannot use TLS — there is
 no publicly trusted certificate for `192.168.42.1`, and a self-signed one
@@ -48,7 +48,7 @@ itself covers DHCP and DNS too, not merely an HTTPS credential POST.
 ```yaml
 services:
   wifi-connect:
-    image: ghcr.io/screenly-labs/wifi-connect:1
+    image: ghcr.io/screenly-labs/wifi-connect:2026.10
     network_mode: host        # required: see docker-compose.balena.yml
     labels:
       io.balena.features.dbus: '1'
@@ -162,7 +162,9 @@ the network and therefore cannot be served over it:
   does not survive Docker's DNAT, and the interface pin that stops us
   serving DHCP on your ethernet LAN has nothing to bind to in a bridge
   namespace.
-- **No ARMv6.** amd64, arm64 and armv7 only.
+- **Architectures:** amd64, arm64, armv7 and armv6. ARMv6 covers the
+  Raspberry Pi 1 and Pi Zero, which is the architecture upstream dropped in
+  v4.4.6 without anyone noticing for three years.
 - **Enterprise WiFi is PEAP/MSCHAPv2 and TTLS/PAP only.** Certificate-based
   EAP-TLS needs key and certificate paths a portal cannot collect. Also note
   that without `domain-suffix-match` the supplicant will accept any server
@@ -180,6 +182,18 @@ protect against a second client that joined the same access point and
 captured the four-way handshake. That is mitigated by the passphrase being
 random per run and the access point being short-lived, but it is a real
 limitation and not a confidentiality boundary between clients.
+
+## Versioning
+
+CalVer, `YYYY.MM.MICRO`, with release tags `vYYYY.MM.MICRO` — the same
+scheme Anthias uses. Semver would imply a compatibility contract this tool
+does not have: there is no library API, and the surface that needs
+stability is the CLI, which is pinned to upstream's flags by the migration
+table above rather than to a major number.
+
+Container tags are `2026.10.0` (exact), `2026.10` (latest patch that month)
+and `latest`. There is deliberately no bare `2026` tag: under CalVer its
+meaning would drift for a whole year while reading like a semver promise.
 
 ## Development
 

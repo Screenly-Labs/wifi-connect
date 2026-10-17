@@ -1,11 +1,14 @@
 [toolchain]
 channel = "1.99"
 components = ["rustfmt", "clippy"]
-# The three release targets. Static musl everywhere: the runtime image is
+# The four release targets. Static musl everywhere: the runtime image is
 # FROM scratch, and a glibc binary there would need a loader, libc.so.6 and
 # version-matched symbols.
 targets = [
   "x86_64-unknown-linux-musl",
   "aarch64-unknown-linux-musl",
   "armv7-unknown-linux-musleabihf",
+  # ARMv6 hard-float: Raspberry Pi 1 and Pi Zero. Upstream silently
+  # dropping this one is a third of the reason this project exists.
+  "arm-unknown-linux-musleabihf",
 ]

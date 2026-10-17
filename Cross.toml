@@ -25,3 +25,8 @@ image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5"
 
 [target.armv7-unknown-linux-musleabihf]
 image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:0.2.5"
+
+# ARMv6 hard-float: Raspberry Pi 1 and Pi Zero. The bare `arm-` triple is
+# the ARMv6 baseline; `armv7-` above is a different, newer target.
+[target.arm-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/arm-unknown-linux-musleabihf:0.2.5"

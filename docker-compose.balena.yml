@@ -7,7 +7,7 @@ version: '2.4' # the balena supervisor speaks compose 2.4, not 3.x
 
 services:
   wifi-connect:
-    image: ghcr.io/screenly-labs/wifi-connect:1
+    image: ghcr.io/screenly-labs/wifi-connect:2026.10
     restart: always
 
     # REQUIRED, and please read this before removing it.

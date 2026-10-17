@@ -99,10 +99,18 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: amd64
+            platform: linux/amd64
           - target: aarch64-unknown-linux-musl
             arch: arm64
+            platform: linux/arm64
           - target: armv7-unknown-linux-musleabihf
             arch: armv7
+            platform: linux/arm/v7
+          # ARMv6: Raspberry Pi 1 and Pi Zero. The bare `arm-` triple is
+          # the ARMv6 baseline, not a typo for `armv7-`.
+          - target: arm-unknown-linux-musleabihf
+            arch: armv6
+            platform: linux/arm/v6
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,7 +139,7 @@ jobs:
           if [ "${{ matrix.arch }}" = "amd64" ]; then
             ./dist/wifi-connect-amd64 --version
           else
-            docker run --rm --platform linux/${{ matrix.arch == 'armv7' && 'arm/v7' || 'arm64' }} \
+            docker run --rm --platform ${{ matrix.platform }} \
               -v "$PWD/dist:/d" --entrypoint /d/wifi-connect-${{ matrix.arch }} \
               docker.io/library/alpine:3.21 --version
           fi
