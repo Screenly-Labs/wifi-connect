@@ -10,18 +10,16 @@
     <meta http-equiv="refresh" content="5" />
     <title>Connecting - {{BRAND_NAME}}</title>
     <script>
-      (function () {
-        var r = document.documentElement;
-        r.className = r.className.replace('no-js', 'has-js');
+      ;(function () {
+        var r = document.documentElement
+        r.className = r.className.replace("no-js", "has-js")
         try {
-          var t = localStorage.getItem('wc-theme');
-          if (t === 'dark' || t === 'light') r.setAttribute('data-theme', t);
+          var t = localStorage.getItem("wc-theme")
+          if (t === "dark" || t === "light") r.setAttribute("data-theme", t)
         } catch (e) {}
-      })();
+      })()
     </script>
-    <style>
-      {{STYLE}}
-    </style>
+    <!--STYLE-->
   </head>
   <body>
     <main class="wrap">
@@ -45,16 +43,16 @@
 
       <div class="card field">
         <p class="sub">
-          Your phone will disconnect from the setup network while this happens.
-          That takes about 30 seconds.
+          Your phone will disconnect from the setup network while this happens. That takes about 30
+          seconds.
         </p>
         <p class="sub">
-          <strong>If this page stops responding, it worked.</strong> Your phone
-          will return to its usual network and the device is now online.
+          <strong>If this page stops responding, it worked.</strong> Your phone will return to its
+          usual network and the device is now online.
         </p>
         <p class="sub">
-          If the setup network reappears, the connection failed. Rejoin it and
-          this page will explain why.
+          If the setup network reappears, the connection failed. Rejoin it and this page will
+          explain why.
         </p>
       </div>
 
@@ -63,8 +61,6 @@
       </footer>
     </main>
 
-    <script>
-      {{SCRIPT}}
-    </script>
+    <!--SCRIPT-->
   </body>
 </html>

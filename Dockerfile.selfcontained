@@ -1,0 +1,26 @@
+# A single-architecture `docker build .` for developers.
+#
+# This is NOT the release path — see Dockerfile, which assembles the
+# multi-arch image from binaries cross-compiled by CI. This one exists so a
+# contributor can build and run the container without CI, on their own
+# architecture only.
+
+FROM rust:1.99-alpine AS builder
+
+# musl-dev provides the libc headers the linker wants; there is no C in the
+# dependency tree, but the linker driver still needs a sysroot.
+RUN apk add --no-cache musl-dev
+
+WORKDIR /src
+COPY . .
+
+# ui/dist is committed, so no bun is needed here. That is the whole reason
+# it is committed: `cargo build` must never require a JavaScript toolchain.
+RUN cargo build --release --locked \
+ && install -D target/release/wifi-connect /out/wifi-connect
+
+FROM scratch
+COPY --from=builder /out/wifi-connect /wifi-connect
+ENV TZ=UTC
+EXPOSE 80/tcp 53/udp 67/udp
+ENTRYPOINT ["/wifi-connect"]

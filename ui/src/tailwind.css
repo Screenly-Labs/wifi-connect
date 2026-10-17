@@ -1,4 +1,10 @@
-@import "tailwindcss";
+/* `source(none)` disables Tailwind v4's automatic source detection, which
+ * otherwise scans the whole project directory on top of the explicit
+ * @source entries below. That swept up stray words from build.ts, the test
+ * file and the generated output, and emitted utilities the portal never
+ * uses - including `.grid`, which quietly broke the "flexbox only"
+ * guarantee the portal relies on for old-WebKit compatibility. */
+@import "tailwindcss" source(none);
 @import "./css/palette.css";
 
 @source "./index.html";
@@ -297,10 +303,18 @@
     opacity: 1;
   }
 
-  .bars > span:nth-child(1) { height: 25%; }
-  .bars > span:nth-child(2) { height: 50%; }
-  .bars > span:nth-child(3) { height: 75%; }
-  .bars > span:nth-child(4) { height: 100%; }
+  .bars > span:nth-child(1) {
+    height: 25%;
+  }
+  .bars > span:nth-child(2) {
+    height: 50%;
+  }
+  .bars > span:nth-child(3) {
+    height: 75%;
+  }
+  .bars > span:nth-child(4) {
+    height: 100%;
+  }
 
   .spinner {
     width: 1.5rem;

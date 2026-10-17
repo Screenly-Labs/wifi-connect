@@ -15,20 +15,18 @@
          exception kills the whole script, taking password show/hide with
          it. The class swap also lets CSS know JS is alive. -->
     <script>
-      (function () {
-        var r = document.documentElement;
-        r.className = r.className.replace('no-js', 'has-js');
+      ;(function () {
+        var r = document.documentElement
+        r.className = r.className.replace("no-js", "has-js")
         try {
-          var t = localStorage.getItem('wc-theme');
-          if (t === 'dark' || t === 'light') r.setAttribute('data-theme', t);
+          var t = localStorage.getItem("wc-theme")
+          if (t === "dark" || t === "light") r.setAttribute("data-theme", t)
         } catch (e) {
           /* no storage in this webview; prefers-color-scheme carries it */
         }
-      })();
+      })()
     </script>
-    <style>
-      {{STYLE}}
-    </style>
+    <!--STYLE-->
   </head>
   <body>
     <main class="wrap">
@@ -63,7 +61,14 @@
 
         <div class="field" id="identity-field" hidden>
           <label for="identity">Username</label>
-          <input id="identity" name="identity" type="text" autocapitalize="none" autocorrect="off" spellcheck="false" />
+          <input
+            id="identity"
+            name="identity"
+            type="text"
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
+          />
           <p class="hint">This network uses enterprise (802.1X) sign-in.</p>
         </div>
 
@@ -87,9 +92,7 @@
               Show
             </button>
           </div>
-          <p class="hint" id="pw-hint">
-            8 to 63 characters. Leave blank for an open network.
-          </p>
+          <p class="hint" id="pw-hint">8 to 63 characters. Leave blank for an open network.</p>
         </div>
 
         <div class="field">
@@ -103,8 +106,6 @@
       </footer>
     </main>
 
-    <script>
-      {{SCRIPT}}
-    </script>
+    <!--SCRIPT-->
   </body>
 </html>

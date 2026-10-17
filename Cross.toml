@@ -1,0 +1,27 @@
+# Cross-compilation for the three release targets.
+#
+# `cross` is chosen over cargo-zigbuild and over native runners for one
+# specific reason: `cross test --target armv7-unknown-linux-musleabihf` runs
+# the test binary under qemu-user. This crate contains hand-written DHCP and
+# DNS wire codecs, and an alignment or byte-order bug there is invisible on
+# x86_64 and fatal on armv7. There is also no hosted armv7 GitHub runner, so
+# a native-runner strategy would need a second mechanism anyway.
+#
+# The images are pinned to the 0.2.5 release tag. Note that `cross` has
+# developed on `main` since 2023; if a target image misbehaves, pin a `main`
+# commit SHA rather than floating.
+
+[build]
+default-target = "x86_64-unknown-linux-musl"
+
+[build.env]
+passthrough = ["RUSTFLAGS", "CARGO_TERM_COLOR", "RUST_LOG"]
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.5"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5"
+
+[target.armv7-unknown-linux-musleabihf]
+image = "ghcr.io/cross-rs/armv7-unknown-linux-musleabihf:0.2.5"

@@ -1,2 +1,197 @@
 # wifi-connect
+
 Minimal tool for joining WiFi networks.
+
+A headless Linux device has a chicken-and-egg problem: it needs WiFi
+credentials, and the only way to give it any is over a network it does not
+have yet. `wifi-connect` solves it the usual way — raise a temporary access
+point, serve a captive portal, take the credentials, join — and then gets
+out of the way.
+
+```
+         ┌── the device ──────────────────────────────┐
+         │  NetworkManager ──► wlan0 192.168.42.1/24  │
+         │                     WPA2/WPA3, AP mode     │
+         │  wifi-connect   ──► udp/67  DHCP           │
+         │                     udp/53  DNS (wildcard) │
+         │                     tcp/80  portal         │
+         └────────────────────────────────────────────┘
+                 ▲ scan the QR on screen to join
+                 │ the portal opens by itself
+            📱 a phone
+```
+
+## What is different from balena's wifi-connect
+
+This is a ground-up replacement, not a fork. The things that differ are the
+things that bit us in production:
+
+| | balena wifi-connect | this |
+|---|---|---|
+| Setup access point | **open by default** | always WPA2/WPA3-encrypted |
+| Getting the passphrase to the user | n/a | a QR code on the device's screen |
+| DHCP / DNS | spawns `dnsmasq` | in-process, no external binaries |
+| Runtime | needs a shell and helpers | one static binary, `FROM scratch`, ~4 MB |
+| Wrong password | frequently just hangs | the portal comes back and says so |
+| Architectures | ARMv6 binary silently dropped in 4.4.6 | every published artifact is executed in CI |
+
+The encryption is the headline. A captive portal cannot use TLS — there is
+no publicly trusted certificate for `192.168.42.1`, and a self-signed one
+makes OS portal detection fail outright instead of degrading — so the
+confidentiality has to come from the link layer. Encrypting the access point
+itself covers DHCP and DNS too, not merely an HTTPS credential POST.
+
+## Quick start
+
+### Docker / balenaOS
+
+```yaml
+services:
+  wifi-connect:
+    image: ghcr.io/screenly-labs/wifi-connect:1
+    network_mode: host        # required: see docker-compose.balena.yml
+    labels:
+      io.balena.features.dbus: '1'
+    environment:
+      DBUS_SYSTEM_BUS_ADDRESS: 'unix:path=/host/run/dbus/system_bus_socket'
+      PORTAL_SSID: 'Device Setup'
+```
+
+### Ubuntu Core
+
+```bash
+sudo snap install wifi-connect
+sudo snap connect wifi-connect:network-manager network-manager:service
+sudo snap start --enable wifi-connect
+```
+
+The `network-manager` interface does **not** auto-connect, so that second
+line is required. For an image you build yourself, declare it in
+`gadget.yaml` instead so it is connected on first boot.
+
+### Debian / Raspberry Pi OS
+
+```bash
+tar xzf wifi-connect-*-aarch64-unknown-linux-musl.tar.gz
+sudo install -m0755 wifi-connect /usr/bin/
+sudo install -m0644 wifi-connect.service /etc/systemd/system/
+sudo install -m0644 wifi-connect.env /etc/default/wifi-connect
+sudo systemctl enable --now wifi-connect
+```
+
+## How it works
+
+1. **Preflight.** Find the WiFi device, confirm NetworkManager manages it,
+   and confirm the adapter can actually do AP mode. Each failure has its own
+   message and exit code, because "it didn't work" is not a bug report.
+2. **Should we even run?** If the device is already online, exit 0. If it
+   has saved WiFi profiles, wait up to 60s for one to come up first —
+   associating plus DHCP plus a probe genuinely takes 15-30s from cold. If
+   it has none, show the portal immediately rather than making a first-boot
+   user stare at nothing for a minute.
+3. **Scan, then raise the access point.** In that order: a radio in AP mode
+   cannot scan.
+4. **Serve the portal.** DHCP hands out leases and advertises the portal via
+   DHCP option 114 (RFC 8910); the wildcard DNS resolver points every name
+   at us so the OS connectivity probe lands here; the HTTP server answers
+   those probes in the way that makes each OS open its sign-in sheet.
+5. **Join.** The browser is answered *before* the access point comes down,
+   because the radio cannot be an AP and a station at once and an unflushed
+   response dies with the client's connection.
+6. **If it fails,** delete the half-made profile, raise the access point
+   again with the same SSID and passphrase so the phone rejoins by itself,
+   and show the user what went wrong.
+
+## Configuration
+
+Every flag has an environment variable. Flags win.
+
+| Flag | Short | Environment | Default |
+|---|---|---|---|
+| `--portal-ssid` | `-s` | `PORTAL_SSID` | `WiFi Connect` |
+| `--portal-passphrase` | `-p` | `PORTAL_PASSPHRASE` | *generated per run* |
+| `--portal-security` | | `WIFI_CONNECT_PORTAL_SECURITY` | `auto` |
+| `--portal-gateway` | `-g` | `PORTAL_GATEWAY` | `192.168.42.1` |
+| `--portal-dhcp-range` | `-d` | `PORTAL_DHCP_RANGE` | `192.168.42.2,192.168.42.254` |
+| `--portal-listening-port` | `-o` | `PORTAL_LISTENING_PORT` | `80` |
+| `--interface` | `-i` | `WIFI_CONNECT_INTERFACE` | auto-detect |
+| `--activity-timeout` | `-a` | `ACTIVITY_TIMEOUT` | `0` (never) |
+| `--ui-directory` | `-u` | `UI_DIRECTORY` | embedded |
+| `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |
+| `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
+| `--force` | | `WIFI_CONNECT_FORCE` | `false` |
+| `--connection-timeout` | | `WIFI_CONNECT_CONNECTION_TIMEOUT` | `45` |
+| `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
+
+### Migrating from balena wifi-connect
+
+All eight of its flags keep working under the same names, short forms and
+environment variables. Two behaviours changed:
+
+- **The access point is now encrypted.** Previously, omitting
+  `--portal-passphrase` gave an *open* network; now it generates one and
+  shows it as a QR code. `--insecure-open-portal` restores the old
+  behaviour, logs a warning, and is not CRA-compliant.
+- **`--ui-directory` is now an override**, not a requirement. The UI is
+  embedded in the binary, so the common deployment failure of the binary
+  not finding a relative `ui/` directory is gone.
+
+`--portal-interface` is accepted as a hidden alias for `--interface`.
+
+## Getting the passphrase to the user
+
+The access point always has a passphrase, so the user needs it before they
+can join. It is rendered **on the device**, since it is what gets you onto
+the network and therefore cannot be served over it:
+
+- `--qr-output <dir>` writes `wifi-connect-qr.svg` plus the raw payload, for
+  a host application to show full-screen. This is the primary path.
+- A Unicode QR is printed to stdout, which a plain HDMI console or a serial
+  terminal renders directly with no host application at all.
+- The SSID and passphrase are logged as text, for operators and for anyone
+  whose scanner refuses.
+
+## Requirements and limitations
+
+- **NetworkManager is required.** This tool drives it; it does not replace it.
+- **The adapter must support AP mode.** Checked up front via NM's
+  `WirelessCapabilities`; known-bad chipsets include BCM43143, MT7601 and
+  RTL8188CUS. Note that some out-of-tree drivers *claim* AP support and then
+  fail to start one — that surfaces as a distinct error message.
+- **Containers need host networking.** DHCP is an L2 broadcast protocol and
+  does not survive Docker's DNAT, and the interface pin that stops us
+  serving DHCP on your ethernet LAN has nothing to bind to in a bridge
+  namespace.
+- **No ARMv6.** amd64, arm64 and armv7 only.
+- **Enterprise WiFi is PEAP/MSCHAPv2 and TTLS/PAP only.** Certificate-based
+  EAP-TLS needs key and certificate paths a portal cannot collect. Also note
+  that without `domain-suffix-match` the supplicant will accept any server
+  certificate its CA store chains to, so PEAP here is not proof against a
+  determined on-path attacker.
+- **No rescan button.** A radio in AP mode cannot scan, so rescanning would
+  mean dropping the access point and disconnecting the user mid-setup. Use
+  the hidden-network field to enter an SSID that did not appear.
+
+### Threat model
+
+The WPA2/WPA3 link protects everything between the phone and the device
+against passive sniffing by anyone not on the access point. It does **not**
+protect against a second client that joined the same access point and
+captured the four-way handshake. That is mitigated by the passphrase being
+random per run and the access point being short-lived, but it is a real
+limitation and not a confidentiality boundary between clients.
+
+## Development
+
+```bash
+cd ui && bun install && bun run build   # the portal; output is committed
+cargo test                              # 166 unit tests, no hardware needed
+cargo clippy --all-targets
+```
+
+`cargo build` never needs bun: `ui/dist` is committed and embedded, and CI
+fails if it has drifted from `ui/src`.
+
+## Licence
+
+Apache-2.0. See [LICENSE](LICENSE).

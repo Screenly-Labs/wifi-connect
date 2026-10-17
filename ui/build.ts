@@ -110,7 +110,12 @@ async function build(): Promise<void> {
 
   for (const page of ['index', 'connecting']) {
     const html = await readFile(join(src, `${page}.html`), 'utf8')
-    const out = html.replace('{{STYLE}}', () => style).replace('{{SCRIPT}}', () => script)
+    // The markers are HTML comments, not {{tokens}} inside <style>/<script>
+    // elements: prettier parses those element bodies as CSS and JS and
+    // would rewrite a bare token into something that no longer matches.
+    const out = html
+      .replace('<!--STYLE-->', () => `<style>\n${style}\n</style>`)
+      .replace('<!--SCRIPT-->', () => `<script>\n${script}\n</script>`)
     await writeFile(join(dist, `${page}.html`), out, 'utf8')
   }
 
