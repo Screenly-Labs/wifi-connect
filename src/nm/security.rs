@@ -1,9 +1,15 @@
-//! Deriving a network's security type from NetworkManager's flag bitfields.
+//! Deciding what credential a network needs.
 //!
-//! Pure, and worth testing hard: the portal asks the user for a password
-//! based on this answer, so getting it wrong means either prompting for a
-//! credential that does not exist or silently building a profile that cannot
-//! associate.
+//! Worth testing hard: the portal asks the user for a password based on this
+//! answer, so getting it wrong means either prompting for a credential that
+//! does not exist or silently building a profile that cannot associate.
+//!
+//! There is exactly **one** classifier, [`classify`], over decoded
+//! [`Features`]. NetworkManager's raw `NM80211ApSecurityFlags` bitfields are
+//! decoded for us by `nmrs`, so this module deliberately does *not* carry a
+//! second decoder: two of them would drift, and the drift would surface as
+//! "WPA3 networks ask for a password twice" on somebody's desk six months
+//! later.
 //!
 //! Three cases are easy to get wrong:
 //!
@@ -11,20 +17,34 @@
 //!   A naive `PRIVACY => ask for a password` check prompts for one that does
 //!   not exist, and the join then fails with no useful explanation.
 //! * **WEP** has no key-management bit of its own. It is only inferrable as
-//!   "the privacy bit is set and *both* the WPA and RSN flags are zero".
+//!   "the privacy bit is set and nothing else is".
 //! * **WPA2/WPA3 transitional** advertises SAE *and* PSK. Joining it as
 //!   `wpa-psk` works with every client; insisting on `sae` does not.
 
-/// `NM80211ApFlags`.
-pub const AP_FLAGS_PRIVACY: u32 = 0x0000_0001;
-
-/// `NM80211ApSecurityFlags`.
-pub const SEC_KEY_MGMT_PSK: u32 = 0x0000_0100;
-pub const SEC_KEY_MGMT_802_1X: u32 = 0x0000_0200;
-pub const SEC_KEY_MGMT_SAE: u32 = 0x0000_0400;
-pub const SEC_KEY_MGMT_OWE: u32 = 0x0000_0800;
-pub const SEC_KEY_MGMT_OWE_TM: u32 = 0x0000_1000;
-pub const SEC_KEY_MGMT_EAP_SUITE_B_192: u32 = 0x0000_2000;
+/// What an access point advertises.
+///
+/// One field per `NM80211ApSecurityFlags` key-management bit that changes
+/// what we must ask the user for, plus the privacy bit from
+/// `NM80211ApFlags`. Ciphers (TKIP, CCMP, WEP40/104) and WPS are
+/// deliberately absent: they affect how an association is negotiated, not
+/// what credential a human has to supply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Features {
+    /// The access point advertises encryption of some kind.
+    pub privacy: bool,
+    /// Pre-shared key: WPA/WPA2-Personal.
+    pub psk: bool,
+    /// 802.1X: enterprise, and the only case needing an identity.
+    pub eap: bool,
+    /// Simultaneous Authentication of Equals: WPA3-Personal.
+    pub sae: bool,
+    /// Opportunistic Wireless Encryption: encrypted, but no credential.
+    pub owe: bool,
+    /// OWE transition mode (an open BSS paired with an OWE one).
+    pub owe_transition: bool,
+    /// WPA3-Enterprise 192-bit.
+    pub eap_suite_b_192: bool,
+}
 
 /// What the portal must ask the user for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -61,28 +81,23 @@ impl Security {
     }
 }
 
-/// Classify an access point from the three bitfields NetworkManager exposes.
-pub fn classify(flags: u32, wpa_flags: u32, rsn_flags: u32) -> Security {
-    let both = wpa_flags | rsn_flags;
-
-    // Enterprise wins the dispatch. An AP offering both 802.1X and PSK is
-    // rare, but if we guessed PSK there we would never ask for the identity
+/// Classify an access point.
+pub fn classify(f: Features) -> Security {
+    // Enterprise wins the dispatch. An access point offering both 802.1X and
+    // PSK is rare, but if we guessed PSK we would never ask for the identity
     // and the association could not complete.
-    if both & (SEC_KEY_MGMT_802_1X | SEC_KEY_MGMT_EAP_SUITE_B_192) != 0 {
+    if f.eap || f.eap_suite_b_192 {
         return Security::Enterprise;
     }
 
-    let sae = both & SEC_KEY_MGMT_SAE != 0;
-    let psk = both & SEC_KEY_MGMT_PSK != 0;
-
-    match (sae, psk) {
+    match (f.sae, f.psk) {
         (true, true) => Security::SaeTransitional,
         (true, false) => Security::Sae,
         (false, true) => Security::WpaPsk,
         (false, false) => {
-            if both & (SEC_KEY_MGMT_OWE | SEC_KEY_MGMT_OWE_TM) != 0 {
+            if f.owe || f.owe_transition {
                 Security::Owe
-            } else if flags & AP_FLAGS_PRIVACY != 0 {
+            } else if f.privacy {
                 // Privacy with no WPA/RSN information element at all.
                 Security::Wep
             } else {
@@ -96,76 +111,93 @@ pub fn classify(flags: u32, wpa_flags: u32, rsn_flags: u32) -> Security {
 mod tests {
     use super::*;
 
+    /// Build `Features` by mutation, so each case names only the bits it
+    /// actually sets.
+    fn f(set: impl Fn(&mut Features)) -> Features {
+        let mut features = Features::default();
+        set(&mut features);
+        features
+    }
+
     #[test]
     fn classification_table() {
-        let cases: &[(&str, u32, u32, u32, Security)] = &[
-            ("open", 0, 0, 0, Security::Open),
-            ("wep", AP_FLAGS_PRIVACY, 0, 0, Security::Wep),
+        let cases: &[(&str, Features, Security)] = &[
+            ("open", f(|_| {}), Security::Open),
             (
-                "wpa2-psk",
-                AP_FLAGS_PRIVACY,
-                0,
-                SEC_KEY_MGMT_PSK,
-                Security::WpaPsk,
+                "wep: privacy and nothing else",
+                f(|x| x.privacy = true),
+                Security::Wep,
             ),
             (
-                "wpa-psk (legacy wpa ie only)",
-                AP_FLAGS_PRIVACY,
-                SEC_KEY_MGMT_PSK,
-                0,
+                "wpa2-psk",
+                f(|x| {
+                    x.privacy = true;
+                    x.psk = true;
+                }),
                 Security::WpaPsk,
             ),
             (
                 "wpa3-sae only",
-                AP_FLAGS_PRIVACY,
-                0,
-                SEC_KEY_MGMT_SAE,
+                f(|x| {
+                    x.privacy = true;
+                    x.sae = true;
+                }),
                 Security::Sae,
             ),
             (
                 "wpa2/wpa3 transitional",
-                AP_FLAGS_PRIVACY,
-                0,
-                SEC_KEY_MGMT_SAE | SEC_KEY_MGMT_PSK,
+                f(|x| {
+                    x.privacy = true;
+                    x.sae = true;
+                    x.psk = true;
+                }),
                 Security::SaeTransitional,
             ),
             (
                 "wpa-enterprise",
-                AP_FLAGS_PRIVACY,
-                0,
-                SEC_KEY_MGMT_802_1X,
+                f(|x| {
+                    x.privacy = true;
+                    x.eap = true;
+                }),
                 Security::Enterprise,
             ),
             (
                 "wpa3-enterprise 192-bit",
-                AP_FLAGS_PRIVACY,
-                0,
-                SEC_KEY_MGMT_EAP_SUITE_B_192,
+                f(|x| {
+                    x.privacy = true;
+                    x.eap_suite_b_192 = true;
+                }),
                 Security::Enterprise,
             ),
             (
                 "802.1x and psk together: enterprise wins",
-                AP_FLAGS_PRIVACY,
-                0,
-                SEC_KEY_MGMT_802_1X | SEC_KEY_MGMT_PSK,
+                f(|x| {
+                    x.privacy = true;
+                    x.eap = true;
+                    x.psk = true;
+                }),
                 Security::Enterprise,
             ),
-            ("owe", AP_FLAGS_PRIVACY, 0, SEC_KEY_MGMT_OWE, Security::Owe),
+            (
+                "owe",
+                f(|x| {
+                    x.privacy = true;
+                    x.owe = true;
+                }),
+                Security::Owe,
+            ),
             (
                 "owe transition mode",
-                AP_FLAGS_PRIVACY,
-                0,
-                SEC_KEY_MGMT_OWE_TM,
+                f(|x| {
+                    x.privacy = true;
+                    x.owe_transition = true;
+                }),
                 Security::Owe,
             ),
         ];
 
-        for (name, flags, wpa, rsn, expected) in cases {
-            assert_eq!(
-                classify(*flags, *wpa, *rsn),
-                *expected,
-                "misclassified {name}"
-            );
+        for (name, features, expected) in cases {
+            assert_eq!(classify(*features), *expected, "misclassified {name}");
         }
     }
 
@@ -173,7 +205,10 @@ mod tests {
     /// is the bug this test exists to prevent.
     #[test]
     fn owe_must_not_prompt_for_a_password() {
-        let s = classify(AP_FLAGS_PRIVACY, 0, SEC_KEY_MGMT_OWE);
+        let s = classify(f(|x| {
+            x.privacy = true;
+            x.owe = true;
+        }));
         assert_eq!(s, Security::Owe);
         assert!(!s.needs_passphrase());
         assert!(!s.needs_identity());
@@ -181,15 +216,17 @@ mod tests {
 
     #[test]
     fn open_networks_prompt_for_nothing() {
-        let s = classify(0, 0, 0);
+        let s = classify(Features::default());
         assert!(!s.needs_passphrase());
         assert!(!s.needs_identity());
     }
 
     #[test]
-    fn enterprise_needs_both_fields() {
-        let s = classify(AP_FLAGS_PRIVACY, 0, SEC_KEY_MGMT_802_1X);
-        assert!(s.needs_passphrase() || s.needs_identity());
+    fn enterprise_needs_an_identity() {
+        let s = classify(f(|x| {
+            x.privacy = true;
+            x.eap = true;
+        }));
         assert!(s.needs_identity());
     }
 
@@ -206,21 +243,18 @@ mod tests {
         }
     }
 
-    /// Without the privacy bit there is no encryption, whatever stray bits
-    /// a vendor sets elsewhere.
+    /// Without the privacy bit there is no encryption at all.
     #[test]
-    fn no_privacy_bit_and_no_key_mgmt_is_open() {
-        assert_eq!(classify(0, 0, 0), Security::Open);
-        assert_eq!(
-            classify(0xffff_0000 & !AP_FLAGS_PRIVACY, 0, 0),
-            Security::Open
-        );
+    fn no_privacy_and_no_key_management_is_open() {
+        assert_eq!(classify(Features::default()), Security::Open);
     }
 
     #[test]
     fn serialises_in_kebab_case_for_the_portal() {
-        let json = serde_json::to_string(&Security::SaeTransitional).unwrap();
-        assert_eq!(json, "\"sae-transitional\"");
+        assert_eq!(
+            serde_json::to_string(&Security::SaeTransitional).unwrap(),
+            "\"sae-transitional\""
+        );
         assert_eq!(
             serde_json::to_string(&Security::WpaPsk).unwrap(),
             "\"wpa-psk\""

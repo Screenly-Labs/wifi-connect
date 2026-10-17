@@ -26,12 +26,9 @@ impl Secret {
         &self.0
     }
 
+    /// Length without revealing the value, for validation messages.
     pub fn len(&self) -> usize {
         self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 }
 

@@ -16,6 +16,9 @@
 //! the reason has to be captured from a merged signal stream. Getting that
 //! wrong is exactly how "the wrong password just hangs" ships.
 
+pub mod fake;
+pub mod nmrs_impl;
+pub mod proxies;
 pub mod security;
 pub mod settings;
 

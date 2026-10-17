@@ -12,11 +12,20 @@ categories = ["command-line-utilities", "network-programming"]
 exclude = ["ui/src", "ui/node_modules", "packaging", ".github"]
 
 [dependencies]
-# NetworkManager over D-Bus. We never depend on zbus/zvariant directly: they
-# come through `nmrs::raw` so there is exactly one zbus in the tree. Two
-# semver-incompatible copies would mean two incompatible Connection types and
-# we could not share a bus connection with nmrs.
+# NetworkManager over D-Bus.
 nmrs = "3.5.7"
+
+# Pinned to the SAME MAJOR as nmrs's own requirement (it asks for ^5.16, and
+# both resolve to one 5.x). That unification is the point: two
+# semver-incompatible zbus copies would mean two incompatible `Connection`
+# types, and the proxies in src/nm/proxies.rs could not be built from nmrs's
+# connection at all. zbus 6.0.0 exists; do not take it until nmrs does.
+#
+# It is a direct dependency rather than reached through `nmrs::raw` because
+# the `#[zbus::proxy]` macro expands to paths rooted at `::zbus`, which only
+# resolve if the crate is named in Cargo.toml. `nmrs::raw::zbus` remains the
+# right way to refer to the *types*.
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 
 async-trait = "0.1.92"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "query", "form", "json"] }
@@ -37,7 +46,7 @@ thiserror = "2.0.21"
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "signal", "sync", "io-util"] }
 tokio-util = "0.7.20"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "tracing-log"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "tracing-log"] }
 uuid = { version = "1.28.0", features = ["v4"] }
 mime_guess = "2.0.5"
 
