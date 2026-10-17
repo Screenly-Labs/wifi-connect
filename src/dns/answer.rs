@@ -199,7 +199,10 @@ mod tests {
     fn malformed_input_is_dropped_silently() {
         assert!(respond(&[], GW).is_none());
         assert!(respond(&[0xff; 3], GW).is_none());
-        assert!(respond(&[0x00; 12], GW).is_none(), "header with no questions");
+        assert!(
+            respond(&[0x00; 12], GW).is_none(),
+            "header with no questions"
+        );
     }
 
     /// A truncated packet claiming more questions than it carries must not
@@ -231,7 +234,10 @@ mod tests {
         let with_rd = query_with_rd("example.com", QTYPE::TYPE(TYPE::A), true);
         let out = respond(&with_rd, GW).unwrap();
         let reply = parse(&out);
-        assert!(reply.has_flags(PacketFlag::RECURSION_DESIRED), "RD must be echoed");
+        assert!(
+            reply.has_flags(PacketFlag::RECURSION_DESIRED),
+            "RD must be echoed"
+        );
         // Never claim recursion: we are not a resolver, and saying we are
         // invites clients to push more exotic queries at us.
         assert!(!reply.has_flags(PacketFlag::RECURSION_AVAILABLE));
@@ -258,7 +264,9 @@ mod tests {
             Name::new("evil.example").unwrap(),
             CLASS::IN,
             9999,
-            RData::A(A { address: 0x0100007f }),
+            RData::A(A {
+                address: 0x0100007f,
+            }),
         ));
         let bytes = p.build_bytes_vec().unwrap();
 

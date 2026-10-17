@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="robots" content="noindex" />
+    <!-- The no-JS poll. The page reloads every five seconds; once the
+         access point comes back (a failed join) this lands on the portal
+         again, carrying the error. -->
+    <meta http-equiv="refresh" content="5" />
+    <title>Connecting - {{BRAND_NAME}}</title>
+    <script>
+      (function () {
+        var r = document.documentElement;
+        r.className = r.className.replace('no-js', 'has-js');
+        try {
+          var t = localStorage.getItem('wc-theme');
+          if (t === 'dark' || t === 'light') r.setAttribute('data-theme', t);
+        } catch (e) {}
+      })();
+    </script>
+    <style>
+      body {
+  margin: 0;
+  padding: 1rem;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  color: #111827;
+  background: #f9fafb;
+}
+.wrap {
+  max-width: 32rem;
+  margin: 0 auto;
+}
+h1 {
+  font-size: 1.25rem;
+}
+fieldset {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  margin: 0 0 1rem;
+}
+label {
+  display: block;
+}
+input[type="text"],
+input[type="password"] {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 44px;
+  font-size: 16px;
+  padding: 0.5rem;
+  border: 1px solid #9ca3af;
+  border-radius: 8px;
+}
+button {
+  min-height: 44px;
+  font-size: 16px;
+  padding: 0.5rem 1rem;
+  border: 0;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #ffffff;
+}
+.net {
+  display: block;
+  min-height: 44px;
+  padding: 0.5rem;
+  border-bottom: 1px solid #e5e7eb;
+}
+.banner {
+  padding: 0.75rem;
+  border: 1px solid #b91c1c;
+  border-radius: 8px;
+  color: #b91c1c;
+  background: #fef2f2;
+  margin-bottom: 1rem;
+}
+@media (prefers-color-scheme: dark) {
+  body {
+    color: #f8fafc;
+    background: #0b1220;
+  }
+  fieldset {
+    border-color: #374151;
+  }
+  input[type="text"],
+  input[type="password"] {
+    color: #f8fafc;
+    background: #1f2937;
+    border-color: #374151;
+  }
+  .net {
+    border-bottom-color: #1f2937;
+  }
+}
+/*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */
+@layer properties{@supports (((-webkit-hyphens:none)) and (not (margin-trim:inline))) or ((-moz-orient:inline) and (not (color:rgb(from red r g b)))){*,:before,:after,::backdrop{--tw-border-style:solid}}}@layer theme{:root,:host{--font-sans:system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;--font-mono:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;--radius-md:.5rem;--radius-lg:.75rem;--default-font-family:var(--font-sans);--default-mono-font-family:var(--font-mono);--color-canvas:var(--c-ink-50);--color-surface:var(--c-white);--color-surface-soft:var(--c-ink-50);--color-surface-raised:var(--c-white);--color-fg:var(--c-ink-900);--color-fg-muted:var(--c-ink-600);--color-fg-faint:var(--c-ink-500);--color-border:var(--a-ink-12);--color-divider:var(--a-ink-08);--color-accent:var(--c-accent-600);--color-accent-hover:var(--c-accent-700);--color-on-accent:var(--c-white);--color-focus-ring:var(--a-accent-45);--color-danger:var(--c-danger-700);--color-danger-wash:var(--c-danger-wash);--color-success:var(--c-success-700);--color-field:var(--c-white);--color-field-border:var(--c-ink-400)}}@layer base{*,:after,:before,::backdrop{box-sizing:border-box;border:0 solid;margin:0;padding:0}::file-selector-button{box-sizing:border-box;border:0 solid;margin:0;padding:0}html,:host{-webkit-text-size-adjust:100%;tab-size:4;line-height:1.5;font-family:var(--default-font-family,-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji");font-feature-settings:var(--default-font-feature-settings,normal);font-variation-settings:var(--default-font-variation-settings,normal);-webkit-tap-highlight-color:transparent}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,samp,pre{font-family:var(--default-mono-font-family,ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);font-feature-settings:var(--default-mono-font-feature-settings,normal);font-variation-settings:var(--default-mono-font-variation-settings,normal);font-size:1em}small{font-size:80%}sub,sup{vertical-align:baseline;font-size:75%;line-height:0;position:relative}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}:-moz-focusring:where(:not(iframe)){outline:auto}progress{vertical-align:baseline}summary{display:list-item}ol,ul,menu{list-style:none}img,svg,video,canvas,audio,iframe,embed,object{vertical-align:middle;display:block}img,video{max-width:100%;height:auto}button,input,select,optgroup,textarea{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}::file-selector-button{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}:where(select:is([multiple],[size])) optgroup{font-weight:bolder}:where(select:is([multiple],[size])) optgroup option{padding-inline-start:20px}::file-selector-button{margin-inline-end:4px}::placeholder{opacity:1}@supports (not ((-webkit-appearance:-apple-pay-button))) or (contain-intrinsic-size:1px){::placeholder{color:currentColor}@supports (color:color-mix(in lab, red, red)){::placeholder{color:color-mix(in oklab, currentcolor 50%, transparent)}}}textarea{resize:vertical}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-date-and-time-value{min-height:1lh;text-align:inherit}::-webkit-datetime-edit{display:inline-flex}::-webkit-datetime-edit-fields-wrapper{padding:0}::-webkit-datetime-edit{padding-block:0}::-webkit-datetime-edit-year-field{padding-block:0}::-webkit-datetime-edit-month-field{padding-block:0}::-webkit-datetime-edit-day-field{padding-block:0}::-webkit-datetime-edit-hour-field{padding-block:0}::-webkit-datetime-edit-minute-field{padding-block:0}::-webkit-datetime-edit-second-field{padding-block:0}::-webkit-datetime-edit-millisecond-field{padding-block:0}::-webkit-datetime-edit-meridiem-field{padding-block:0}::-webkit-calendar-picker-indicator{line-height:1}:-moz-ui-invalid{box-shadow:none}button,input:where([type=button],[type=reset],[type=submit]){appearance:button}::file-selector-button{appearance:button}::-webkit-inner-spin-button{height:auto}::-webkit-outer-spin-button{height:auto}[hidden]:where(:not([hidden=until-found])){display:none!important}html{background:var(--color-canvas)}body{padding:1.5rem max(1rem, env(safe-area-inset-right)) max(1.5rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));font-family:var(--font-sans);color:var(--color-fg);background:var(--color-canvas);-webkit-text-size-adjust:100%;margin:0;font-size:1rem;line-height:1.5}h1{margin:0 0 .25rem;font-size:1.375rem;font-weight:700}:focus-visible{outline:2px solid var(--color-focus-ring);outline-offset:2px}input[type=text],input[type=password]{box-sizing:border-box;width:100%;min-height:2.75rem;font:inherit;color:var(--color-fg);background:var(--color-field);border:1px solid var(--color-field-border);border-radius:var(--radius-md);padding:.625rem .75rem;font-size:1rem}button{font:inherit;cursor:pointer}}@layer components{.wrap{flex-direction:column;gap:1rem;max-width:32rem;margin:0 auto;display:flex}.card{background:var(--color-surface);border:1px solid var(--color-border);border-radius:var(--radius-lg);box-shadow:0 1px 2px var(--a-ink-04)}.hdr{flex-direction:column;gap:.25rem;display:flex}.sub{color:var(--color-fg-muted);margin:0}.banner{color:var(--color-danger);background:var(--color-danger-wash);border:1px solid var(--color-danger);border-radius:var(--radius-md);padding:.75rem 1rem}.nets{border:0;flex-direction:column;margin:0;padding:0;display:flex}.nets>legend{padding:0 0 .5rem;font-weight:600}.net{border-bottom:1px solid var(--color-divider);align-items:center;gap:.75rem;min-height:2.75rem;padding:.625rem 1rem;display:flex}.net:last-of-type{border-bottom:0}.net:has(input:checked){background:var(--color-surface-soft)}.net__name{overflow-wrap:anywhere;flex:auto;min-width:0}.net__meta{color:var(--color-fg-muted);flex:none;align-items:center;gap:.5rem;display:flex}.field{flex-direction:column;gap:.375rem;padding:1rem;display:flex}.field>label{font-weight:600}.hint{color:var(--color-fg-muted);margin:0;font-size:.875rem}.pw{align-items:stretch;gap:.5rem;display:flex}.pw>input{flex:auto}.pw__toggle{min-width:2.75rem;min-height:2.75rem;color:var(--color-fg-muted);background:var(--color-surface-soft);border:1px solid var(--color-field-border);border-radius:var(--radius-md);flex:none;padding:0 .75rem}.btn{width:100%;min-height:2.75rem;color:var(--color-on-accent);background:var(--color-accent);border-radius:var(--radius-md);border:0;padding:.625rem 1rem;font-weight:600;display:block}.btn:hover{background:var(--color-accent-hover)}.foot{color:var(--color-fg-faint);justify-content:space-between;align-items:center;gap:1rem;font-size:.875rem;display:flex}.link-btn{color:var(--color-fg-muted);background:0 0;border:0;min-height:2.75rem;padding:.5rem;text-decoration:underline}.hidden-net{padding:0 1rem 1rem}.hidden-net>summary{min-height:2.75rem;color:var(--color-fg-muted);cursor:pointer;align-items:center;display:flex}.bars{align-items:flex-end;gap:2px;height:1rem;display:inline-flex}.bars>span{background:var(--color-fg-faint);opacity:.25;border-radius:1px;width:3px}.bars>span.on{opacity:1}.bars>span:first-child{height:25%}.bars>span:nth-child(2){height:50%}.bars>span:nth-child(3){height:75%}.bars>span:nth-child(4){height:100%}.spinner{border:3px solid var(--color-border);border-top-color:var(--color-accent);border-radius:50%;width:1.5rem;height:1.5rem;animation:.9s linear infinite spin}@media (prefers-reduced-motion:reduce){.spinner{border-top-color:var(--color-border);animation:none}}@keyframes spin{to{transform:rotate(360deg)}}}@layer utilities{.collapse{visibility:collapse}.block{display:block}.hidden{display:none}.table{display:table}.border{border-style:var(--tw-border-style);border-width:1px}}:root{--c-ink-950:#0b1220;--c-ink-900:#111827;--c-ink-800:#1f2937;--c-ink-700:#374151;--c-ink-600:#4b5563;--c-ink-500:#6b7280;--c-ink-400:#9ca3af;--c-ink-300:#d1d5db;--c-ink-200:#e5e7eb;--c-ink-100:#f3f4f6;--c-ink-50:#f9fafb;--c-white:#fff;--c-accent-700:#1d4ed8;--c-accent-600:#2563eb;--c-accent-500:#3b82f6;--c-accent-400:#60a5fa;--c-accent-300:#93c5fd;--c-danger-700:#b91c1c;--c-danger-400:#f87171;--c-danger-wash:#fef2f2;--c-danger-wash-dark:#2a1215;--c-success-700:#15803d;--c-success-400:#4ade80;--a-ink-04:#1118270a;--a-ink-08:#11182714;--a-ink-12:#1118271f;--a-ink-60:#11182799;--a-white-08:#ffffff14;--a-white-12:#ffffff1f;--a-white-60:#fff9;--a-white-70:#ffffffb3;--a-accent-20:#2563eb33;--a-accent-45:#2563eb73}@supports not (color:rgb(0 0 0 / 0.5)){:root{--color-border:#d1d5db;--color-divider:#e5e7eb;--color-focus-ring:#2563eb}}@property --tw-border-style{syntax:"*";inherits:false;initial-value:solid}@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+color-scheme: dark;
+--color-canvas: var(--c-ink-950);
+--color-surface: var(--c-ink-900);
+--color-surface-soft: var(--c-ink-800);
+--color-surface-raised: var(--c-ink-800);
+--color-fg: #f8fafc;
+--color-fg-muted: var(--c-ink-400);
+--color-fg-faint: var(--c-ink-500);
+--color-border: var(--a-white-12);
+--color-divider: var(--a-white-08);
+--color-accent: var(--c-accent-500);
+--color-accent-hover: var(--c-accent-400);
+--color-on-accent: #0b1220;
+--color-focus-ring: var(--c-accent-400);
+--color-danger: var(--c-danger-400);
+--color-danger-wash: var(--c-danger-wash-dark);
+--color-success: var(--c-success-400);
+--color-field: var(--c-ink-800);
+--color-field-border: var(--a-white-12);
+  }
+}
+:root[data-theme="dark"] {
+color-scheme: dark;
+--color-canvas: var(--c-ink-950);
+--color-surface: var(--c-ink-900);
+--color-surface-soft: var(--c-ink-800);
+--color-surface-raised: var(--c-ink-800);
+--color-fg: #f8fafc;
+--color-fg-muted: var(--c-ink-400);
+--color-fg-faint: var(--c-ink-500);
+--color-border: var(--a-white-12);
+--color-divider: var(--a-white-08);
+--color-accent: var(--c-accent-500);
+--color-accent-hover: var(--c-accent-400);
+--color-on-accent: #0b1220;
+--color-focus-ring: var(--c-accent-400);
+--color-danger: var(--c-danger-400);
+--color-danger-wash: var(--c-danger-wash-dark);
+--color-success: var(--c-success-400);
+--color-field: var(--c-ink-800);
+--color-field-border: var(--a-white-12);
+}
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="hdr">
+        <h1>Connecting to {{SSID}}</h1>
+      </header>
+
+      <!-- This page has to explain BOTH outcomes up front, because we may
+           never get to talk to this browser again. Starting the join tears
+           down the access point the phone is using to read this page, so
+           there is no guarantee any later message reaches it.
+
+           "It stopped responding" is the SUCCESS case, and saying so is
+           what stops a user power-cycling a device that just worked. -->
+      <div class="card field" role="status" aria-live="polite" id="status">
+        <div class="pw">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="status-text">Trying to join {{SSID}}…</span>
+        </div>
+      </div>
+
+      <div class="card field">
+        <p class="sub">
+          Your phone will disconnect from the setup network while this happens.
+          That takes about 30 seconds.
+        </p>
+        <p class="sub">
+          <strong>If this page stops responding, it worked.</strong> Your phone
+          will return to its usual network and the device is now online.
+        </p>
+        <p class="sub">
+          If the setup network reappears, the connection failed. Rejoin it and
+          this page will explain why.
+        </p>
+      </div>
+
+      <footer class="foot">
+        <span>{{BRAND_NAME}}</span>
+      </footer>
+    </main>
+
+    <script>
+      function writeStored(key,value){try{localStorage.setItem(key,value)}catch{}}function resolvedTheme(){let explicit=document.documentElement.getAttribute("data-theme");if(explicit==="light"||explicit==="dark")return explicit;return window.matchMedia?.("(prefers-color-scheme: dark)").matches?"dark":"light"}function initThemeToggle(){let button=document.getElementById("theme-toggle");if(!(button instanceof HTMLButtonElement))return;button.hidden=!1,button.addEventListener("click",()=>{let next=resolvedTheme()==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next),writeStored("wc-theme",next)})}function initPasswordToggle(){let toggle=document.getElementById("pw-toggle"),input=document.getElementById("pw");if(!(toggle instanceof HTMLButtonElement)||!(input instanceof HTMLInputElement))return;toggle.hidden=!1,toggle.addEventListener("click",()=>{let revealed=input.type==="text";input.type=revealed?"password":"text",toggle.textContent=revealed?"Show":"Hide",toggle.setAttribute("aria-pressed",String(!revealed)),input.focus()})}function initSecurityAwareness(){let password=document.getElementById("pw"),identityField=document.getElementById("identity-field");if(!(password instanceof HTMLInputElement))return;let apply=(radio)=>{let security=radio.dataset.security??"wpa-psk",needsPassphrase=security!=="open"&&security!=="owe",needsIdentity=security==="enterprise";if(password.disabled=!needsPassphrase,password.required=!1,!needsPassphrase)password.value="";if(needsPassphrase)password.setAttribute("minlength","8");else password.removeAttribute("minlength");if(identityField instanceof HTMLElement)identityField.hidden=!needsIdentity};for(let el of document.querySelectorAll('input[name="ssid_hex"]')){if(!(el instanceof HTMLInputElement))continue;if(el.addEventListener("change",()=>apply(el)),el.checked)apply(el)}}function initStatusPolling(){let text=document.getElementById("status-text");if(!(text instanceof HTMLElement))return;let poll=async()=>{try{let controller=new AbortController,timer=setTimeout(()=>controller.abort(),3000),response=await fetch("/api/status",{signal:controller.signal,cache:"no-store"});if(clearTimeout(timer),!response.ok)return;let status=await response.json();if(status.state==="failed"&&status.error)text.textContent=status.error,document.getElementById("status")?.setAttribute("role","alert");else if(status.state==="connected")text.textContent=`Connected to ${status.ssid??"the network"}.`}catch{}};poll(),setInterval(()=>void poll(),2000)}function main(){initThemeToggle(),initPasswordToggle(),initSecurityAwareness(),initStatusPolling()}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",main);else main();
+
+    </script>
+  </body>
+</html>

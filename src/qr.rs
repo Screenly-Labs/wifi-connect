@@ -136,8 +136,14 @@ mod tests {
         let pass = Secret::new(r#"pa;ss,wo:rd"q"\z"#);
         let p = wifi_payload(&ssid, &pass, false);
 
-        assert!(p.contains(r#"S:My\;Net\,work\:\"x\"\\y;"#), "ssid not escaped: {p}");
-        assert!(p.contains(r#"P:pa\;ss\,wo\:rd\"q\"\\z;"#), "pass not escaped: {p}");
+        assert!(
+            p.contains(r#"S:My\;Net\,work\:\"x\"\\y;"#),
+            "ssid not escaped: {p}"
+        );
+        assert!(
+            p.contains(r#"P:pa\;ss\,wo\:rd\"q\"\\z;"#),
+            "pass not escaped: {p}"
+        );
     }
 
     #[test]
@@ -158,7 +164,11 @@ mod tests {
         let qr = JoinQr::encode(&payload).unwrap();
 
         let svg = qr.to_svg(256);
-        assert!(svg.contains("<svg"), "not svg: {}", &svg[..40.min(svg.len())]);
+        assert!(
+            svg.contains("<svg"),
+            "not svg: {}",
+            &svg[..40.min(svg.len())]
+        );
         assert!(svg.contains("</svg>"));
 
         let uni = qr.to_unicode();

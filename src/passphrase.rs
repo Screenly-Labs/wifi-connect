@@ -140,6 +140,9 @@ mod tests {
             validate(&"a".repeat(64)).unwrap_err(),
             PassphraseError::TooLong(64)
         );
-        assert_eq!(validate("hunter2\u{1F600}").unwrap_err(), PassphraseError::NotAscii);
+        assert_eq!(
+            validate("hunter2\u{1F600}").unwrap_err(),
+            PassphraseError::NotAscii
+        );
     }
 }

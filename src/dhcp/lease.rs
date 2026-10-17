@@ -82,7 +82,12 @@ impl Leases {
     ///
     /// Order: the address this MAC already has, then the one it asked for,
     /// then the first free one.
-    pub fn offer(&mut self, mac: MacAddr, requested: Option<Ipv4Addr>, now: Instant) -> Option<Ipv4Addr> {
+    pub fn offer(
+        &mut self,
+        mac: MacAddr,
+        requested: Option<Ipv4Addr>,
+        now: Instant,
+    ) -> Option<Ipv4Addr> {
         if let Some(existing) = self.by_mac.get(&mac).copied()
             && self.is_free(existing, now, mac)
         {
@@ -150,7 +155,10 @@ mod tests {
     const B: MacAddr = [0x02, 0, 0, 0, 0, 0x02];
 
     fn pool() -> Leases {
-        Leases::new(Ipv4Addr::new(192, 168, 42, 10), Ipv4Addr::new(192, 168, 42, 12))
+        Leases::new(
+            Ipv4Addr::new(192, 168, 42, 10),
+            Ipv4Addr::new(192, 168, 42, 12),
+        )
     }
 
     #[test]
@@ -214,7 +222,9 @@ mod tests {
         let now = Instant::now();
         for i in 0..3u8 {
             let mac = [0x02, 0, 0, 0, 0, i];
-            let ip = l.offer(mac, None, now).expect("pool should still have room");
+            let ip = l
+                .offer(mac, None, now)
+                .expect("pool should still have room");
             l.commit(mac, ip, now);
         }
         assert_eq!(l.offer([0x02, 0, 0, 0, 0, 0xff], None, now), None);
@@ -233,7 +243,11 @@ mod tests {
             let ip = l.offer(mac, None, t0).expect("pool should still have room");
             l.commit(mac, ip, t0);
         }
-        assert_eq!(l.offer(NEWCOMER, None, t0), None, "pool should be exhausted");
+        assert_eq!(
+            l.offer(NEWCOMER, None, t0),
+            None,
+            "pool should be exhausted"
+        );
 
         // Once every lease has aged out, the addresses come back.
         let later = t0 + LEASE_TIME + Duration::from_secs(1);
@@ -279,7 +293,10 @@ mod tests {
 
     #[test]
     fn an_inverted_range_yields_an_empty_pool() {
-        let mut l = Leases::new(Ipv4Addr::new(192, 168, 42, 200), Ipv4Addr::new(192, 168, 42, 10));
+        let mut l = Leases::new(
+            Ipv4Addr::new(192, 168, 42, 200),
+            Ipv4Addr::new(192, 168, 42, 10),
+        );
         assert_eq!(l.offer(A, None, Instant::now()), None);
     }
 
@@ -291,6 +308,9 @@ mod tests {
         let second = Ipv4Addr::new(192, 168, 42, 11);
         l.commit(A, first, now);
         l.commit(A, second, now);
-        assert!(l.may_use(B, first, now), "the old address should be free again");
+        assert!(
+            l.may_use(B, first, now),
+            "the old address should be free again"
+        );
     }
 }

@@ -1,0 +1,102 @@
+/* Unlayered fallback stylesheet.
+ *
+ * Emitted BEFORE the Tailwind bundle, and deliberately using no @layer, no
+ * custom properties, no oklch and no modern selectors.
+ *
+ * Tailwind v4's output is wrapped in @layer. A browser that does not
+ * understand @layer does not degrade gracefully — it DROPS THE ENTIRE
+ * BLOCK. On an iPhone stuck below iOS 15.4 that would leave a completely
+ * unstyled page: white, full-bleed, 16px-margin, with a password field
+ * somewhere down the bottom. Still usable, but it looks broken, and looking
+ * broken is what makes a user give up on setting the device up at all.
+ *
+ * These forty lines are the insurance. On a modern browser the Tailwind
+ * layer overrides every one of them; on an ancient one they are the whole
+ * design, and the result is plain but deliberate.
+ */
+
+body {
+  margin: 0;
+  padding: 1rem;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  color: #111827;
+  background: #f9fafb;
+}
+
+.wrap {
+  max-width: 32rem;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.25rem;
+}
+
+fieldset {
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  margin: 0 0 1rem;
+}
+
+label {
+  display: block;
+}
+
+input[type="text"],
+input[type="password"] {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 44px;
+  font-size: 16px;
+  padding: 0.5rem;
+  border: 1px solid #9ca3af;
+  border-radius: 8px;
+}
+
+button {
+  min-height: 44px;
+  font-size: 16px;
+  padding: 0.5rem 1rem;
+  border: 0;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #ffffff;
+}
+
+.net {
+  display: block;
+  min-height: 44px;
+  padding: 0.5rem;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.banner {
+  padding: 0.75rem;
+  border: 1px solid #b91c1c;
+  border-radius: 8px;
+  color: #b91c1c;
+  background: #fef2f2;
+  margin-bottom: 1rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    color: #f8fafc;
+    background: #0b1220;
+  }
+  fieldset {
+    border-color: #374151;
+  }
+  input[type="text"],
+  input[type="password"] {
+    color: #f8fafc;
+    background: #1f2937;
+    border-color: #374151;
+  }
+  .net {
+    border-bottom-color: #1f2937;
+  }
+}

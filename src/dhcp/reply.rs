@@ -84,7 +84,9 @@ fn push_common_options(reply: &mut Message, cfg: &ServerConfig, lease_secs: u32)
     // We are the router and the resolver. Both point at us.
     opts.insert(DhcpOption::Router(vec![cfg.gateway]));
     opts.insert(DhcpOption::DomainNameServer(vec![cfg.gateway]));
-    opts.insert(DhcpOption::CaptivePortal(cfg.captive_portal_api_url.clone()));
+    opts.insert(DhcpOption::CaptivePortal(
+        cfg.captive_portal_api_url.clone(),
+    ));
 }
 
 /// Build the response to one DHCP message, or `None` to stay silent.
@@ -308,9 +310,13 @@ mod tests {
         let (c, mut l) = (cfg(), leases());
         let mut req = request(MessageType::Request);
         req.opts_mut()
-            .insert(DhcpOption::ServerIdentifier(Ipv4Addr::new(192, 168, 42, 99)));
+            .insert(DhcpOption::ServerIdentifier(Ipv4Addr::new(
+                192, 168, 42, 99,
+            )));
         req.opts_mut()
-            .insert(DhcpOption::RequestedIpAddress(Ipv4Addr::new(192, 168, 42, 10)));
+            .insert(DhcpOption::RequestedIpAddress(Ipv4Addr::new(
+                192, 168, 42, 10,
+            )));
 
         assert!(respond(&req, &c, &mut l, Instant::now()).is_none());
     }
@@ -344,7 +350,10 @@ mod tests {
         let mut dec = request(MessageType::Decline);
         dec.opts_mut().insert(DhcpOption::RequestedIpAddress(ip));
         assert!(respond(&dec, &c, &mut l, now).is_none());
-        assert!(!l.may_use(CLIENT, ip, now), "declined address must be withdrawn");
+        assert!(
+            !l.may_use(CLIENT, ip, now),
+            "declined address must be withdrawn"
+        );
     }
 
     #[test]

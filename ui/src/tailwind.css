@@ -1,0 +1,336 @@
+@import "tailwindcss";
+@import "./css/palette.css";
+
+@source "./index.html";
+@source "./connecting.html";
+@source "./portal.ts";
+
+@theme {
+  /* MUST come first.
+   *
+   * This clears Tailwind's built-in colour palette, which is the single
+   * most important compatibility decision in this file: that palette is
+   * authored in oklch(), which needs Safari 15.4+. Deleting it means not
+   * one oklch() value reaches the stylesheet, and every colour we ship is
+   * plain hex or sRGB rgb().
+   *
+   * It also means `text-red-600` stays an unknown class, so a component
+   * cannot quietly hardcode a colour instead of naming a role. */
+  --color-*: initial;
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+
+  /* ---- Colour roles (light) --------------------------------------------
+   * These are the ONLY colour names the markup may use, and the only
+   * things --brand-css needs to override to rebrand the portal. */
+  --color-canvas: var(--c-ink-50);
+  --color-surface: var(--c-white);
+  --color-surface-soft: var(--c-ink-50);
+  --color-surface-raised: var(--c-white);
+
+  --color-fg: var(--c-ink-900);
+  --color-fg-muted: var(--c-ink-600);
+  --color-fg-faint: var(--c-ink-500);
+
+  --color-border: var(--a-ink-12);
+  --color-divider: var(--a-ink-08);
+
+  --color-accent: var(--c-accent-600);
+  --color-accent-hover: var(--c-accent-700);
+  --color-on-accent: var(--c-white);
+  --color-focus-ring: var(--a-accent-45);
+
+  --color-danger: var(--c-danger-700);
+  --color-danger-wash: var(--c-danger-wash);
+  --color-success: var(--c-success-700);
+
+  --color-field: var(--c-white);
+  --color-field-border: var(--c-ink-400);
+
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+}
+
+/* Base element styling.
+ *
+ * Deliberately plain CSS rather than utility classes on every element: the
+ * markup stays readable as a document, which is what makes the no-JS and
+ * no-CSS fallbacks legible. */
+@layer base {
+  html {
+    background: var(--color-canvas);
+  }
+
+  body {
+    margin: 0;
+    /* viewport-fit=cover plus these insets keep the submit button clear of
+     * the iPhone home indicator. */
+    padding: 1.5rem max(1rem, env(safe-area-inset-right)) max(1.5rem, env(safe-area-inset-bottom))
+      max(1rem, env(safe-area-inset-left));
+    font-family: var(--font-sans);
+    /* 16px minimum. Below that iOS Safari auto-zooms on focus and the
+     * layout jumps while the user is halfway through a password. */
+    font-size: 1rem;
+    line-height: 1.5;
+    color: var(--color-fg);
+    background: var(--color-canvas);
+    -webkit-text-size-adjust: 100%;
+  }
+
+  h1 {
+    margin: 0 0 0.25rem;
+    font-size: 1.375rem;
+    font-weight: 700;
+  }
+
+  :focus-visible {
+    /* A plain outline rather than ring-*, which is backed by @property. */
+    outline: 2px solid var(--color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  input[type="text"],
+  input[type="password"] {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 2.75rem;
+    padding: 0.625rem 0.75rem;
+    font: inherit;
+    font-size: 1rem;
+    color: var(--color-fg);
+    background: var(--color-field);
+    border: 1px solid var(--color-field-border);
+    border-radius: var(--radius-md);
+  }
+
+  button {
+    font: inherit;
+    cursor: pointer;
+  }
+}
+
+@layer components {
+  .wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    max-width: 32rem;
+    margin: 0 auto;
+  }
+
+  .card {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-lg);
+    /* One plain shadow. Tailwind's shadow-* utilities are composed from
+     * @property-backed custom properties. */
+    box-shadow: 0 1px 2px var(--a-ink-04);
+  }
+
+  .hdr {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .sub {
+    margin: 0;
+    color: var(--color-fg-muted);
+  }
+
+  .banner {
+    padding: 0.75rem 1rem;
+    color: var(--color-danger);
+    background: var(--color-danger-wash);
+    border: 1px solid var(--color-danger);
+    border-radius: var(--radius-md);
+  }
+
+  .nets {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .nets > legend {
+    padding: 0 0 0.5rem;
+    font-weight: 600;
+  }
+
+  /* Each network is a whole-row label wrapping its radio, so the entire
+   * 44px row is the touch target. */
+  .net {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    min-height: 2.75rem;
+    padding: 0.625rem 1rem;
+    border-bottom: 1px solid var(--color-divider);
+  }
+
+  .net:last-of-type {
+    border-bottom: 0;
+  }
+
+  .net:has(input:checked) {
+    background: var(--color-surface-soft);
+  }
+
+  .net__name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .net__meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--color-fg-muted);
+    flex: 0 0 auto;
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+    padding: 1rem;
+  }
+
+  .field > label {
+    font-weight: 600;
+  }
+
+  .hint {
+    margin: 0;
+    font-size: 0.875rem;
+    color: var(--color-fg-muted);
+  }
+
+  .pw {
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+  }
+
+  .pw > input {
+    flex: 1 1 auto;
+  }
+
+  .pw__toggle {
+    flex: 0 0 auto;
+    min-width: 2.75rem;
+    min-height: 2.75rem;
+    padding: 0 0.75rem;
+    color: var(--color-fg-muted);
+    background: var(--color-surface-soft);
+    border: 1px solid var(--color-field-border);
+    border-radius: var(--radius-md);
+  }
+
+  .btn {
+    display: block;
+    width: 100%;
+    min-height: 2.75rem;
+    padding: 0.625rem 1rem;
+    font-weight: 600;
+    color: var(--color-on-accent);
+    background: var(--color-accent);
+    border: 0;
+    border-radius: var(--radius-md);
+  }
+
+  .btn:hover {
+    background: var(--color-accent-hover);
+  }
+
+  .foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    color: var(--color-fg-faint);
+    font-size: 0.875rem;
+  }
+
+  .link-btn {
+    color: var(--color-fg-muted);
+    background: none;
+    border: 0;
+    padding: 0.5rem;
+    min-height: 2.75rem;
+    text-decoration: underline;
+  }
+
+  .hidden-net {
+    padding: 0 1rem 1rem;
+  }
+
+  .hidden-net > summary {
+    min-height: 2.75rem;
+    display: flex;
+    align-items: center;
+    color: var(--color-fg-muted);
+    cursor: pointer;
+  }
+
+  /* Signal bars. Four spans; the lit ones carry .on. Strength is ALSO
+   * announced as text for screen readers and conveyed by the aria-label,
+   * never by colour alone. */
+  .bars {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 1rem;
+  }
+
+  .bars > span {
+    width: 3px;
+    background: var(--color-fg-faint);
+    border-radius: 1px;
+    opacity: 0.25;
+  }
+
+  .bars > span.on {
+    opacity: 1;
+  }
+
+  .bars > span:nth-child(1) { height: 25%; }
+  .bars > span:nth-child(2) { height: 50%; }
+  .bars > span:nth-child(3) { height: 75%; }
+  .bars > span:nth-child(4) { height: 100%; }
+
+  .spinner {
+    width: 1.5rem;
+    height: 1.5rem;
+    border: 3px solid var(--color-border);
+    border-top-color: var(--color-accent);
+    border-radius: 50%;
+    animation: spin 0.9s linear infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spinner {
+      animation: none;
+      border-top-color: var(--color-border);
+    }
+  }
+
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+}
+
+/* A space-separated rgb() is Safari 12.1+. If an engine is older than even
+ * that, fall back to flat hex borders rather than losing them entirely. */
+@supports not (color: rgb(0 0 0 / 0.5)) {
+  :root {
+    --color-border: #d1d5db;
+    --color-divider: #e5e7eb;
+    --color-focus-ring: #2563eb;
+  }
+}

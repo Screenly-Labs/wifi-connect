@@ -1,0 +1,19 @@
+{
+  "name": "wifi-connect-portal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run build.ts",
+    "dev": "bun run build.ts --watch",
+    "test": "bun test",
+    "format:check": "bun x prettier --check 'src/**/*.{ts,css,html}' build.ts",
+    "format:fix": "bun x prettier --write 'src/**/*.{ts,css,html}' build.ts"
+  },
+  "devDependencies": {
+    "@happy-dom/global-registrator": "^21.0.1",
+    "@tailwindcss/cli": "^4.3.3",
+    "happy-dom": "^21.0.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1927,6 +1927,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "ipnet",
+ "mime_guess",
  "nmrs",
  "qrcode",
  "rand",

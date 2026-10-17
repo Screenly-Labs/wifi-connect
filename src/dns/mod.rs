@@ -9,7 +9,6 @@ pub mod answer;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
@@ -20,11 +19,7 @@ use crate::sockets;
 const MAX_DATAGRAM: usize = 512;
 
 /// Serve wildcard DNS on `gateway:53` until `cancel` fires.
-pub async fn serve(
-    gateway: Ipv4Addr,
-    port: u16,
-    cancel: CancellationToken,
-) -> std::io::Result<()> {
+pub async fn serve(gateway: Ipv4Addr, port: u16, cancel: CancellationToken) -> std::io::Result<()> {
     let socket = Arc::new(sockets::bind_udp_retrying(SocketAddr::from((gateway, port))).await?);
     debug!(%gateway, port, "DNS server listening");
 
