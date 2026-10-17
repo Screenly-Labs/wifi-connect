@@ -1,0 +1,54 @@
+[package]
+name = "wifi-connect"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Minimal tool for joining WiFi networks: raises an encrypted setup access point with a captive portal and joins the chosen network via NetworkManager."
+repository = "https://github.com/Screenly-Labs/wifi-connect"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["wifi", "networkmanager", "captive-portal", "provisioning"]
+categories = ["command-line-utilities", "network-programming"]
+exclude = ["ui/src", "ui/node_modules", "packaging", ".github"]
+
+[dependencies]
+# NetworkManager over D-Bus. We never depend on zbus/zvariant directly: they
+# come through `nmrs::raw` so there is exactly one zbus in the tree. Two
+# semver-incompatible copies would mean two incompatible Connection types and
+# we could not share a bus connection with nmrs.
+nmrs = "3.5.7"
+
+async-trait = "0.1.92"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "query", "form", "json"] }
+clap = { version = "4.6.7", features = ["derive", "env", "wrap_help"] }
+dhcproto = "0.15.0"
+hex = "0.4.3"
+ipnet = "2.12.2"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+rand = "0.10.3"
+rust-embed = { version = "8.13.0", features = ["mime-guess", "debug-embed"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+simple-dns = "0.12.0"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.21"
+# current_thread flavour is enough: there is no CPU work here and a single
+# thread keeps RSS down on a Pi Zero-class board.
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "signal", "sync", "io-util"] }
+tokio-util = "0.7.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "tracing-log"] }
+uuid = { version = "1.28.0", features = ["v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio = { version = "1", features = ["rt", "macros", "test-util", "time", "sync"] }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+# A 2 MB binary on an SD card is worth more than a few percent of throughput.
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
