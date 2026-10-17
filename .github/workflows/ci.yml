@@ -115,6 +115,15 @@ jobs:
       - run: cross build --release --locked --target ${{ matrix.target }}
       - run: install -D target/${{ matrix.target }}/release/wifi-connect dist/wifi-connect-${{ matrix.arch }}
 
+      # Registers binfmt handlers so the runner can execute a foreign-arch
+      # binary. Without this the smoke-run below dies with
+      # "exec format error" — running an arm64 container on an amd64 host
+      # still needs emulation; the --platform flag alone does not provide
+      # it. (The release image build needs no QEMU, because it only COPYs
+      # binaries that cross has already produced.)
+      - if: matrix.arch != 'amd64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
       # Upstream shipped an empty ARMv6 container for three years because
       # nothing ever executed the artifact. Prove each one runs.
       - name: the binary executes on its target architecture
