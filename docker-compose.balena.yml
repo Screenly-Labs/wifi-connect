@@ -1,0 +1,60 @@
+# Example balenaOS service block.
+#
+# Copy the service into your own docker-compose.yml; this file is an
+# example, not something to deploy as-is.
+
+version: '2.4' # the balena supervisor speaks compose 2.4, not 3.x
+
+services:
+  wifi-connect:
+    image: ghcr.io/screenly-labs/wifi-connect:2026.10
+    restart: always
+
+    # REQUIRED, and please read this before removing it.
+    #
+    # The access point interface lives in the HOST network namespace, and
+    # two consequences of that are individually fatal to bridge networking:
+    #
+    #   1. DHCP is an L2 broadcast protocol. A DHCPDISCOVER arrives from
+    #      0.0.0.0 addressed to 255.255.255.255, and the DHCPOFFER has to
+    #      reach a client that does not have an IP address yet. Neither
+    #      survives Docker's DNAT-based port publishing.
+    #   2. The DHCP socket is pinned to the WiFi interface with
+    #      SO_BINDTODEVICE so that we can never hand out leases on your
+    #      ethernet LAN. In a bridge namespace that interface is not there
+    #      to bind to.
+    #
+    # Removing this does not give you a hardened portal; it gives you one
+    # where the page loads and no device can ever get an address.
+    network_mode: host
+
+    # Bind-mounts the host D-Bus at /host/run/dbus.
+    labels:
+      io.balena.features.dbus: '1'
+
+    environment:
+      DBUS_SYSTEM_BUS_ADDRESS: 'unix:path=/host/run/dbus/system_bus_socket'
+      PORTAL_SSID: 'Anthias Setup'
+      PORTAL_GATEWAY: '192.168.42.1'
+      PORTAL_DHCP_RANGE: '192.168.42.2,192.168.42.254'
+      ACTIVITY_TIMEOUT: '600'
+      WIFI_CONNECT_BRAND_NAME: 'Anthias'
+      WIFI_CONNECT_LOG_FORMAT: 'json'
+      # Where to write the join QR for the host application to display.
+      WIFI_CONNECT_QR_OUTPUT: '/data/qr'
+
+    volumes:
+      - wifi-connect-qr:/data/qr
+
+    # NOT required. We never configure the interface ourselves —
+    # NetworkManager does, as root, on the host — and SO_BINDTODEVICE has
+    # been unprivileged since Linux 5.7 for a not-yet-bound socket.
+    #
+    # Uncomment only if your kernel denies SO_BINDTODEVICE; the symptom is
+    # the DHCP server failing to start with EPERM.
+    # cap_add:
+    #   - NET_ADMIN
+    #   - NET_RAW
+
+volumes:
+  wifi-connect-qr: {}

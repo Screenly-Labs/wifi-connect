@@ -1,0 +1,17 @@
+/* Served at /brand.css when --brand-css points here.
+ *
+ * Loaded last, so it overrides the role tokens. Override ROLES only --
+ * never the --c-* primitives and never the markup -- and a rebrand cannot
+ * come adrift when the portal's layout changes.
+ */
+:root {
+  --color-accent: #ea4aaa;
+  --color-accent-hover: #d43d98;
+  --color-on-accent: #ffffff;
+  --color-focus-ring: rgb(234 74 170 / 0.45);
+}
+
+:root[data-theme='dark'] {
+  --color-accent: #f472b6;
+  --color-on-accent: #2a0a1c;
+}

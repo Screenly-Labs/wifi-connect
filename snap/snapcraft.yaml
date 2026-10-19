@@ -1,0 +1,112 @@
+name: wifi-connect
+base: core24
+adopt-info: wifi-connect
+summary: Minimal tool for joining WiFi networks
+description: |
+  Raises an encrypted WiFi access point with a captive portal so that a user
+  can pick a network and enter its password. Drives NetworkManager over
+  D-Bus, and serves DHCP, DNS and the portal itself with no external
+  daemons.
+
+  After installation the network-manager interface must be connected by
+  hand, because snapd does not auto-connect it:
+
+      sudo snap connect wifi-connect:network-manager network-manager:service
+      sudo snap start --enable wifi-connect
+
+  On Ubuntu Core, declare the connection in your gadget.yaml instead so it
+  is made on first boot. See docs/snap.md.
+
+grade: stable
+confinement: strict
+license: Apache-2.0
+source-code: https://github.com/Screenly-Labs/wifi-connect
+issues: https://github.com/Screenly-Labs/wifi-connect/issues
+
+# core24 replaces core22's `architectures:` key with `platforms:`.
+#
+# build-on amd64 for every target is legitimate here because the part is a
+# file copy of a binary cross-compiled upstream by `cross` — no compiler
+# runs during the snap build, so there is nothing to emulate.
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+  arm64:
+    build-on: [amd64]
+    build-for: [arm64]
+  armhf:
+    build-on: [amd64]
+    build-for: [armhf]
+
+parts:
+  wifi-connect:
+    # `plugin: nil` with a prebuilt binary rather than `plugin: rust`.
+    # The rust plugin works, but it would mean either native arm builders
+    # or snapcraft remote-build on Launchpad, and a second differently
+    # configured toolchain producing a binary that is not bit-identical to
+    # the one in the OCI image and the .deb.
+    plugin: nil
+    source: .
+    override-build: |
+      craftctl default
+      case "${CRAFT_TARGET_ARCH}" in
+        amd64) BIN=dist/wifi-connect-amd64 ;;
+        arm64) BIN=dist/wifi-connect-arm64 ;;
+        armhf) BIN=dist/wifi-connect-armv7 ;;
+        *) echo "unsupported architecture ${CRAFT_TARGET_ARCH}" >&2; exit 1 ;;
+      esac
+      test -f "${BIN}" || {
+        echo "${BIN} is missing: build it with 'cross build --release' first" >&2
+        exit 1
+      }
+      install -D -m0755 "${BIN}" "${CRAFT_PART_INSTALL}/bin/wifi-connect"
+      craftctl set version="$(git describe --tags --always --dirty | sed 's/^v//')"
+
+apps:
+  wifi-connect:
+    command: bin/wifi-connect
+    daemon: simple
+
+    # Installing the snap must NOT immediately start broadcasting a setup
+    # access point on a device that is already happily online. Starting it
+    # is an explicit act.
+    install-mode: disable
+
+    restart-condition: on-failure
+    restart-delay: 5s
+
+    # The most important line in this file.
+    #
+    # The worst possible moment for snapd to restart the daemon is the
+    # ~15-second window where the access point is down and NetworkManager
+    # is attempting the join. `endure` means a refresh does not restart
+    # us; the new revision takes effect on the next reboot instead.
+    refresh-mode: endure
+
+    plugs:
+      # Auto-connects. Outbound access; cheap to keep even though
+      # connectivity is checked through NetworkManager rather than by
+      # fetching anything ourselves.
+      - network
+      # Auto-connects. Permission to act as a network service, which is
+      # what the DHCP, DNS and portal listeners need. Snaps run as root so
+      # the privileged port numbers themselves are not the issue.
+      - network-bind
+      # Does NOT auto-connect. This is the one that has to be connected by
+      # hand, or declared in a gadget.yaml.
+      - network-manager
+
+    # Deliberately NOT plugged:
+    #
+    #   network-observe       netlink access for enumerating interfaces.
+    #                         Avoided entirely by getting the device list
+    #                         from NetworkManager over D-Bus — a concrete
+    #                         reason to do so, since it deletes a second
+    #                         non-auto-connecting plug from this list.
+    #   network-setup-observe reads /etc/netplan and /etc/network, which are
+    #                         irrelevant on an NM-managed system.
+    #   network-control       grants raw sockets and netns manipulation. We
+    #                         need neither; documented in docs/snap.md as a
+    #                         troubleshooting step if SO_BINDTODEVICE is
+    #                         denied on an older kernel.

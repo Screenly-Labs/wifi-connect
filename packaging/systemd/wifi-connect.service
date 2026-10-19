@@ -1,0 +1,70 @@
+[Unit]
+Description=WiFi Connect captive portal
+Documentation=https://github.com/Screenly-Labs/wifi-connect
+Requires=NetworkManager.service
+After=NetworkManager.service dbus.service
+# Do not race NetworkManager's own startup attempts. If NM can bring up a
+# known network by itself, this unit's connectivity gate exits 0 and the
+# portal never appears — which is the behaviour you want.
+After=NetworkManager-wait-online.service
+
+[Service]
+Type=exec
+EnvironmentFile=-/etc/default/wifi-connect
+ExecStart=/usr/bin/wifi-connect
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+
+# --- Privileges -------------------------------------------------------
+#
+# Runs as root. NetworkManager's D-Bus methods are polkit-gated, and the
+# unprivileged variant needs a polkit rule plus a system user; root with a
+# narrow capability bounding set is the simpler correct default. See
+# docs/debian.md for the non-root setup.
+#
+# CAP_NET_BIND_SERVICE: udp/53, udp/67 and tcp/80.
+# CAP_NET_RAW:          only needed for SO_BINDTODEVICE on kernels older
+#                       than 5.7 (Raspberry Pi OS Buster shipped 4.19 and
+#                       is still in the field). It is in the bounding set so
+#                       it CAN be used, but is not granted ambiently.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+
+# --- Hardening --------------------------------------------------------
+#
+# Connecting to the D-Bus socket under /run/dbus is a connect() against an
+# inode, not a filesystem write, so ProtectSystem=strict does not block it.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Obviously NOT PrivateNetwork=yes.
+#
+# And no IPAddressDeny: the DHCP server has to talk to clients that have no
+# address yet, which no address-based filter can express.
+
+StateDirectory=wifi-connect
+StateDirectoryMode=0755
+ReadWritePaths=/var/lib/wifi-connect
+
+[Install]
+WantedBy=multi-user.target

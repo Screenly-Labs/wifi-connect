@@ -1,0 +1,6 @@
+/target
+/dist
+# The portal's intermediate build products. `ui/dist` is deliberately NOT
+# ignored: it is committed so that `cargo build` never needs bun.
+/ui/node_modules
+/ui/.tmp

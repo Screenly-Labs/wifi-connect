@@ -1,0 +1,42 @@
+# /etc/default/wifi-connect
+#
+# Every setting here has a command-line equivalent; see `wifi-connect --help`.
+# Uncomment what you need.
+
+# Name of the setup access point.
+#PORTAL_SSID="WiFi Connect"
+
+# Passphrase for the setup access point.
+#
+# Leave this unset and one is generated per run and shown as a QR code.
+# That is the recommended setup: it is unique per device and per run, and
+# nobody has to type it. Set it only for a managed fleet where the operator
+# needs to know the passphrase in advance.
+#
+# The access point is encrypted either way — there is no open-AP default.
+#PORTAL_PASSPHRASE=
+
+# Where to write the join QR code (SVG, plus the raw payload as .txt) so a
+# host application can display it on the device's screen.
+#WIFI_CONNECT_QR_OUTPUT=/var/lib/wifi-connect/qr
+
+# Network layout of the setup access point.
+#PORTAL_GATEWAY=192.168.42.1
+#PORTAL_DHCP_RANGE=192.168.42.2,192.168.42.254
+
+# Exit after this many seconds with no successful join. 0 means never.
+#
+# Worth considering for an unattended device: a portal that stays up
+# forever is a standing access point.
+#ACTIVITY_TIMEOUT=0
+
+# Pin the WiFi interface rather than auto-detecting it.
+#WIFI_CONNECT_INTERFACE=wlan0
+
+# Product name shown in the portal, and a CSS file overriding its colour
+# roles. See docs/branding.md.
+#WIFI_CONNECT_BRAND_NAME="WiFi Connect"
+#WIFI_CONNECT_BRAND_CSS=/etc/wifi-connect/brand.css
+
+#WIFI_CONNECT_LOG_LEVEL=info
+#WIFI_CONNECT_LOG_FORMAT=text

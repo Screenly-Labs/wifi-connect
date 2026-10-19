@@ -1,0 +1,85 @@
+# The portal is HTTP-only by design.
+#
+# A captive portal works by intercepting a client's cleartext probe. There is
+# no publicly-trusted certificate for 192.168.42.1, and a self-signed one
+# makes OS portal detection fail outright rather than degrade. Confidentiality
+# comes from the access point itself being WPA2/WPA3-encrypted, which protects
+# DHCP and DNS too — not just an HTTPS credential POST.
+#
+# So no TLS stack belongs in this tree. The realistic way one sneaks in is
+# somebody adding `reqwest` for a connectivity check; `NetworkManager`'s own
+# CheckConnectivity() over D-Bus is both lighter and more correct.
+#
+# aws-lc-rs and ring additionally build C and assembly, which would break the
+# "no C toolchain" premise that makes the musl cross-builds painless.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[[bans.deny]]
+name = "openssl-sys"
+reason = "the portal is HTTP-only by design; no TLS stack belongs here"
+
+[[bans.deny]]
+name = "ring"
+reason = "no TLS stack, and it would add C/asm to the cross-build"
+
+[[bans.deny]]
+name = "aws-lc-sys"
+reason = "no TLS stack, and it needs cmake/bindgen in every cross image"
+
+[[bans.deny]]
+name = "aws-lc-rs"
+reason = "no TLS stack, and it needs cmake/bindgen in every cross image"
+
+[[bans.deny]]
+name = "native-tls"
+reason = "no TLS stack belongs here"
+
+[advisories]
+version = 2
+yanked = "deny"
+
+# The zbus 5 -> 6 restructuring, not abandonment.
+#
+# zbus 6.0.0 absorbed zvariant as its `wire` module and folded in the
+# helper crates, so RUSTSEC marked the standalone 5.x crates unmaintained.
+# These are `unmaintained` notices with no vulnerability behind them.
+#
+# We cannot take zbus 6 yet: nmrs 3.5.7 requires zbus ^5.16, and two
+# semver-incompatible zbus copies would mean two incompatible `Connection`
+# types — the proxies in src/nm/proxies.rs could not then be built from
+# nmrs's own connection, which is the single thing that keeps us to one bus
+# connection.
+#
+# Scoped to these three IDs on purpose. Setting `unmaintained = "allow"`
+# would switch off the check that is meant to catch the next dependency
+# that genuinely rots, which is precisely how the tool this replaces ended
+# up pinned to a 2023 release of an abandoned fork for three years.
+#
+# REMOVE when nmrs moves to zbus 6; re-check on every nmrs bump.
+ignore = [
+  "RUSTSEC-2026-0370", # zvariant
+  "RUSTSEC-2026-0371", # zvariant_derive
+  "RUSTSEC-2026-0372", # zbus_names
+]
+
+[licenses]
+version = 2
+# Exactly the licences the tree actually uses. Allowing more than that is
+# a standing permission for a licence nobody has reviewed to arrive
+# unnoticed; cargo-deny warns about each unmatched entry, which is the
+# signal that this list has drifted.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

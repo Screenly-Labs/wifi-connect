@@ -1,0 +1,53 @@
+/* Dark theme — colour ROLES only.
+ *
+ * The declaration block below is authored ONCE and emitted TWICE by
+ * build.ts, under two different selectors:
+ *
+ *   @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) }
+ *   :root[data-theme="dark"]
+ *
+ * Both arms are mandatory and this is a deliberate divergence from the
+ * Anthias management UI, which drives themes purely from a data-theme
+ * attribute written by a boot script. Anthias can do that because its UI
+ * already requires JavaScript. A captive portal cannot: the page has to look
+ * right with JS disabled, and iOS's Captive Network Assistant has no
+ * localStorage to read a preference out of anyway. The media arm carries
+ * those cases; the attribute arm lets the in-page toggle win in both
+ * directions.
+ *
+ * Maintaining the list twice by hand is how the two arms drift, hence the
+ * single-source-plus-codegen approach.
+ *
+ * Specificity note: Tailwind emits its theme into `:root, :host` (0,1,0), so
+ * a bare [data-theme="dark"] would merely tie and lose on source order.
+ * `:root[data-theme="dark"]` is (0,2,0) and wins outright. Do not
+ * "simplify" that selector.
+ */
+
+/* @dark-roles:start */
+color-scheme: dark;
+
+--color-canvas: var(--c-ink-950);
+--color-surface: var(--c-ink-900);
+--color-surface-soft: var(--c-ink-800);
+--color-surface-raised: var(--c-ink-800);
+
+--color-fg: #f8fafc;
+--color-fg-muted: var(--c-ink-400);
+--color-fg-faint: var(--c-ink-500);
+
+--color-border: var(--a-white-12);
+--color-divider: var(--a-white-08);
+
+--color-accent: var(--c-accent-500);
+--color-accent-hover: var(--c-accent-400);
+--color-on-accent: #0b1220;
+--color-focus-ring: var(--c-accent-400);
+
+--color-danger: var(--c-danger-400);
+--color-danger-wash: var(--c-danger-wash-dark);
+--color-success: var(--c-success-400);
+
+--color-field: var(--c-ink-800);
+--color-field-border: var(--a-white-12);
+/* @dark-roles:end */

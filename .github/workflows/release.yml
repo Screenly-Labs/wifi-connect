@@ -1,0 +1,185 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release
+  packages: write # push to GHCR
+  id-token: write # OIDC, for the attestation
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            platform: linux/arm64
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7
+            platform: linux/arm/v7
+          # ARMv6: Raspberry Pi 1 and Pi Zero. The bare `arm-` triple is
+          # the ARMv6 baseline, not a typo for `armv7-`.
+          - target: arm-unknown-linux-musleabihf
+            arch: armv6
+            platform: linux/arm/v6
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.3"
+      # Rebuilt rather than trusted: a release must not ship whatever
+      # happened to be committed in ui/dist.
+      - run: bun install --frozen-lockfile && bun run build
+        working-directory: ui
+      - run: git diff --exit-code -- ui/dist
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cross
+      - run: cross build --release --locked --target ${{ matrix.target }}
+      - run: install -D target/${{ matrix.target }}/release/wifi-connect dist/wifi-connect-${{ matrix.arch }}
+
+      - name: tarball
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          S="wifi-connect-${V}-${{ matrix.target }}"
+          mkdir -p "$S"
+          install -m0755 dist/wifi-connect-${{ matrix.arch }} "$S/wifi-connect"
+          cp packaging/systemd/wifi-connect.service "$S/"
+          cp packaging/default/wifi-connect "$S/wifi-connect.env"
+          cp LICENSE README.md "$S/"
+          tar -czf "dist/${S}.tar.gz" "$S"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+
+  image:
+    needs: [build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: chmod +x dist/wifi-connect-*
+
+      # No setup-qemu: nothing is emulated. The Dockerfile only COPYs
+      # binaries that `cross` already built.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/screenly-labs/wifi-connect
+          # CalVer, so: 2026.10.0 (exact), 2026.10 (latest patch that
+          # month), latest.
+          #
+          # No bare {{major}}: under CalVer that is `2026`, a tag whose
+          # meaning drifts for a whole year and which reads like a semver
+          # compatibility promise this project does not make. Pin the exact
+          # version or track latest.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v6
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/screenly-labs/wifi-connect
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  snap:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64, armhf]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # snapcraft.yaml derives its version from git describe
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: chmod +x dist/wifi-connect-*
+
+      - uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
+        id: snapcraft
+        with:
+          snapcraft-args: --build-for ${{ matrix.platform }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: snap-${{ matrix.platform }}
+          path: ${{ steps.snapcraft.outputs.snap }}
+
+      # Publishing is gated on the secret existing, so a fork — and the
+      # first few releases, before the store listing exists — still produce
+      # a downloadable .snap rather than failing the run.
+      - name: publish to the snap store
+        if: ${{ env.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40 # v1.2.0
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.snapcraft.outputs.snap }}
+          release: edge
+
+  release:
+    needs: [image, snap]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: dist/*
+          generate_release_notes: true

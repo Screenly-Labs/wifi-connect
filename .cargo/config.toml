@@ -1,0 +1,13 @@
+# Static musl for every release target.
+#
+# The runtime image is `FROM scratch`. A glibc binary there would need a
+# loader, libc.so.6, libgcc_s.so.1 and version-matched symbols; a static
+# musl binary needs nothing at all. It also makes one tarball work across
+# Raspberry Pi OS Buster through Trixie, whose glibc versions span 2.28 to
+# 2.41.
+#
+# This is viable only because there is no C in the dependency tree: zbus is
+# pure Rust over an AF_UNIX socket, and deny.toml keeps every TLS stack out.
+
+[target.'cfg(target_env = "musl")']
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,151 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  ui:
+    name: portal (bun + tailwind)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.3"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('ui/bun.lock') }}
+
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run format:check
+      - run: bun run build
+
+      # The gate that makes committing ui/dist safe.
+      #
+      # ui/dist is committed so that `cargo build` never needs bun — a
+      # build.rs that shelled out to it would break cargo install, the
+      # cross containers and snapcraft's build environment. The cost of
+      # that choice is that the committed output can go stale, so CI
+      # rebuilds it and fails on any difference.
+      - name: ui/dist is in sync with ui/src
+        run: |
+          if ! git diff --exit-code -- dist; then
+            echo "::error::ui/dist is stale. Run 'cd ui && bun run build' and commit the result."
+            exit 1
+          fi
+
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: lint
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+      # Enforces the HTTP-only design: no TLS stack may enter the tree.
+      # See deny.toml for why.
+      - run: cargo deny check bans advisories licenses sources
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: test
+      - run: cargo test --all-features
+
+  # This crate contains hand-written DHCP and DNS wire codecs. An alignment
+  # or byte-order bug there is invisible on x86_64 and fatal on armv7, and
+  # running the tests under qemu-user is the reason `cross` was chosen over
+  # cargo-zigbuild.
+  test-armv7:
+    name: test (armv7 under qemu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cross
+      - run: cross test --target armv7-unknown-linux-musleabihf
+
+  build:
+    needs: [ui]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            platform: linux/arm64
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7
+            platform: linux/arm/v7
+          # ARMv6: Raspberry Pi 1 and Pi Zero. The bare `arm-` triple is
+          # the ARMv6 baseline, not a typo for `armv7-`.
+          - target: arm-unknown-linux-musleabihf
+            arch: armv6
+            platform: linux/arm/v6
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cross
+      - run: cross build --release --locked --target ${{ matrix.target }}
+      - run: install -D target/${{ matrix.target }}/release/wifi-connect dist/wifi-connect-${{ matrix.arch }}
+
+      # Registers binfmt handlers so the runner can execute a foreign-arch
+      # binary. Without this the smoke-run below dies with
+      # "exec format error" — running an arm64 container on an amd64 host
+      # still needs emulation; the --platform flag alone does not provide
+      # it. (The release image build needs no QEMU, because it only COPYs
+      # binaries that cross has already produced.)
+      - if: matrix.arch != 'amd64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      # Upstream shipped an empty ARMv6 container for three years because
+      # nothing ever executed the artifact. Prove each one runs.
+      - name: the binary executes on its target architecture
+        run: |
+          if [ "${{ matrix.arch }}" = "amd64" ]; then
+            ./dist/wifi-connect-amd64 --version
+          else
+            docker run --rm --platform ${{ matrix.platform }} \
+              -v "$PWD/dist:/d" --entrypoint /d/wifi-connect-${{ matrix.arch }} \
+              docker.io/library/alpine:3.21 --version
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-${{ matrix.arch }}
+          path: dist/wifi-connect-${{ matrix.arch }}
+          retention-days: 7

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8" />
+    <!-- viewport-fit=cover pairs with env(safe-area-inset-*) so the submit
+         button clears the iPhone home indicator. No maximum-scale and no
+         user-scalable=no: blocking zoom on a password form is an
+         accessibility failure. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="robots" content="noindex" />
+    <title>{{BRAND_NAME}} setup</title>
+    <!-- Theme boot. Runs before first paint to avoid a flash, and every
+         storage access is wrapped: iOS's Captive Network Assistant has no
+         localStorage and THROWS rather than returning null. Unguarded, that
+         exception kills the whole script, taking password show/hide with
+         it. The class swap also lets CSS know JS is alive. -->
+    <script>
+      ;(function () {
+        var r = document.documentElement
+        r.className = r.className.replace("no-js", "has-js")
+        try {
+          var t = localStorage.getItem("wc-theme")
+          if (t === "dark" || t === "light") r.setAttribute("data-theme", t)
+        } catch (e) {
+          /* no storage in this webview; prefers-color-scheme carries it */
+        }
+      })()
+    </script>
+    <!--STYLE-->
+  </head>
+  <body>
+    <main class="wrap">
+      <header class="hdr">
+        <h1>{{BRAND_NAME}}</h1>
+        <p class="sub">Choose a WiFi network for this device.</p>
+      </header>
+
+      {{BANNER}}
+
+      <!-- A real form. Everything below works with JavaScript disabled;
+           portal.ts only enhances it. -->
+      <form class="card" method="post" action="/connect">
+        <fieldset class="nets">
+          <legend class="field">Available networks</legend>
+          {{NETWORKS}}
+        </fieldset>
+
+        <details class="hidden-net">
+          <summary>Join a hidden network</summary>
+          <label for="hidden-ssid">Network name</label>
+          <input
+            id="hidden-ssid"
+            name="ssid"
+            type="text"
+            autocapitalize="none"
+            autocorrect="off"
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </details>
+
+        <div class="field" id="identity-field" hidden>
+          <label for="identity">Username</label>
+          <input
+            id="identity"
+            name="identity"
+            type="text"
+            autocapitalize="none"
+            autocorrect="off"
+            spellcheck="false"
+          />
+          <p class="hint">This network uses enterprise (802.1X) sign-in.</p>
+        </div>
+
+        <div class="field">
+          <label for="pw">Password</label>
+          <div class="pw">
+            <input
+              id="pw"
+              name="passphrase"
+              type="password"
+              autocomplete="current-password"
+              autocapitalize="none"
+              autocorrect="off"
+              spellcheck="false"
+              minlength="8"
+              maxlength="63"
+              aria-describedby="pw-hint"
+            />
+            <!-- type=button so it can never submit the form. -->
+            <button class="pw__toggle" type="button" id="pw-toggle" aria-pressed="false" hidden>
+              Show
+            </button>
+          </div>
+          <p class="hint" id="pw-hint">8 to 63 characters. Leave blank for an open network.</p>
+        </div>
+
+        <div class="field">
+          <button class="btn" type="submit">Connect</button>
+        </div>
+      </form>
+
+      <footer class="foot">
+        <span>{{BRAND_NAME}}</span>
+        <button class="link-btn" type="button" id="theme-toggle" hidden>Switch theme</button>
+      </footer>
+    </main>
+
+    <!--SCRIPT-->
+  </body>
+</html>

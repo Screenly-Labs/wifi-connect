@@ -1,0 +1,66 @@
+/* Palette primitives.
+ *
+ * Deliberately NOT in @theme. Anything declared there becomes a utility
+ * class, and primitives must not be reachable from markup: a component that
+ * writes `bg-slate-700` has hardcoded a colour and will not follow the
+ * theme. Only the ROLES in tailwind.css get @theme treatment, and a role is
+ * the only thing the markup may name.
+ *
+ * That split is also the white-labelling seam. An integrator overrides roles
+ * through --brand-css and never touches these, so a rebrand cannot
+ * accidentally depend on our particular blue.
+ *
+ * Every value is hex or sRGB rgb(). Nothing here is oklch(), which matters
+ * more than it looks: Tailwind v4's own palette is authored in oklch, and
+ * oklch needs Safari 15.4+. Clearing that palette (see tailwind.css) and
+ * declaring our own in hex buys back several iOS releases on exactly the
+ * old phones most likely to be used to set up a sign.
+ */
+
+:root {
+  /* Neutral ramp. */
+  --c-ink-950: #0b1220;
+  --c-ink-900: #111827;
+  --c-ink-800: #1f2937;
+  --c-ink-700: #374151;
+  --c-ink-600: #4b5563;
+  --c-ink-500: #6b7280;
+  --c-ink-400: #9ca3af;
+  --c-ink-300: #d1d5db;
+  --c-ink-200: #e5e7eb;
+  --c-ink-100: #f3f4f6;
+  --c-ink-50: #f9fafb;
+  --c-white: #ffffff;
+
+  /* Accent ramp. */
+  --c-accent-700: #1d4ed8;
+  --c-accent-600: #2563eb;
+  --c-accent-500: #3b82f6;
+  --c-accent-400: #60a5fa;
+  --c-accent-300: #93c5fd;
+
+  /* Feedback. Both clear 4.5:1 as text on their own surfaces. */
+  --c-danger-700: #b91c1c;
+  --c-danger-400: #f87171;
+  --c-danger-wash: #fef2f2;
+  --c-danger-wash-dark: #2a1215;
+  --c-success-700: #15803d;
+  --c-success-400: #4ade80;
+
+  /* Alpha ladders.
+   *
+   * These exist so the markup never needs Tailwind's `/opacity` modifier,
+   * which compiles to color-mix(in oklab, ...) — the single feature that
+   * defines Tailwind v4's browser floor. Declaring the alphas explicitly
+   * keeps color-mix() out of the output entirely. */
+  --a-ink-04: rgb(17 24 39 / 0.04);
+  --a-ink-08: rgb(17 24 39 / 0.08);
+  --a-ink-12: rgb(17 24 39 / 0.12);
+  --a-ink-60: rgb(17 24 39 / 0.6);
+  --a-white-08: rgb(255 255 255 / 0.08);
+  --a-white-12: rgb(255 255 255 / 0.12);
+  --a-white-60: rgb(255 255 255 / 0.6);
+  --a-white-70: rgb(255 255 255 / 0.7);
+  --a-accent-20: rgb(37 99 235 / 0.2);
+  --a-accent-45: rgb(37 99 235 / 0.45);
+}
