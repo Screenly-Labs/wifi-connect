@@ -61,7 +61,34 @@ parts:
         exit 1
       }
       install -D -m0755 "${BIN}" "${CRAFT_PART_INSTALL}/bin/wifi-connect"
-      craftctl set version="$(git describe --tags --always --dirty | sed 's/^v//')"
+
+      # Read the version out of Cargo.toml, NOT `git describe`.
+      #
+      # This used to shell out to git, and git is not installed in the
+      # core24 build instance. The failure was silent in the worst way:
+      # the command substitution swallowed "git: command not found",
+      # `craftctl set version=` accepted the empty string, and the build
+      # died several steps later in a 2 KB pydantic validation dump that
+      # named neither git nor this line. It took the v2026.10.0 release
+      # down with it — the release job needs the snaps, so no GitHub
+      # Release, no tarballs and no checksums were published at all.
+      #
+      # Cargo.toml is the source of truth for the version anyway, so
+      # asking it directly is both correct and one fewer thing that has
+      # to exist inside the build instance. version.sh is shared with
+      # the release workflow's tag guard so the two cannot drift.
+      #
+      # Assigned first and checked, rather than inlined into the
+      # craftctl call. `craftctl set version="$(failing-command)"` takes
+      # its exit status from craftctl, not from the substitution, so an
+      # inlined failure sets the empty version and carries on — which is
+      # exactly how this broke the last time.
+      VERSION="$(sh packaging/version.sh)" || exit 1
+      test -n "${VERSION}" || {
+        echo "packaging/version.sh produced an empty version" >&2
+        exit 1
+      }
+      craftctl set version="${VERSION}"
 
 apps:
   wifi-connect:
