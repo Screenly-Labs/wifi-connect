@@ -14,7 +14,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Runs before anything is built or pushed. A tag that disagrees with
+  # Cargo.toml produces tarballs named for one version containing a
+  # binary that reports another, and container tags derived from a
+  # version the code has never heard of -- all of it published and
+  # immutable by the time anyone notices.
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: the tag matches Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sh packaging/version.sh)"
+          if [ "${tag}" != "${crate}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml" \
+                 "version ${crate}. Bump Cargo.toml (and Cargo.lock) or" \
+                 "retag."
+            exit 1
+          fi
+          echo "releasing ${crate}"
+
   build:
+    needs: [version]
     strategy:
       fail-fast: false
       matrix:
@@ -124,6 +146,50 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
+      # A GHCR package is PRIVATE when it is first created, and nothing
+      # in a workflow can change that -- visibility is an org setting
+      # with no REST endpoint behind it. A pushed-but-private image is
+      # the worst kind of release: every job here goes green, the tags
+      # all exist, and every device that tries to pull gets a 401.
+      #
+      # So prove it the way a device would: take an anonymous pull token
+      # and fetch the manifest for the tag just pushed. Retried, because
+      # a freshly pushed tag can take a few seconds to be servable.
+      - name: the pushed image is anonymously pullable
+        run: |
+          image="screenly-labs/wifi-connect"
+          tag="${GITHUB_REF_NAME#v}"
+
+          for attempt in 1 2 3 4 5; do
+            token="$(curl -fsS \
+              "https://ghcr.io/token?scope=repository:${image}:pull&service=ghcr.io" \
+              | jq -r '.token // empty')" || token=""
+
+            if [ -n "${token}" ]; then
+              code="$(curl -s -o /dev/null -w '%{http_code}' \
+                -H "Authorization: Bearer ${token}" \
+                -H "Accept: application/vnd.oci.image.index.v1+json" \
+                "https://ghcr.io/v2/${image}/manifests/${tag}")"
+              if [ "${code}" = "200" ]; then
+                echo "ghcr.io/${image}:${tag} is anonymously pullable"
+                exit 0
+              fi
+              echo "manifest returned HTTP ${code} (attempt ${attempt})"
+            else
+              echo "no anonymous pull token (attempt ${attempt})"
+            fi
+            sleep 10
+          done
+
+          echo "::error::ghcr.io/${image}:${tag} cannot be pulled" \
+               "anonymously, so no device can use this release. The" \
+               "package is almost certainly still private: GitHub ->" \
+               "Screenly-Labs -> Packages -> wifi-connect -> Package" \
+               "settings -> Change visibility -> Public. There is no" \
+               "API for this; it has to be done once, by hand, by an" \
+               "org owner. Then re-run this job."
+          exit 1
+
   snap:
     needs: [build]
     strategy:
@@ -133,8 +199,6 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0 # snapcraft.yaml derives its version from git describe
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*

@@ -149,3 +149,54 @@ jobs:
           name: bin-${{ matrix.arch }}
           path: dist/wifi-connect-${{ matrix.arch }}
           retention-days: 7
+
+  # The snap is packaging rather than code, so nothing else in this file
+  # would notice it breaking — and it did break: the first build of it
+  # for v2026.10.0 ran *after* the tag was pushed, failed on a version
+  # the build instance could not compute, and took the whole release
+  # with it (the release job needs the snaps, so no tarballs and no
+  # checksums were published either).
+  #
+  # Same principle as "the binary executes on its target architecture"
+  # above: build the artifact, then check the thing about it that
+  # silently went wrong.
+  snap:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors the release workflow. All three are built because the
+        # one mapping that is easy to get wrong — snapcraft's `armhf`
+        # onto this project's `armv7` binary — is only exercised by the
+        # armhf build.
+        platform: [amd64, arm64, armhf]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bin-*
+          path: dist
+          merge-multiple: true
+      - run: chmod +x dist/wifi-connect-*
+
+      - uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
+        id: snapcraft
+        with:
+          snapcraft-args: --build-for ${{ matrix.platform }}
+
+      # snapcraft names the file wifi-connect_<version>_<arch>.snap, so
+      # the filename is precisely where an empty or wrong version shows
+      # up — which is the failure this job exists to catch. A build that
+      # merely succeeded would not have.
+      - name: the snap carries the Cargo.toml version
+        run: |
+          want="$(sh packaging/version.sh)"
+          got="$(basename "${{ steps.snapcraft.outputs.snap }}")"
+          case "${got}" in
+            "wifi-connect_${want}_"*.snap)
+              echo "${got} carries version ${want}" ;;
+            *)
+              echo "::error::${got} does not carry the Cargo.toml version ${want}"
+              exit 1 ;;
+          esac
