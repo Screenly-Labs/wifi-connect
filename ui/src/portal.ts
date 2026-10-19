@@ -81,12 +81,18 @@ function initSecurityAwareness(): void {
     // naive check gets wrong.
     const needsPassphrase = radio.dataset.needsPassphrase !== 'false'
     const needsIdentity = radio.dataset.needsIdentity === 'true'
+    // Enterprise (PEAP/TTLS) takes no WPA passphrase but still needs a
+    // password alongside the identity, so the field is required whenever
+    // either is true. Disabling it for enterprise would leave the password
+    // unsubmitted and the join would silently fall back to open and fail.
+    const needsPassword = needsPassphrase || needsIdentity
 
-    password.disabled = !needsPassphrase
+    password.disabled = !needsPassword
     password.required = false
-    if (!needsPassphrase) password.value = ''
-    // minlength on a disabled/empty field would block submission of an
-    // open network, so it is applied only where it is meaningful.
+    if (!needsPassword) password.value = ''
+    // The 8-character floor is a WPA-PSK rule; EAP passwords have no such
+    // minimum, and on a disabled/empty field it would block submission of an
+    // open network. Apply it only to PSK networks.
     if (needsPassphrase) {
       password.setAttribute('minlength', '8')
     } else {

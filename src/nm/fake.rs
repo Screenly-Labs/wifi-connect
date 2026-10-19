@@ -175,8 +175,8 @@ impl NetworkControl for FakeNm {
         let mut state = self.state.lock().unwrap();
         state.ap_raises += 1;
         Ok(ApHandle {
-            profile_path: "/fake/profile".into(),
-            active_path: "/fake/active".into(),
+            uuid: "00000000-0000-4000-8000-00000000fake".into(),
+            interface: "wlan0".into(),
         })
     }
 

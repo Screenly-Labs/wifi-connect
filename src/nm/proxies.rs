@@ -56,7 +56,23 @@ pub trait Device {
 
     #[zbus(property)]
     fn interface(&self) -> zbus::Result<String>;
+
+    /// `NM_DEVICE_STATE_*`. Polled at AP teardown to tell when the radio has
+    /// finished leaving the access-point connection, so a station join is
+    /// not started while the device is still deactivating.
+    #[zbus(property)]
+    fn state(&self) -> zbus::Result<u32>;
 }
 
 /// `NM_802_11_MODE_AP`.
 pub const WIFI_MODE_AP: u32 = 3;
+
+/// `true` while a device is mid-transition: `NM_DEVICE_STATE` in the
+/// activating band (40 PREPARE … 90 SECONDARIES) or 110 DEACTIVATING.
+/// Starting a station join in any of these states makes NetworkManager
+/// reject it with `ConnectionInProgress` ("a connection operation is already
+/// in progress"), which is how a join launched milliseconds after AP
+/// teardown silently fails.
+pub fn is_device_busy(state: u32) -> bool {
+    matches!(state, 40 | 50 | 60 | 70 | 80 | 90 | 110)
+}

@@ -80,18 +80,6 @@ fn security_label(security: Security) -> &'static str {
     }
 }
 
-fn security_slug(security: Security) -> &'static str {
-    match security {
-        Security::Open => "open",
-        Security::Owe => "owe",
-        Security::Wep => "wep",
-        Security::WpaPsk => "wpa-psk",
-        Security::Sae => "sae",
-        Security::SaeTransitional => "sae-transitional",
-        Security::Enterprise => "enterprise",
-    }
-}
-
 fn render_networks(networks: &[WifiNetwork]) -> String {
     if networks.is_empty() {
         return String::from(
@@ -126,7 +114,7 @@ fn render_networks(networks: &[WifiNetwork]) -> String {
 
         out.push_str(&format!(
             "<label class=\"net\">\
-               <input type=\"radio\" name=\"ssid_hex\" value=\"{hex}\" data-security=\"{slug}\" \
+               <input type=\"radio\" name=\"ssid_hex\" value=\"{hex}\" \
                 data-needs-passphrase=\"{needs_pw}\" data-needs-identity=\"{needs_id}\" required{checked}>\
                <span class=\"net__name\">{name}</span>\
                <span class=\"net__meta\">\
@@ -135,7 +123,6 @@ fn render_networks(networks: &[WifiNetwork]) -> String {
                </span>\
              </label>",
             hex = n.ssid_hex,
-            slug = security_slug(n.security),
         ));
     }
     out
@@ -291,7 +278,10 @@ mod tests {
             &PortalState::Portal,
         );
         assert!(html.contains(r#"value="486f6d65""#), "ssid_hex missing");
-        assert!(html.contains(r#"data-security="enterprise""#));
+        // Enterprise needs an identity and (for PEAP/TTLS) a password; the
+        // script reads these booleans, not a security slug.
+        assert!(html.contains(r#"data-needs-identity="true""#));
+        assert!(html.contains(r#"data-needs-passphrase="false""#));
         assert!(html.contains("Enterprise"));
     }
 

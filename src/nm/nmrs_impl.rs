@@ -24,13 +24,14 @@ use nmrs::raw::zbus;
 use nmrs::{ConnectionError, NetworkManager, WifiSecurity};
 use tracing::{debug, info, warn};
 
-use super::proxies::{DeviceProxy, DeviceWirelessProxy, WIFI_MODE_AP};
+use super::proxies::{DeviceProxy, DeviceWirelessProxy, WIFI_MODE_AP, is_device_busy};
 use super::security;
 use super::settings::{ApProfile, ap_settings};
 use super::{
     ApConfig, ApHandle, Connectivity, DeviceInfo, JoinFailure, JoinOutcome, JoinRequest,
     NetworkControl, NetworkError, WifiNetwork,
 };
+use crate::secret::Secret;
 use crate::ssid::Ssid;
 
 /// `connection.id` given to the access-point profile. Also what the startup
@@ -118,12 +119,15 @@ impl NmrsControl {
             .ipv4_auto()
             .ipv6_auto();
 
-        builder = match (&request.passphrase, &request.identity) {
-            (Some(psk), None) => builder.wpa_psk(psk.expose()),
-            (Some(password), Some(identity)) => builder
-                .try_wpa_eap(nmrs::EapOptions::new(identity.clone(), password.expose()))
+        builder = match classify_credentials(request) {
+            Credential::Psk(psk) => builder.wpa_psk(psk.expose()),
+            Credential::Eap { identity, password } => builder
+                .try_wpa_eap(nmrs::EapOptions::new(
+                    identity.to_string(),
+                    password.expose(),
+                ))
                 .map_err(|e| NetworkError::Other(e.to_string()))?,
-            _ => builder.open(),
+            Credential::Open => builder.open(),
         };
 
         if let Err(e) = self
@@ -132,6 +136,10 @@ impl NmrsControl {
             .await
         {
             debug!(error = %e, "hidden network activation failed");
+            // `add_and_activate_connection` persists the profile before it
+            // reports the failure, so delete it rather than leaving an
+            // autoconnect-enabled bad profile behind.
+            self.delete_profile_quietly(&ssid).await;
             return Ok(JoinOutcome::Failed(classify_failure(&e)));
         }
 
@@ -141,33 +149,120 @@ impl NmrsControl {
                 return Ok(JoinOutcome::Joined);
             }
             if tokio::time::Instant::now() >= deadline {
+                // The profile was created with autoconnect on; left behind,
+                // NetworkManager would keep retrying a known-bad network on
+                // every scan. Clean up on the way out so this path does not
+                // rely on the caller to do it.
+                self.delete_profile_quietly(&ssid).await;
                 return Ok(JoinOutcome::Failed(JoinFailure::Timeout));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+
+    /// Delete a saved connection by name, swallowing "nothing to delete".
+    async fn delete_profile_quietly(&self, name: &str) {
+        match self.nm.forget(name).await {
+            Ok(()) | Err(ConnectionError::NoSavedConnection) => {}
+            Err(e) => debug!(error = %e, name, "could not delete the profile"),
+        }
+    }
+
+    /// Trigger a scan and wait, briefly, for `target` to appear in the BSS
+    /// cache. Best-effort: `scan_networks` only issues a RequestScan and
+    /// returns before results land, so this polls `list_access_points` until
+    /// the SSID shows up or a deadline elapses. Compares raw bytes, since an
+    /// SSID need not be valid UTF-8.
+    async fn rescan_for(&self, interface: &str, target: &Ssid) {
+        if let Err(e) = self.nm.scan_networks(Some(interface)).await {
+            debug!(error = %e, "RequestScan before join was refused");
+        }
+        let want = target.as_bytes();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Ok(aps) = self.nm.list_access_points(Some(interface)).await
+                && aps.iter().any(|ap| ap.ssid_bytes.as_slice() == want)
+            {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+    }
+
+    /// Poll the device state until it is out of any transitional state, or a
+    /// short deadline elapses. Best-effort: any read failure ends the wait
+    /// rather than blocking the join.
+    async fn wait_until_device_idle(&self, interface: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let busy = match self.nm.wifi_device_by_interface(interface).await {
+                Ok(dev) => match DeviceProxy::builder(self.bus()).path(dev.path.clone()) {
+                    Ok(b) => match b.build().await {
+                        Ok(p) => p.state().await.map(is_device_busy).unwrap_or(false),
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if !busy || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+}
+
+/// The credential shape a submission implies.
+///
+/// Decided in one place so the two code paths that need it — the broadcast
+/// `try_connect` path via [`credentials_for`] and the hidden-network builder
+/// path in [`NmrsBackend::join_hidden`] — cannot drift. Two copies of this
+/// classification is exactly the single-source-of-truth problem the portal's
+/// server-rendered `needs-*` booleans set out to remove on the UI side.
+enum Credential<'a> {
+    Psk(&'a Secret),
+    // PEAP/MSCHAPv2 and TTLS/PAP are the 90% of enterprise WiFi.
+    // Certificate-based EAP-TLS needs key and certificate paths that a
+    // captive portal has no way to collect.
+    //
+    // Known limitation, documented in the README: without a
+    // `domain_suffix_match` the supplicant accepts any server certificate
+    // the CA store chains to, so this is not proof against a determined
+    // on-path attacker.
+    Eap {
+        identity: &'a str,
+        password: &'a Secret,
+    },
+    // An identity with no password, or neither: treat as open.
+    // NetworkManager rejects a security section with nothing in it.
+    Open,
+}
+
+fn classify_credentials(request: &JoinRequest) -> Credential<'_> {
+    match (&request.passphrase, &request.identity) {
+        (Some(psk), None) => Credential::Psk(psk),
+        (Some(password), Some(identity)) => Credential::Eap {
+            identity: identity.as_str(),
+            password,
+        },
+        _ => Credential::Open,
+    }
 }
 
 /// Build the credentials nmrs wants from a portal submission.
 fn credentials_for(request: &JoinRequest) -> WifiSecurity {
-    match (&request.passphrase, &request.identity) {
-        (Some(psk), None) => WifiSecurity::WpaPsk {
+    match classify_credentials(request) {
+        Credential::Psk(psk) => WifiSecurity::WpaPsk {
             psk: psk.expose().to_string(),
         },
-        // PEAP/MSCHAPv2 and TTLS/PAP are the 90% of enterprise WiFi.
-        // Certificate-based EAP-TLS needs key and certificate paths that a
-        // captive portal has no way to collect.
-        //
-        // Known limitation, documented in the README: without a
-        // `domain_suffix_match` the supplicant accepts any server
-        // certificate the CA store chains to, so this is not proof against
-        // a determined on-path attacker.
-        (Some(password), Some(identity)) => WifiSecurity::WpaEap {
-            opts: nmrs::EapOptions::new(identity.clone(), password.expose()),
+        Credential::Eap { identity, password } => WifiSecurity::WpaEap {
+            opts: nmrs::EapOptions::new(identity.to_string(), password.expose()),
         },
-        // An identity with no password, or neither: treat as open.
-        // NetworkManager rejects a security section with nothing in it.
-        _ => WifiSecurity::Open,
+        Credential::Open => WifiSecurity::Open,
     }
 }
 
@@ -262,6 +357,22 @@ impl NetworkControl for NmrsControl {
                 if let Err(e) = self.nm.set_wireless_enabled(true).await {
                     debug!(error = %e, "could not enable the WiFi radio");
                     return Err(NetworkError::RadioBlocked);
+                }
+                // `set_wireless_enabled` returns before NetworkManager has
+                // actually brought the radio up. Raising the AP on a
+                // not-yet-ready radio fails transiently and surfaces as the
+                // misleading "no access point could be raised". Wait for the
+                // radio to report enabled before proceeding.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    match self.nm.wifi_state().await {
+                        Ok(r) if r.enabled => break,
+                        _ if tokio::time::Instant::now() >= deadline => {
+                            debug!("radio did not report enabled within the deadline");
+                            break;
+                        }
+                        _ => tokio::time::sleep(Duration::from_millis(150)).await,
+                    }
                 }
             }
             Ok(_) => {}
@@ -374,9 +485,10 @@ impl NetworkControl for NmrsControl {
         device: &DeviceInfo,
         config: &ApConfig,
     ) -> Result<ApHandle, NetworkError> {
+        let uuid = uuid::Uuid::new_v4().to_string();
         let profile = ApProfile {
             id: AP_PROFILE_ID.to_string(),
-            uuid: uuid::Uuid::new_v4().to_string(),
+            uuid: uuid.clone(),
             interface: device.interface.clone(),
             ssid: config.ssid.clone(),
             passphrase: config.passphrase.clone(),
@@ -389,28 +501,35 @@ impl NetworkControl for NmrsControl {
 
         // `specific_object` is "/" for AP mode: there is no access point to
         // target, we are becoming one.
-        let (profile_path, active_path) = self
-            .nm
+        self.nm
             .add_and_activate_connection(settings, Some(&device.interface), None)
             .await
             .map_err(|e| NetworkError::ApFailed(e.to_string()))?;
 
         info!(ssid = %config.ssid, interface = %device.interface, "access point raised");
         Ok(ApHandle {
-            profile_path: profile_path.to_string(),
-            active_path: active_path.to_string(),
+            uuid,
+            interface: device.interface.clone(),
         })
     }
 
     async fn tear_down_ap(&self, handle: &ApHandle) -> Result<(), NetworkError> {
-        // Deactivating and then deleting. A "not active" error is success
-        // from our point of view: the AP is gone, which is what we wanted.
-        if let Err(e) = self.nm.disconnect_by_uuid(&handle.active_path).await {
+        // Deactivate by the connection's UUID (NetworkManager finds the
+        // matching active connection itself) and then delete the profile. A
+        // "not active" / "no saved connection" error is success from our
+        // point of view: the AP is gone, which is what we wanted.
+        if let Err(e) = self.nm.disconnect_by_uuid(&handle.uuid).await {
             debug!(error = %e, "deactivating the access point was a no-op");
         }
         if let Err(e) = self.nm.forget(AP_PROFILE_ID).await {
             debug!(error = %e, "deleting the access-point profile was a no-op");
         }
+        // Deactivation is asynchronous: NetworkManager moves the device
+        // ACTIVATED -> DEACTIVATING -> DISCONNECTED over several hundred
+        // milliseconds. A station join started while it is still
+        // DEACTIVATING is rejected outright, so wait for the radio to settle
+        // before returning to the caller, which joins next.
+        self.wait_until_device_idle(&handle.interface).await;
         Ok(())
     }
 
@@ -429,6 +548,13 @@ impl NetworkControl for NmrsControl {
         if request.hidden {
             return self.join_hidden(device, request, budget).await;
         }
+
+        // The radio could not scan while it was the access point, so its BSS
+        // cache is stale by the time we get here. Without a fresh scan,
+        // `try_connect` returns "network not found" for a network that is
+        // actually in range — including the one the portal just showed the
+        // user. Rescan and wait, briefly, for the target to reappear.
+        self.rescan_for(&device.interface, &request.ssid).await;
 
         let attempt = tokio::time::timeout(
             budget,

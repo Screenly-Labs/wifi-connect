@@ -69,6 +69,13 @@ pub fn ap_settings(p: &ApProfile) -> Settings<'_> {
     if let Some(ch) = p.channel {
         wireless.insert("channel", Value::from(ch));
     }
+    // Client-to-client isolation on the setup network: a second device that
+    // joins the AP cannot reach the one doing setup, only the gateway (the
+    // AP host itself), which is where the portal, DHCP and DNS live — so the
+    // portal stays reachable. NM_TERNARY 1 = yes; the property is an int32.
+    // Supported since NetworkManager 1.28 (2021); every target OS is newer.
+    // The README's threat model relies on this being set.
+    wireless.insert("ap-isolation", Value::from(1_i32));
     if p.passphrase.is_some() {
         wireless.insert("security", Value::from("802-11-wireless-security"));
     }
@@ -188,6 +195,19 @@ mod tests {
         let s = ap_settings(&p);
         assert_eq!(get(&s, "802-11-wireless", "mode"), &Value::from("ap"));
         assert_eq!(get(&s, "802-11-wireless", "band"), &Value::from("bg"));
+    }
+
+    /// Client-to-client isolation must be on: the README's threat model
+    /// treats a second device on the setup AP as untrusted. `1` is the
+    /// NM_TERNARY "yes"; the property is an int32, not a bool.
+    #[test]
+    fn ap_isolation_is_enabled() {
+        let p = profile();
+        let s = ap_settings(&p);
+        assert_eq!(
+            get(&s, "802-11-wireless", "ap-isolation"),
+            &Value::from(1_i32)
+        );
     }
 
     /// An autoconnecting AP profile is a bricking mode: after a reboot the

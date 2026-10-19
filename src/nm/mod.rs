@@ -178,8 +178,16 @@ pub struct ApConfig {
 /// A raised access point, as a handle to tear down.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApHandle {
-    pub profile_path: String,
-    pub active_path: String,
+    /// The AP connection's UUID. Teardown deactivates *this* connection by
+    /// UUID; NetworkManager resolves the active connection itself. Passing
+    /// the active-connection object path here instead makes it look up a
+    /// connection that does not exist, so the AP is never brought down and
+    /// the following station join is rejected with "a connection operation
+    /// is already in progress".
+    pub uuid: String,
+    /// The wireless interface the AP is on, so teardown can wait for the
+    /// radio to finish leaving the AP before a station join starts.
+    pub interface: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -196,6 +204,10 @@ pub enum NetworkError {
     RadioBlocked,
     #[error("could not raise the access point: {0}")]
     ApFailed(String),
+    #[error(
+        "the {0} server could not start, so the portal is unreachable (is port 80 already in use on this host?)"
+    )]
+    PortalUnavailable(String),
     #[error("NetworkManager error: {0}")]
     Other(String),
 }

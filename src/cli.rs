@@ -21,7 +21,7 @@ use crate::nm::ApSecurity;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum SecurityMode {
-    /// Try WPA3-SAE, fall back to WPA2-PSK.
+    /// WPA2-PSK (CCMP) — the interoperable default. Same as `wpa2`.
     Auto,
     Wpa2,
     Wpa3,
@@ -63,9 +63,14 @@ pub struct Cli {
 
     /// Security for the setup access point.
     ///
-    /// `auto` attempts WPA3-SAE and falls back to WPA2-PSK. The fallback is
-    /// the expected path on every Raspberry Pi: AP-mode SAE on brcmfmac is
-    /// unreliable.
+    /// `auto` (the default) and `wpa2` both raise a WPA2-PSK/CCMP access
+    /// point — the mode every client and every target chipset handle.
+    /// `wpa3` raises a WPA3-SAE access point; it is opt-in because AP-mode
+    /// SAE on the brcmfmac radios in every Raspberry Pi is unreliable in
+    /// practice (the AP comes up but clients fail to associate), so it is
+    /// not safe as a default. There is no automatic SAE-to-WPA2 fallback:
+    /// the AP cannot see a client's association failure, so a failed SAE
+    /// association looks identical to a healthy AP with no clients yet.
     #[arg(long, env = "WIFI_CONNECT_PORTAL_SECURITY", default_value = "auto")]
     pub portal_security: SecurityMode,
 
@@ -205,9 +210,8 @@ pub fn parse_dhcp_range(spec: &str, gateway: Ipv4Addr) -> Result<DhcpRange, Conf
 impl Cli {
     /// The access point's security mode, as the settings builder wants it.
     ///
-    /// `auto` resolves to WPA2-PSK here and is upgraded to SAE at
-    /// activation time if the adapter turns out to support it, because that
-    /// is only knowable once NetworkManager has the device.
+    /// `auto` and `wpa2` both map to WPA2-PSK; only an explicit `wpa3`
+    /// selects SAE. See [`SecurityMode`] for why `auto` is not SAE.
     pub fn ap_security(&self) -> ApSecurity {
         match self.portal_security {
             SecurityMode::Wpa3 => ApSecurity::Wpa3Sae,

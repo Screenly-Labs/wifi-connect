@@ -310,6 +310,7 @@ pub fn report(result: &Result<Outcome, NetworkError>) -> i32 {
                 | NetworkError::Unmanaged(_)
                 | NetworkError::RadioBlocked => 4,
                 NetworkError::Unreachable(_) => 5,
+                NetworkError::PortalUnavailable(_) => 6,
                 _ => 1,
             }
         }

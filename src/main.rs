@@ -219,13 +219,20 @@ async fn run() -> ExitCode {
             let dns = dns::serve(gateway, 53, cancel.clone());
             let portal = http::serve(SocketAddr::from((gateway, port)), shared, cancel.clone());
 
-            // Any one of the three failing makes the portal useless, so say
-            // so rather than limping on with a page nobody can reach.
-            tokio::select! {
-                r = dhcp => if let Err(e) = r { error!(error = %e, "the DHCP server stopped") },
-                r = dns => if let Err(e) = r { error!(error = %e, "the DNS server stopped") },
-                r = portal => if let Err(e) = r { error!(error = %e, "the portal stopped") },
+            // Any one of the three failing makes the portal useless. Cancel
+            // the run so the access point comes back down and the exit code
+            // reflects the failure, rather than limping on with the AP up
+            // and a page nobody can reach. The common cause is port 80
+            // already held on the host (e.g. the Anthias server container).
+            let failed: Option<&'static str> = tokio::select! {
+                r = dhcp => r.err().map(|e| { error!(error = %e, "the DHCP server stopped"); "DHCP" }),
+                r = dns => r.err().map(|e| { error!(error = %e, "the DNS server stopped"); "DNS" }),
+                r = portal => r.err().map(|e| { error!(error = %e, "the portal stopped"); "portal" }),
+            };
+            if failed.is_some() {
+                cancel.cancel();
             }
+            failed
         })
     };
 
@@ -254,7 +261,17 @@ async fn run() -> ExitCode {
 
     cancel.cancel();
     signals.abort();
-    let _ = servers.await;
+    let server_failure = servers.await.ok().flatten();
+
+    // If a support server died, the portal was never reachable. Unless the
+    // join had already succeeded, report that rather than the generic
+    // Cancelled outcome the dead server's cancel() produced — otherwise a
+    // port-80 collision exits as if the AP did its job.
+    let result = match (&result, server_failure) {
+        (Ok(app::Outcome::Online), _) => result,
+        (_, Some(what)) => Err(nm::NetworkError::PortalUnavailable(what.to_string())),
+        _ => result,
+    };
 
     ExitCode::from(app::report(&result) as u8)
 }
