@@ -30,6 +30,7 @@ pub fn router(shared: Shared) -> Router {
         .route("/api/networks", get(api::networks))
         .route("/api/status", get(api::status))
         .route("/api/captive-portal", get(api::captive_portal_api))
+        .route("/brand.css", get(api::brand_css))
         .route("/assets/{*path}", get(assets::serve));
 
     // OS probe endpoints. Registered explicitly so they are covered by
@@ -73,7 +74,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn app() -> Router {
-        let (shared, _rx) = Shared::new("http://192.168.42.1/".into(), "WiFi Connect".into());
+        let (shared, _rx) = Shared::new("http://192.168.42.1/".into(), "WiFi Connect".into(), None);
         router(shared)
     }
 
@@ -82,6 +83,43 @@ mod tests {
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    async fn get_path_branded(path: &str) -> axum::response::Response {
+        let (shared, _rx) = Shared::new(
+            "http://192.168.42.1/".into(),
+            "WiFi Connect".into(),
+            Some(std::sync::Arc::from(":root{--color-accent:#ffe11a}")),
+        );
+        router(shared)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn brand_css_serves_the_configured_stylesheet() {
+        let resp = get_path_branded("/brand.css").await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/css; charset=utf-8"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b":root{--color-accent:#ffe11a}");
+    }
+
+    /// Not a 404, and not the catch-all redirect: the fallback turns every
+    /// unknown path into a probe redirect, so a missing route here would
+    /// hand the browser an HTML page with a text/css expectation.
+    #[tokio::test]
+    async fn brand_css_is_empty_but_present_when_unconfigured() {
+        let resp = get_path("/brand.css").await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.is_empty());
     }
 
     /// The single most important assertion in the HTTP layer. A 204 here

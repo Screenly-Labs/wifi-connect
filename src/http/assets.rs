@@ -138,18 +138,45 @@ fn render_banner(state: &PortalState) -> String {
     }
 }
 
+/// The `<link>` for the integrator stylesheet, or nothing.
+///
+/// Emitted ONLY when `--brand-css` is set. An unbranded portal must stay a
+/// single request: it is served to a captive-portal mini-browser over an
+/// access point with no internet, and ui/test/portal.test.ts asserts the
+/// built pages pull in nothing external. The href is a fixed literal, so
+/// nothing attacker-influenced reaches the markup.
+fn render_brand_css(branded: bool) -> &'static str {
+    if branded {
+        "<link rel=\"stylesheet\" href=\"/brand.css\" />"
+    } else {
+        ""
+    }
+}
+
 /// Render the portal page.
-pub fn render_index(brand: &str, networks: &[WifiNetwork], state: &PortalState) -> String {
+pub fn render_index(
+    brand: &str,
+    networks: &[WifiNetwork],
+    state: &PortalState,
+    branded: bool,
+) -> String {
     template("index.html")
         .replace("{{BRAND_NAME}}", &escape(brand))
+        .replace("{{BRAND_CSS}}", render_brand_css(branded))
         .replace("{{NETWORKS}}", &render_networks(networks))
         .replace("{{BANNER}}", &render_banner(state))
 }
 
 /// Render the portal page carrying a validation error.
-pub fn render_index_with_error(brand: &str, networks: &[WifiNetwork], error: &str) -> String {
+pub fn render_index_with_error(
+    brand: &str,
+    networks: &[WifiNetwork],
+    error: &str,
+    branded: bool,
+) -> String {
     template("index.html")
         .replace("{{BRAND_NAME}}", &escape(brand))
+        .replace("{{BRAND_CSS}}", render_brand_css(branded))
         .replace("{{NETWORKS}}", &render_networks(networks))
         .replace(
             "{{BANNER}}",
@@ -161,9 +188,10 @@ pub fn render_index_with_error(brand: &str, networks: &[WifiNetwork], error: &st
 }
 
 /// Render the "connecting…" page.
-pub fn render_connecting(brand: &str, ssid: &str) -> String {
+pub fn render_connecting(brand: &str, ssid: &str, branded: bool) -> String {
     template("connecting.html")
         .replace("{{BRAND_NAME}}", &escape(brand))
+        .replace("{{BRAND_CSS}}", render_brand_css(branded))
         .replace("{{SSID}}", &escape(ssid))
 }
 
@@ -220,6 +248,7 @@ mod tests {
             "Anthias",
             &[net("Home", 80, Security::WpaPsk)],
             &PortalState::Portal,
+            false,
         );
         for token in [
             "{{BRAND_NAME}}",
@@ -242,6 +271,7 @@ mod tests {
             "Brand",
             &[net(evil, 50, Security::WpaPsk)],
             &PortalState::Portal,
+            false,
         );
 
         assert!(!html.contains("<script>alert"), "SSID was not escaped");
@@ -255,6 +285,7 @@ mod tests {
             "Brand",
             &[net(evil, 50, Security::WpaPsk)],
             &PortalState::Portal,
+            false,
         );
         assert!(
             !html.contains(r#"onfocus="alert"#),
@@ -265,7 +296,7 @@ mod tests {
 
     #[test]
     fn the_brand_name_is_escaped_too() {
-        let html = render_index("<b>Brand</b>", &[], &PortalState::Portal);
+        let html = render_index("<b>Brand</b>", &[], &PortalState::Portal, false);
         assert!(!html.contains("<b>Brand</b>"));
         assert!(html.contains("&lt;b&gt;Brand&lt;/b&gt;"));
     }
@@ -276,6 +307,7 @@ mod tests {
             "B",
             &[net("Home", 80, Security::Enterprise)],
             &PortalState::Portal,
+            false,
         );
         assert!(html.contains(r#"value="486f6d65""#), "ssid_hex missing");
         // Enterprise needs an identity and (for PEAP/TTLS) a password; the
@@ -291,6 +323,7 @@ mod tests {
             "B",
             &[net("A", 90, Security::WpaPsk), net("B", 40, Security::Open)],
             &PortalState::Portal,
+            false,
         );
         // Match the rendered radio markup specifically. A looser search
         // also hits the `:has(input:checked)` CSS rule and the inlined
@@ -310,7 +343,7 @@ mod tests {
 
     #[test]
     fn an_empty_scan_still_offers_manual_entry() {
-        let html = render_index("B", &[], &PortalState::Portal);
+        let html = render_index("B", &[], &PortalState::Portal, false);
         assert!(html.contains("No networks were found"));
         // The hidden-network field is in the static template.
         assert!(html.contains("hidden-ssid"));
@@ -324,7 +357,7 @@ mod tests {
             ssid: "Office".into(),
             error: JoinFailure::BadPassword.message("Office"),
         };
-        let html = render_index("B", &[], &state);
+        let html = render_index("B", &[], &state, false);
 
         assert!(html.contains(r#"role="alert""#));
         assert!(html.contains("password was not accepted"));
@@ -332,8 +365,58 @@ mod tests {
 
     #[test]
     fn the_portal_state_renders_no_banner() {
-        let html = render_index("B", &[], &PortalState::Portal);
+        let html = render_index("B", &[], &PortalState::Portal, false);
         assert!(!html.contains(r#"class="banner""#));
+    }
+
+    /// The single-request property, enforced at render time.
+    ///
+    /// ui/test/portal.test.ts asserts the BUILT pages pull in nothing
+    /// external; this is the other half, because the link is substituted
+    /// in afterwards. An unbranded portal must come out byte-identical to
+    /// what that test checked.
+    #[test]
+    fn an_unbranded_portal_links_no_stylesheet() {
+        for html in [
+            render_index("B", &[], &PortalState::Portal, false),
+            render_connecting("B", "Home", false),
+        ] {
+            assert!(!html.contains("<link"), "unbranded page links something");
+            assert!(
+                !html.contains("{{BRAND_CSS}}"),
+                "token leaked into the page"
+            );
+        }
+    }
+
+    #[test]
+    fn a_branded_portal_links_the_stylesheet_once() {
+        for html in [
+            render_index("B", &[], &PortalState::Portal, true),
+            render_connecting("B", "Home", true),
+        ] {
+            assert_eq!(html.matches(r#"href="/brand.css""#).count(), 1);
+            assert!(!html.contains("{{BRAND_CSS}}"));
+        }
+    }
+
+    /// The error page is a separate render path and was the one most
+    /// likely to be forgotten.
+    #[test]
+    fn the_error_page_is_branded_too() {
+        let html = render_index_with_error("B", &[], "nope", true);
+        assert!(html.contains(r#"href="/brand.css""#));
+        assert!(!html.contains("{{BRAND_CSS}}"));
+    }
+
+    /// Loaded last or it cannot override anything: the role tokens are
+    /// defined in the inline <style> above it.
+    #[test]
+    fn the_brand_stylesheet_comes_after_the_inline_styles() {
+        let html = render_index("B", &[], &PortalState::Portal, true);
+        let style = html.find("<style").expect("no inline style");
+        let link = html.find(r#"href="/brand.css""#).expect("no brand link");
+        assert!(link > style);
     }
 
     #[test]
@@ -351,13 +434,14 @@ mod tests {
             "B",
             &[net("Home", 80, Security::WpaPsk)],
             &PortalState::Portal,
+            false,
         );
         assert!(html.contains(r#"aria-label="Signal 4 of 4""#));
     }
 
     #[test]
     fn the_connecting_page_names_the_network_and_explains_both_outcomes() {
-        let html = render_connecting("Anthias", "Office WiFi");
+        let html = render_connecting("Anthias", "Office WiFi", false);
         assert!(html.contains("Office WiFi"));
         // Saying so is what stops a user power-cycling a device that just
         // worked.
@@ -371,6 +455,7 @@ mod tests {
             "B",
             &[net("Home", 80, Security::WpaPsk)],
             "Choose a network, or enter its name.",
+            false,
         );
         assert!(html.contains("Choose a network"));
         assert!(html.contains("486f6d65"), "the list must survive the error");

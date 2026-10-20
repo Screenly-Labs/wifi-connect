@@ -191,7 +191,21 @@ async fn run() -> ExitCode {
         Err(e) => return ExitCode::from(app::report(&Err(e)) as u8),
     };
 
-    let (shared, joins) = state::Shared::new(args.portal_url(), args.brand_name.clone());
+    // Read eagerly. A mistyped --brand-css should stop the portal here,
+    // with the path in the message, rather than quietly serving an
+    // unbranded page that looks like the flag was ignored.
+    let brand_css = match &args.brand_css {
+        None => None,
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(css) => Some(std::sync::Arc::from(css.as_str())),
+            Err(e) => {
+                error!(error = %e, path = %path.display(), "could not read --brand-css");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    let (shared, joins) = state::Shared::new(args.portal_url(), args.brand_name.clone(), brand_css);
     let cancel = CancellationToken::new();
 
     // DHCP, DNS and HTTP. DHCP is pinned to the access-point interface;

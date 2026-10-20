@@ -345,7 +345,7 @@ mod tests {
     }
 
     fn shared() -> (Shared, mpsc::Receiver<JoinRequest>) {
-        Shared::new("http://192.168.42.1/".into(), "Test".into())
+        Shared::new("http://192.168.42.1/".into(), "Test".into(), None)
     }
 
     fn request(ssid: &str) -> JoinRequest {

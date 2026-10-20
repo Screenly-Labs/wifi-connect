@@ -158,6 +158,16 @@ pub struct Cli {
     #[arg(long, env = "WIFI_CONNECT_BRAND_NAME", default_value = "WiFi Connect")]
     pub brand_name: String,
 
+    /// Path to a stylesheet served at `/brand.css`, loaded after the
+    /// portal's own CSS.
+    ///
+    /// Override the role tokens (`--color-accent` and friends) and nothing
+    /// else; see `ui/dist/brand.example.css`. The primitives and the markup
+    /// are deliberately not a public surface, so a rebrand that sticks to
+    /// roles survives a layout change.
+    #[arg(long, env = "WIFI_CONNECT_BRAND_CSS")]
+    pub brand_css: Option<PathBuf>,
+
     /// Default theme when the viewer has expressed no preference.
     #[arg(long, env = "WIFI_CONNECT_DEFAULT_THEME", default_value = "system")]
     pub default_theme: ThemeMode,

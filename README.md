@@ -119,6 +119,7 @@ Every flag has an environment variable. Flags win.
 | `--ui-directory` | `-u` | `UI_DIRECTORY` | embedded |
 | `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |
 | `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
+| `--brand-css` | | `WIFI_CONNECT_BRAND_CSS` | — |
 | `--force` | | `WIFI_CONNECT_FORCE` | `false` |
 | `--connection-timeout` | | `WIFI_CONNECT_CONNECTION_TIMEOUT` | `45` |
 | `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
@@ -150,6 +151,36 @@ the network and therefore cannot be served over it:
   terminal renders directly with no host application at all.
 - The SSID and passphrase are logged as text, for operators and for anyone
   whose scanner refuses.
+
+## White-labelling the portal
+
+`--brand-name` changes the name in the page. `--brand-css` points at a
+stylesheet served at `/brand.css` and loaded after the portal's own CSS, so
+it can override the role tokens:
+
+```bash
+wifi-connect --brand-name Anthias --brand-css /etc/wifi-connect/brand.css
+```
+
+```css
+:root {
+  --color-accent: #ffe11a;
+  --color-accent-hover: #e6cb17;
+  --color-on-accent: #1f002a;
+  --color-focus-ring: rgb(255 225 26 / 0.45);
+}
+```
+
+Override **roles only** — never the `--c-*` primitives and never the markup.
+That split is the whole point: a rebrand that sticks to roles keeps working
+when the portal's layout changes. `ui/dist/brand.example.css` is a worked
+example.
+
+The file is read once at startup, so a path that does not exist stops the
+portal with a clear message rather than quietly serving an unbranded page.
+When the flag is unset the pages link nothing at all and stay a single
+request, which is what makes them work in a captive-portal mini-browser with
+no internet behind it.
 
 ## Requirements and limitations
 
