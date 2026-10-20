@@ -455,6 +455,7 @@ mod tests {
             "B",
             &[net("Home", 80, Security::WpaPsk)],
             "Choose a network, or enter its name.",
+            false,
         );
         assert!(html.contains("Choose a network"));
         assert!(html.contains("486f6d65"), "the list must survive the error");
