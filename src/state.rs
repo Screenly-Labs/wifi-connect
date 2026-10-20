@@ -51,10 +51,22 @@ pub struct Shared {
     pub portal_url: String,
     /// The product name shown in the page, for white-labelling.
     pub brand_name: String,
+    /// The integrator's stylesheet, served at `/brand.css`.
+    ///
+    /// Read once at startup rather than per request: it is a handful of
+    /// custom properties, the path is operator-supplied, and reading it
+    /// eagerly means a typo in `--brand-css` fails at boot with a clear
+    /// message instead of silently serving an unbranded portal to every
+    /// client. `Arc<str>` because `Shared` is cloned into every handler.
+    pub brand_css: Option<Arc<str>>,
 }
 
 impl Shared {
-    pub fn new(portal_url: String, brand_name: String) -> (Self, mpsc::Receiver<JoinRequest>) {
+    pub fn new(
+        portal_url: String,
+        brand_name: String,
+        brand_css: Option<Arc<str>>,
+    ) -> (Self, mpsc::Receiver<JoinRequest>) {
         let (join_tx, join_rx) = mpsc::channel(1);
         (
             Self {
@@ -66,6 +78,7 @@ impl Shared {
                 join_tx,
                 portal_url,
                 brand_name,
+                brand_css,
             },
             join_rx,
         )
@@ -140,7 +153,7 @@ mod tests {
     use crate::ssid::Ssid;
 
     fn shared() -> (Shared, mpsc::Receiver<JoinRequest>) {
-        Shared::new("http://192.168.42.1/".into(), "WiFi Connect".into())
+        Shared::new("http://192.168.42.1/".into(), "WiFi Connect".into(), None)
     }
 
     fn request(ssid: &str) -> JoinRequest {

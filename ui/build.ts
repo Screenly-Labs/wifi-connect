@@ -116,6 +116,10 @@ async function build(): Promise<void> {
     const out = html
       .replace('<!--STYLE-->', () => `<style>\n${style}\n</style>`)
       .replace('<!--SCRIPT-->', () => `<script>\n${script}\n</script>`)
+      // Substituted at render time, not here: the link must appear ONLY
+      // when --brand-css is set, so an unbranded portal keeps the
+      // single-request property this file's test asserts.
+      .replace('<!--BRAND-->', () => '{{BRAND_CSS}}')
     await writeFile(join(dist, `${page}.html`), out, 'utf8')
   }
 
