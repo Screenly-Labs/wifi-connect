@@ -124,6 +124,7 @@ Every flag has an environment variable. Flags win.
 | `--force` | | `WIFI_CONNECT_FORCE` | `false` |
 | `--connection-timeout` | | `WIFI_CONNECT_CONNECTION_TIMEOUT` | `45` |
 | `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
+| `--insecure-eap-skip-server-verification` | | `WIFI_CONNECT_INSECURE_EAP` | `false` |
 
 ### Migrating from balena wifi-connect
 
@@ -247,11 +248,20 @@ failed unit.
 - **Architectures:** amd64, arm64, armv7 and armv6. ARMv6 covers the
   Raspberry Pi 1 and Pi Zero, which is the architecture upstream dropped in
   v4.4.6 without anyone noticing for three years.
-- **Enterprise WiFi is PEAP/MSCHAPv2 and TTLS/PAP only.** Certificate-based
-  EAP-TLS needs key and certificate paths a portal cannot collect. Also note
-  that without `domain-suffix-match` the supplicant will accept any server
-  certificate its CA store chains to, so PEAP here is not proof against a
-  determined on-path attacker.
+- **Enterprise WiFi is PEAP/MSCHAPv2 only.** Certificate-based EAP-TLS
+  needs key and certificate paths a portal cannot collect. The RADIUS
+  server's certificate must chain to the **host's** system CA store
+  (NetworkManager's `system-ca-certs`; it is the host's wpa_supplicant that
+  reads it, so the `FROM scratch` container image is irrelevant). The
+  portal also asks for an optional *server domain*, which becomes
+  `domain-suffix-match`: without one, any certificate a public CA has issued
+  for *any* name passes, so it is worth filling in. The outer identity is
+  sent as `anonymous@<realm>` (or `anonymous`), so the real username stays
+  inside the TLS tunnel. A network whose RADIUS server uses a **private CA**
+  will fail to join; `--insecure-eap-skip-server-verification` turns CA
+  checking off for it, logs a warning, and lets anyone in radio range who
+  copies the network's name capture the user's MSCHAPv2 exchange, which
+  cracks offline to their password hash.
 - **No rescan button.** A radio in AP mode cannot scan, so rescanning would
   mean dropping the access point and disconnecting the user mid-setup. Use
   the hidden-network field to enter an SSID that did not appear.

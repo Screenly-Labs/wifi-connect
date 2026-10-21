@@ -6,7 +6,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use tracing::warn;
 
-use crate::nm::JoinRequest;
+use crate::nm::security::Security;
+use crate::nm::{JoinRequest, WifiNetwork};
 use crate::passphrase;
 use crate::secret::Secret;
 use crate::ssid::Ssid;
@@ -180,6 +181,10 @@ pub struct ConnectForm {
     pub identity: String,
     #[serde(default)]
     pub passphrase: String,
+    /// Enterprise only: the domain the RADIUS server's certificate must
+    /// belong to. Optional; see [`server_domain`].
+    #[serde(default)]
+    pub server_domain: String,
 }
 
 /// Why a submission was rejected before we touched the radio.
@@ -187,6 +192,7 @@ pub struct ConnectForm {
 pub enum FormError {
     NoNetwork,
     BadPassphrase(String),
+    BadServerDomain,
 }
 
 impl FormError {
@@ -194,8 +200,54 @@ impl FormError {
         match self {
             FormError::NoNetwork => "Choose a network, or enter its name.".into(),
             FormError::BadPassphrase(m) => m.clone(),
+            FormError::BadServerDomain => {
+                "The server domain must be a host name such as radius.example.com.".into()
+            }
         }
     }
+}
+
+/// The longest DNS name, in its dotted text form.
+const MAX_DOMAIN_LEN: usize = 253;
+
+/// Validate the optional "server domain" an enterprise user may supply.
+///
+/// It becomes `802-1x.domain-suffix-match`, which pins the RADIUS server's
+/// certificate to a name rather than to "anything the CA store will sign".
+/// We accept only what a host name can be — LDH labels of 1 to 63
+/// characters, 253 in all — because the value is handed to the supplicant
+/// verbatim: wpa_supplicant reads `;` in that field as a separator between
+/// alternatives, so letting punctuation through would let one field
+/// quietly widen the match. A trailing dot (the absolute form) is dropped
+/// rather than refused, since people paste it from DNS tools.
+///
+/// Blank means "not supplied", which is not an error: system-CA validation
+/// still applies without it.
+pub fn server_domain(raw: &str) -> Result<Option<String>, FormError> {
+    let t = raw.trim();
+    let t = t.strip_suffix('.').unwrap_or(t);
+    if t.is_empty() {
+        return if raw.trim().is_empty() {
+            Ok(None)
+        } else {
+            // A lone "." is not a domain.
+            Err(FormError::BadServerDomain)
+        };
+    }
+    if t.len() > MAX_DOMAIN_LEN {
+        return Err(FormError::BadServerDomain);
+    }
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    if !t.split('.').all(label_ok) {
+        return Err(FormError::BadServerDomain);
+    }
+    // Certificate name matching is case-insensitive; store one spelling.
+    Ok(Some(t.to_ascii_lowercase()))
 }
 
 /// Turn a submitted form into a join request.
@@ -205,7 +257,16 @@ impl FormError {
 /// instead of surfacing an opaque `InvalidProperty`. It also avoids a
 /// thirty-second access-point bounce that teaches the user nothing: on a
 /// validation failure the AP never goes down at all.
-pub fn validate(form: &ConnectForm) -> Result<JoinRequest, FormError> {
+///
+/// `scanned` is the network list the portal offered. A username is what
+/// turns a join into an 802.1X one (see `classify_credentials`), so when
+/// the user picked a scanned network that is *not* enterprise, any
+/// username and server domain that came along are dropped: a stale value
+/// from a hidden field, a browser's autofill, or a hand-crafted POST must
+/// not turn a WPA-PSK join into a doomed EAP one. A typed (hidden) network,
+/// or one that has since left the list, has no recorded security, so there
+/// the username alone decides, as before.
+pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinRequest, FormError> {
     let typed = form.ssid.trim();
     let (ssid, hidden) = if !form.ssid_hex.is_empty() {
         (
@@ -222,23 +283,49 @@ pub fn validate(form: &ConnectForm) -> Result<JoinRequest, FormError> {
         return Err(FormError::NoNetwork);
     }
 
-    let passphrase = if form.passphrase.is_empty() {
+    let known_security = if hidden {
         None
     } else {
-        passphrase::validate(&form.passphrase)
-            .map_err(|e| FormError::BadPassphrase(e.to_string()))?;
-        Some(Secret::new(form.passphrase.clone()))
+        let hex = ssid.to_hex();
+        scanned
+            .iter()
+            .find(|n| n.ssid_hex == hex)
+            .map(|n| n.security)
     };
 
     let identity = {
         let t = form.identity.trim();
         (!t.is_empty()).then(|| t.to_string())
+    }
+    .filter(|_| known_security.is_none_or(Security::needs_identity));
+    let enterprise = identity.is_some();
+
+    let passphrase = if form.passphrase.is_empty() {
+        None
+    } else {
+        // The 8..=63 printable-ASCII rule is WPA-PSK's. An 802.1X password
+        // is whatever the directory behind the RADIUS server allows, which
+        // is routinely longer than 63 characters.
+        if !enterprise {
+            passphrase::validate(&form.passphrase)
+                .map_err(|e| FormError::BadPassphrase(e.to_string()))?;
+        }
+        Some(Secret::new(form.passphrase.clone()))
+    };
+
+    // Only meaningful next to a username; otherwise ignored rather than
+    // validated, so a leftover value cannot fail a PSK join either.
+    let server_domain = if enterprise {
+        server_domain(&form.server_domain)?
+    } else {
+        None
     };
 
     Ok(JoinRequest {
         ssid,
         identity,
         passphrase,
+        server_domain,
         hidden,
     })
 }
@@ -384,7 +471,7 @@ pub async fn connect(
         );
     }
 
-    let request = match validate(&form) {
+    let request = match validate(&form, &shared.networks()) {
         Ok(r) => r,
         Err(e) => {
             // No teardown: the user stays on the portal and fixes the typo.
@@ -435,19 +522,20 @@ mod tests {
             ssid: ssid.into(),
             identity: String::new(),
             passphrase: passphrase.into(),
+            server_domain: String::new(),
         }
     }
 
     #[test]
     fn a_selected_network_is_identified_by_its_exact_bytes() {
-        let r = validate(&form("4d79ff", "", "abcdefgh")).unwrap();
+        let r = validate(&form("4d79ff", "", "abcdefgh"), &[]).unwrap();
         assert_eq!(r.ssid.as_bytes(), &[0x4d, 0x79, 0xff]);
         assert!(!r.hidden, "a scanned network is not hidden");
     }
 
     #[test]
     fn a_typed_network_is_treated_as_hidden() {
-        let r = validate(&form("", "  My Hidden Net  ", "abcdefgh")).unwrap();
+        let r = validate(&form("", "  My Hidden Net  ", "abcdefgh"), &[]).unwrap();
         assert_eq!(
             r.ssid,
             Ssid::from("My Hidden Net"),
@@ -458,7 +546,7 @@ mod tests {
 
     #[test]
     fn the_selected_network_wins_over_a_typed_one() {
-        let r = validate(&form("486f6d65", "Typed", "abcdefgh")).unwrap();
+        let r = validate(&form("486f6d65", "Typed", "abcdefgh"), &[]).unwrap();
         assert_eq!(r.ssid, Ssid::from("Home"));
     }
 
@@ -469,7 +557,7 @@ mod tests {
             form("", "   ", "abcdefgh"),
             form("zzz", "", "abcdefgh"),
         ] {
-            assert_eq!(validate(&f).unwrap_err(), FormError::NoNetwork);
+            assert_eq!(validate(&f, &[]).unwrap_err(), FormError::NoNetwork);
         }
     }
 
@@ -478,7 +566,7 @@ mod tests {
     /// would teach the user nothing.
     #[test]
     fn a_short_passphrase_is_rejected_before_the_radio_is_touched() {
-        let err = validate(&form("486f6d65", "", "short")).unwrap_err();
+        let err = validate(&form("486f6d65", "", "short"), &[]).unwrap_err();
         match err {
             FormError::BadPassphrase(m) => assert!(m.contains('8'), "unhelpful: {m}"),
             other => panic!("expected a passphrase error, got {other:?}"),
@@ -487,13 +575,13 @@ mod tests {
 
     #[test]
     fn an_over_long_passphrase_is_rejected() {
-        let err = validate(&form("486f6d65", "", &"a".repeat(64))).unwrap_err();
+        let err = validate(&form("486f6d65", "", &"a".repeat(64)), &[]).unwrap_err();
         assert!(matches!(err, FormError::BadPassphrase(_)));
     }
 
     #[test]
     fn an_empty_passphrase_means_an_open_network() {
-        let r = validate(&form("486f6d65", "", "")).unwrap();
+        let r = validate(&form("486f6d65", "", ""), &[]).unwrap();
         assert!(r.passphrase.is_none());
     }
 
@@ -501,7 +589,7 @@ mod tests {
     fn an_identity_is_carried_for_enterprise_networks() {
         let mut f = form("486f6d65", "", "abcdefgh");
         f.identity = "  alice  ".into();
-        let r = validate(&f).unwrap();
+        let r = validate(&f, &[]).unwrap();
         assert_eq!(r.identity.as_deref(), Some("alice"));
     }
 
@@ -509,7 +597,7 @@ mod tests {
     fn a_blank_identity_is_dropped_rather_than_sent_as_empty() {
         let mut f = form("486f6d65", "", "abcdefgh");
         f.identity = "   ".into();
-        assert!(validate(&f).unwrap().identity.is_none());
+        assert!(validate(&f, &[]).unwrap().identity.is_none());
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -744,7 +832,157 @@ mod tests {
 
     #[test]
     fn the_passphrase_does_not_leak_through_the_request_debug() {
-        let r = validate(&form("486f6d65", "", "sup3rsecret")).unwrap();
+        let r = validate(&form("486f6d65", "", "sup3rsecret"), &[]).unwrap();
         assert!(!format!("{r:?}").contains("sup3rsecret"));
+    }
+
+    #[test]
+    fn a_server_domain_is_carried_normalised() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.identity = "alice@example.com".into();
+        f.server_domain = "  Radius.Example.COM.  ".into();
+        let r = validate(&f, &[]).unwrap();
+        assert_eq!(
+            r.server_domain.as_deref(),
+            Some("radius.example.com"),
+            "trimmed, lower-cased, and without the absolute-form dot"
+        );
+    }
+
+    #[test]
+    fn a_blank_server_domain_is_simply_not_supplied() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.server_domain = "   ".into();
+        assert!(validate(&f, &[]).unwrap().server_domain.is_none());
+    }
+
+    /// The value goes to the supplicant verbatim, and wpa_supplicant reads
+    /// `;` in `domain_suffix_match` as "or". Anything but a host name must
+    /// be refused before it can widen the match.
+    #[test]
+    fn a_server_domain_that_is_not_a_host_name_is_rejected() {
+        for bad in [
+            ".",
+            "example.com;evil.net",
+            "example .com",
+            "example..com",
+            ".example.com",
+            "-radius.example.com",
+            "radius-.example.com",
+            "radius_1.example.com",
+            "*.example.com",
+            "exämple.com",
+            "radius.example.com/x",
+        ] {
+            assert_eq!(
+                server_domain(bad).unwrap_err(),
+                FormError::BadServerDomain,
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_domain_length_limits_are_enforced() {
+        let label63 = "a".repeat(63);
+        assert!(server_domain(&format!("{label63}.com")).is_ok());
+        assert!(server_domain(&format!("{}a.com", label63)).is_err());
+
+        // 4 x 63 + 3 dots = 255 > 253.
+        let long = [label63.as_str(); 4].join(".");
+        assert!(server_domain(&long).is_err());
+        // A single label is a valid suffix to match on.
+        assert_eq!(server_domain("corp").unwrap().as_deref(), Some("corp"));
+    }
+
+    /// Rejected before the radio is touched, like a bad passphrase: a typo
+    /// here would otherwise cost an access-point bounce and come back as a
+    /// generic authentication failure.
+    #[test]
+    fn a_bad_server_domain_fails_the_whole_submission() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.identity = "alice".into();
+        f.server_domain = "example.com;evil.net".into();
+        assert_eq!(validate(&f, &[]).unwrap_err(), FormError::BadServerDomain);
+    }
+
+    /// "Home" (486f6d65) as the portal listed it.
+    fn scanned(security: Security) -> Vec<WifiNetwork> {
+        vec![WifiNetwork::new(
+            Ssid::from("Home"),
+            80,
+            security,
+            Some(2437),
+        )]
+    }
+
+    /// The portal hides the username block for a PSK network but a hidden
+    /// input still submits, and autofill or a crafted POST can fill it
+    /// anyway. A username is what makes a join 802.1X, so on a network the
+    /// scan says is PSK it must be dropped, or a correct WPA password goes
+    /// out as an EAP login and the join fails.
+    #[test]
+    fn a_username_sent_for_a_scanned_psk_network_is_dropped() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.identity = "alice".into();
+        f.server_domain = "radius.example.com".into();
+        let r = validate(&f, &scanned(Security::WpaPsk)).unwrap();
+        assert!(r.identity.is_none(), "would have been joined as EAP");
+        assert!(r.server_domain.is_none());
+        assert!(r.passphrase.is_some());
+    }
+
+    /// Ignored, so not validated either: a leftover typo in a field the
+    /// user can no longer see must not block a PSK join.
+    #[test]
+    fn a_leftover_bad_server_domain_does_not_fail_a_psk_join() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.identity = "alice".into();
+        f.server_domain = "example.com;evil.net".into();
+        assert!(validate(&f, &scanned(Security::WpaPsk)).is_ok());
+    }
+
+    #[test]
+    fn a_username_is_kept_for_a_scanned_enterprise_network() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.identity = "alice".into();
+        f.server_domain = "radius.example.com".into();
+        let r = validate(&f, &scanned(Security::Enterprise)).unwrap();
+        assert_eq!(r.identity.as_deref(), Some("alice"));
+        assert_eq!(r.server_domain.as_deref(), Some("radius.example.com"));
+    }
+
+    /// The 8..=63 rule is WPA-PSK's. Directory passwords are routinely
+    /// longer, shorter, or non-ASCII.
+    #[test]
+    fn enterprise_passwords_are_not_held_to_the_wpa_psk_rules() {
+        for pw in [
+            "a".repeat(64),
+            "a".repeat(200),
+            "short".into(),
+            "pässwörd".into(),
+        ] {
+            let mut f = form("486f6d65", "", &pw);
+            f.identity = "alice".into();
+            let r = validate(&f, &scanned(Security::Enterprise)).unwrap();
+            assert_eq!(r.passphrase.unwrap().expose(), pw);
+        }
+        // The same password without a username is a PSK and still checked.
+        let f = form("486f6d65", "", &"a".repeat(64));
+        assert!(matches!(
+            validate(&f, &scanned(Security::Enterprise)).unwrap_err(),
+            FormError::BadPassphrase(_)
+        ));
+    }
+
+    /// A typed hidden network was never scanned, so the username is the
+    /// only signal; it must still reach the join.
+    #[test]
+    fn a_hidden_network_keeps_its_username() {
+        let mut f = form("", "Home", "abcdefgh");
+        f.identity = "alice".into();
+        let r = validate(&f, &scanned(Security::WpaPsk)).unwrap();
+        assert!(r.hidden);
+        assert_eq!(r.identity.as_deref(), Some("alice"));
     }
 }

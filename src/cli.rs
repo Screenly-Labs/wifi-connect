@@ -85,6 +85,18 @@ pub struct Cli {
     )]
     pub insecure_open_portal: bool,
 
+    /// Join enterprise (802.1X) networks WITHOUT verifying the RADIUS
+    /// server's certificate.
+    ///
+    /// By default the server must chain to the host's system CA store, and
+    /// to the server domain the user typed, when they typed one. A network
+    /// whose RADIUS server uses a private CA will then fail to join; this
+    /// restores the old accept-anything behaviour for it. Anyone in radio
+    /// range can then impersonate the network and capture the user's
+    /// MSCHAPv2 exchange, which cracks offline to their password hash.
+    #[arg(long, env = "WIFI_CONNECT_INSECURE_EAP", default_value_t = false)]
+    pub insecure_eap_skip_server_verification: bool,
+
     /// Gateway address of the setup network.
     #[arg(
         short = 'g',
@@ -355,6 +367,16 @@ mod tests {
         assert!(
             !c.insecure_open_portal,
             "upstream defaults to an open AP; we must not"
+        );
+    }
+
+    /// Skipping RADIUS server verification hands the user's credentials to
+    /// any look-alike access point, so it must never be the default.
+    #[test]
+    fn enterprise_server_verification_is_on_by_default() {
+        assert!(!cli(&[]).insecure_eap_skip_server_verification);
+        assert!(
+            cli(&["--insecure-eap-skip-server-verification"]).insecure_eap_skip_server_verification
         );
     }
 

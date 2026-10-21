@@ -33,7 +33,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, LogFormat};
-use nm::nmrs_impl::NmrsControl;
+use nm::nmrs_impl::{EapServerCheck, NmrsControl};
 use secret::Secret;
 use ssid::Ssid;
 
@@ -154,7 +154,17 @@ async fn run() -> ExitCode {
     let ssid = Ssid::from(args.portal_ssid.as_str());
     publish_qr(&args, &ssid, passphrase.as_ref());
 
-    let nm = match NmrsControl::connect().await {
+    let eap_server_check = if args.insecure_eap_skip_server_verification {
+        warn!(
+            "enterprise WiFi server verification is OFF: any access point \
+             copying the network's name can capture the user's credentials"
+        );
+        EapServerCheck::Insecure
+    } else {
+        EapServerCheck::SystemCa
+    };
+
+    let nm = match NmrsControl::connect(eap_server_check).await {
         Ok(nm) => nm,
         Err(e) => {
             error!("{e}");

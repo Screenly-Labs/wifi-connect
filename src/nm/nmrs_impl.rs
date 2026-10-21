@@ -40,10 +40,30 @@ pub const AP_PROFILE_ID: &str = "wifi-connect-portal";
 
 pub struct NmrsControl {
     nm: NetworkManager,
+    eap_server_check: EapServerCheck,
+}
+
+/// Whether an enterprise join verifies the RADIUS server's certificate.
+///
+/// Without verification, PEAP's protection is illusory: an access point
+/// that merely copies the SSID can terminate the TLS tunnel with any
+/// certificate, run the MSCHAPv2 exchange, and walk away with something
+/// that cracks offline to the user's NT hash. That is the attack
+/// `hostapd-wpe` packages, and it needs nothing more than radio range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EapServerCheck {
+    /// Chain the server's certificate to the system CA store (and to the
+    /// user's server domain, when they gave one). The default.
+    #[default]
+    SystemCa,
+    /// Accept any server certificate. Only for networks whose RADIUS
+    /// server uses a private CA that the host store does not carry, and
+    /// only by explicit operator choice.
+    Insecure,
 }
 
 impl NmrsControl {
-    pub async fn connect() -> Result<Self, NetworkError> {
+    pub async fn connect(eap_server_check: EapServerCheck) -> Result<Self, NetworkError> {
         // nmrs calls zbus's `Connection::system()`, which honours
         // DBUS_SYSTEM_BUS_ADDRESS. That is how the balena container reaches
         // the host bus at /host/run/dbus/system_bus_socket — set in the
@@ -52,7 +72,10 @@ impl NmrsControl {
         let nm = NetworkManager::new()
             .await
             .map_err(|e| NetworkError::Unreachable(e.to_string()))?;
-        Ok(Self { nm })
+        Ok(Self {
+            nm,
+            eap_server_check,
+        })
     }
 
     fn bus(&self) -> &zbus::Connection {
@@ -131,10 +154,16 @@ impl NmrsControl {
 
         builder = match classify_credentials(request) {
             Credential::Psk(psk) => builder.wpa_psk(psk.expose()),
-            Credential::Eap { identity, password } => builder
-                .try_wpa_eap(nmrs::EapOptions::new(
-                    identity.to_string(),
-                    password.expose(),
+            Credential::Eap {
+                identity,
+                password,
+                server_domain,
+            } => builder
+                .try_wpa_eap(eap_options(
+                    identity,
+                    password,
+                    server_domain,
+                    self.eap_server_check,
                 ))
                 .map_err(|e| NetworkError::Other(e.to_string()))?,
             Credential::Open => builder.open(),
@@ -305,17 +334,16 @@ impl NmrsControl {
 /// server-rendered `needs-*` booleans set out to remove on the UI side.
 enum Credential<'a> {
     Psk(&'a Secret),
-    // PEAP/MSCHAPv2 and TTLS/PAP are the 90% of enterprise WiFi.
-    // Certificate-based EAP-TLS needs key and certificate paths that a
-    // captive portal has no way to collect.
+    // PEAP/MSCHAPv2 (nmrs's default method) is the bulk of enterprise
+    // WiFi. Certificate-based EAP-TLS needs key and certificate paths that
+    // a captive portal has no way to collect.
     //
-    // Known limitation, documented in the README: without a
-    // `domain_suffix_match` the supplicant accepts any server certificate
-    // the CA store chains to, so this is not proof against a determined
-    // on-path attacker.
+    // How the server is authenticated is decided in [`eap_options`]; see
+    // there, and the README's "Requirements and limitations".
     Eap {
         identity: &'a str,
         password: &'a Secret,
+        server_domain: Option<&'a str>,
     },
     // An identity with no password, or neither: treat as open.
     // NetworkManager rejects a security section with nothing in it.
@@ -328,9 +356,58 @@ fn classify_credentials(request: &JoinRequest) -> Credential<'_> {
         (Some(password), Some(identity)) => Credential::Eap {
             identity: identity.as_str(),
             password,
+            server_domain: request.server_domain.as_deref(),
         },
         _ => Credential::Open,
     }
+}
+
+/// The outer (phase-1) identity to send for `identity`.
+///
+/// PEAP sends the outer identity before the TLS tunnel exists, so whatever
+/// goes there crosses the air in clear — to the real network and to any
+/// look-alike. The real username belongs inside the tunnel only. The realm
+/// is kept, because RADIUS proxies (eduroam is the famous case) route on
+/// it; a server that sees a bare "anonymous" may not know where to send
+/// the request. `DOMAIN\user` carries no routable realm, so it gets the
+/// bare form.
+fn anonymous_identity(identity: &str) -> String {
+    match identity.rsplit_once('@') {
+        Some((_, realm)) if !realm.is_empty() => format!("anonymous@{realm}"),
+        _ => "anonymous".to_string(),
+    }
+}
+
+/// The EAP options for an enterprise join.
+///
+/// nmrs's `EapOptions::new` defaults to no CA at all, which tells
+/// wpa_supplicant to accept any server certificate. We turn the system CA
+/// store on instead. Note that it is the *host's* store that matters, not
+/// this process's: NetworkManager translates `system-ca-certs` into a
+/// `ca_path` for wpa_supplicant, which runs on the host and opens that
+/// path in its own filesystem. That is why it works even though our
+/// container image is `FROM scratch` with no certificates in it.
+///
+/// A public CA alone still admits any certificate a public CA will issue,
+/// for any name, so the user's server domain, when given, narrows it to
+/// the one name that should be there.
+fn eap_options(
+    identity: &str,
+    password: &Secret,
+    server_domain: Option<&str>,
+    check: EapServerCheck,
+) -> nmrs::EapOptions {
+    let mut opts = nmrs::EapOptions::new(identity, password.expose())
+        .with_anonymous_identity(anonymous_identity(identity))
+        .with_system_ca_certs(check == EapServerCheck::SystemCa);
+    if let Some(domain) = server_domain {
+        // Kept under the insecure opt-out too. The operator turned off CA
+        // chaining, not the user's own name check; without a trusted CA a
+        // forged certificate can carry any name, so this is weak there,
+        // but it is what the user asked for and it costs nothing.
+        opts = opts.with_domain_suffix_match(domain);
+    }
+    opts
 }
 
 /// Shortest budget worth spending on a fresh open profile after a saved one
@@ -410,13 +487,17 @@ const WIFI_SSID: nmrs::models::Property<Vec<u8>> =
     nmrs::models::Property::new(WIFI_CONNECTION_TYPE, "ssid");
 
 /// Build the credentials nmrs wants from a portal submission.
-fn credentials_for(request: &JoinRequest) -> WifiSecurity {
+fn credentials_for(request: &JoinRequest, check: EapServerCheck) -> WifiSecurity {
     match classify_credentials(request) {
         Credential::Psk(psk) => WifiSecurity::WpaPsk {
             psk: psk.expose().to_string(),
         },
-        Credential::Eap { identity, password } => WifiSecurity::WpaEap {
-            opts: nmrs::EapOptions::new(identity.to_string(), password.expose()),
+        Credential::Eap {
+            identity,
+            password,
+            server_domain,
+        } => WifiSecurity::WpaEap {
+            opts: eap_options(identity, password, server_domain, check),
         },
         Credential::Open => WifiSecurity::Open,
     }
@@ -747,8 +828,11 @@ impl NetworkControl for NmrsControl {
 
         let attempt = tokio::time::timeout(
             budget,
-            self.nm
-                .try_connect(&ssid, Some(&device.interface), credentials_for(request)),
+            self.nm.try_connect(
+                &ssid,
+                Some(&device.interface),
+                credentials_for(request, self.eap_server_check),
+            ),
         )
         .await;
 
@@ -1050,12 +1134,116 @@ mod tests {
         assert_eq!(security::classify(features_of(&both)), Security::Enterprise);
     }
 
+    fn enterprise(identity: &str, server_domain: Option<&str>) -> JoinRequest {
+        JoinRequest {
+            ssid: Ssid::from("Corp"),
+            identity: Some(identity.into()),
+            passphrase: Some(Secret::new("hunter2")),
+            server_domain: server_domain.map(str::to_string),
+            hidden: false,
+        }
+    }
+
+    fn eap_of(security: WifiSecurity) -> nmrs::EapOptions {
+        match security {
+            WifiSecurity::WpaEap { opts } => opts,
+            other => panic!("expected WPA-EAP, got {other:?}"),
+        }
+    }
+
+    /// The realm survives, because RADIUS proxies route on it; the user
+    /// part never leaves the TLS tunnel.
+    #[test]
+    fn the_outer_identity_keeps_the_realm_and_drops_the_user() {
+        assert_eq!(
+            anonymous_identity("alice@example.com"),
+            "anonymous@example.com"
+        );
+        assert_eq!(
+            anonymous_identity("alice@staff@uni.example"),
+            "anonymous@uni.example",
+            "the realm is what follows the LAST @"
+        );
+        assert_eq!(anonymous_identity("alice"), "anonymous");
+        assert_eq!(anonymous_identity(r"CORP\alice"), "anonymous");
+        assert_eq!(
+            anonymous_identity("alice@"),
+            "anonymous",
+            "an empty realm is no realm"
+        );
+    }
+
+    /// The regression this pins: nmrs's defaults validate nothing, which
+    /// hands an evil twin the MSCHAPv2 exchange.
+    #[test]
+    fn enterprise_joins_verify_the_server_by_default() {
+        let opts = eap_of(credentials_for(
+            &enterprise("alice@example.com", None),
+            EapServerCheck::default(),
+        ));
+        assert!(
+            opts.system_ca_certs,
+            "the server must chain to the CA store"
+        );
+        assert_eq!(opts.identity, "alice@example.com");
+        assert_eq!(
+            opts.anonymous_identity.as_deref(),
+            Some("anonymous@example.com"),
+            "the real username must not be the cleartext outer identity"
+        );
+        assert_eq!(opts.domain_suffix_match, None);
+    }
+
+    #[test]
+    fn a_server_domain_becomes_the_domain_suffix_match() {
+        let opts = eap_of(credentials_for(
+            &enterprise("alice", Some("radius.example.com")),
+            EapServerCheck::SystemCa,
+        ));
+        assert!(opts.system_ca_certs);
+        assert_eq!(
+            opts.domain_suffix_match.as_deref(),
+            Some("radius.example.com")
+        );
+        assert_eq!(opts.anonymous_identity.as_deref(), Some("anonymous"));
+    }
+
+    /// The opt-out drops CA checking and nothing else: the identity stays
+    /// anonymous and a supplied domain still applies.
+    #[test]
+    fn only_the_explicit_opt_out_skips_server_verification() {
+        let opts = eap_of(credentials_for(
+            &enterprise("alice@example.com", Some("example.com")),
+            EapServerCheck::Insecure,
+        ));
+        assert!(!opts.system_ca_certs);
+        assert_eq!(
+            opts.anonymous_identity.as_deref(),
+            Some("anonymous@example.com")
+        );
+        assert_eq!(opts.domain_suffix_match.as_deref(), Some("example.com"));
+    }
+
+    /// A domain is an enterprise setting; on a PSK network it must not turn
+    /// the join into something else.
+    #[test]
+    fn a_server_domain_without_an_identity_is_ignored() {
+        let mut r = enterprise("alice", Some("example.com"));
+        r.identity = None;
+        r.passphrase = Some(Secret::new("abcdefgh"));
+        assert!(matches!(
+            credentials_for(&r, EapServerCheck::SystemCa),
+            WifiSecurity::WpaPsk { .. }
+        ));
+    }
+
     fn join(ssid: &str, passphrase: Option<&str>, hidden: bool) -> JoinRequest {
         JoinRequest {
             ssid: Ssid::from(ssid),
             identity: None,
             passphrase: passphrase.map(Secret::new),
             hidden,
+            server_domain: None,
         }
     }
 

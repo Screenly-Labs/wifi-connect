@@ -95,6 +95,9 @@ pub struct JoinRequest {
     pub ssid: Ssid,
     pub identity: Option<String>,
     pub passphrase: Option<Secret>,
+    /// For enterprise networks: the domain the RADIUS server's certificate
+    /// must belong to (`802-1x.domain-suffix-match`). Ignored otherwise.
+    pub server_domain: Option<String>,
     pub hidden: bool,
 }
 
