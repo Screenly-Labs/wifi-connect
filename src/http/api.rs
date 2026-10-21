@@ -1,7 +1,7 @@
 //! The portal's handlers.
 
 use axum::Form;
-use axum::extract::State;
+use axum::extract::{FromRequest, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use tracing::warn;
@@ -596,14 +596,135 @@ fn cross_site_reason(headers: &HeaderMap, portal_url: &str) -> Option<&'static s
     None
 }
 
-pub async fn connect(
-    State(shared): State<Shared>,
-    headers: HeaderMap,
-    Form(form): Form<ConnectForm>,
+/// One row of upstream's `GET /networks`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+pub struct UpstreamNetwork {
+    pub ssid: String,
+    /// `none`, `wep`, `wpa` or `enterprise`, upstream's four values.
+    pub security: &'static str,
+}
+
+/// Upstream's name for a security type.
+///
+/// Upstream has four, and a client branches on them to decide which
+/// fields to ask for: `none` takes nothing, `enterprise` a username and a
+/// password, the other two a password. So OWE, which is encrypted but takes
+/// no credential, is `none`, and every WPA-Personal flavour is `wpa`.
+fn upstream_security(security: Security) -> &'static str {
+    match security {
+        Security::Open | Security::Owe => "none",
+        Security::Wep => "wep",
+        Security::WpaPsk | Security::Sae | Security::SaeTransitional => "wpa",
+        Security::Enterprise => "enterprise",
+    }
+}
+
+/// `GET /networks`, in upstream's shape: `[{"ssid": …, "security": …}]`.
+///
+/// For scripts and custom front ends written against balena's API. Our own
+/// pages never call it; `/api/networks` carries more (the exact SSID bytes,
+/// strength, frequency).
+pub async fn upstream_networks(State(shared): State<Shared>) -> Response {
+    let rows: Vec<UpstreamNetwork> = shared
+        .networks()
+        .into_iter()
+        .map(|n| UpstreamNetwork {
+            security: upstream_security(n.security),
+            ssid: n.ssid,
+        })
+        .collect();
+    no_store(axum::Json(rows).into_response())
+}
+
+/// Upstream's `POST /connect` body, which its UI sends as JSON.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct UpstreamConnect {
+    #[serde(default)]
+    pub ssid: String,
+    #[serde(default)]
+    pub identity: String,
+    #[serde(default)]
+    pub passphrase: String,
+}
+
+impl UpstreamConnect {
+    /// Our form, from upstream's fields.
+    ///
+    /// Upstream names a network by its display name only. One the scan
+    /// listed is joined by its exact bytes, as if picked from our list, so
+    /// it is not mistaken for a hidden network and keeps its scanned
+    /// security; any other name is joined as a typed (hidden) network,
+    /// which is what upstream's API had no way to ask for.
+    fn into_form(self, scanned: &[WifiNetwork]) -> ConnectForm {
+        let typed = self.ssid.trim();
+        let ssid_hex = scanned
+            .iter()
+            .find(|n| n.ssid == typed)
+            .map(|n| n.ssid_hex.clone())
+            .unwrap_or_default();
+        ConnectForm {
+            ssid_hex,
+            ssid: self.ssid,
+            identity: self.identity,
+            passphrase: self.passphrase,
+            ..ConnectForm::default()
+        }
+    }
+}
+
+/// How `POST /connect` answers: the page for a browser's form post, JSON
+/// for a client speaking upstream's API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    Page,
+    Json,
+}
+
+/// `POST /connect`: our form, or upstream's JSON body.
+///
+/// Told apart by `Content-Type`, which is also what keeps the JSON form
+/// safe from other sites: a cross-origin `application/json` POST needs a
+/// CORS preflight, which nothing here answers, and the provenance check in
+/// [`connect_with`] applies to both.
+pub async fn connect(State(shared): State<Shared>, request: Request) -> Response {
+    let is_json = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
+    let headers = request.headers().clone();
+    if is_json {
+        match axum::Json::<UpstreamConnect>::from_request(request, &shared).await {
+            Ok(axum::Json(body)) => {
+                let form = body.into_form(&shared.networks());
+                connect_with(shared, &headers, form, Reply::Json).await
+            }
+            Err(rejection) => rejection.into_response(),
+        }
+    } else {
+        match Form::<ConnectForm>::from_request(request, &shared).await {
+            Ok(Form(form)) => connect_with(shared, &headers, form, Reply::Page).await,
+            Err(rejection) => rejection.into_response(),
+        }
+    }
+}
+
+/// A JSON answer for upstream's API: `{"error": …}` on refusal, the
+/// network's name once the join is under way.
+fn json_reply(status: StatusCode, body: serde_json::Value) -> Response {
+    no_store((status, axum::Json(body)).into_response())
+}
+
+async fn connect_with(
+    shared: Shared,
+    headers: &HeaderMap,
+    form: ConnectForm,
+    reply: Reply,
 ) -> Response {
     // Before validation, so a forged request learns nothing about what the
     // form would have accepted, and long before the radio is touched.
-    if let Some(reason) = cross_site_reason(&headers, &shared.portal_url) {
+    if let Some(reason) = cross_site_reason(headers, &shared.portal_url) {
         warn!(
             reason,
             host = ?headers.get(header::HOST),
@@ -612,6 +733,12 @@ pub async fn connect(
             sec_fetch_site = ?headers.get("sec-fetch-site"),
             "rejected a cross-site POST /connect"
         );
+        if reply == Reply::Json {
+            return json_reply(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({ "error": "request did not come from this portal" }),
+            );
+        }
         return no_store(
             (
                 StatusCode::FORBIDDEN,
@@ -635,6 +762,12 @@ pub async fn connect(
         Ok(r) => r,
         Err(e) => {
             // No teardown: the user stays on the portal and fixes the typo.
+            if reply == Reply::Json {
+                return json_reply(
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({ "error": e.message() }),
+                );
+            }
             return no_store(
                 (
                     StatusCode::BAD_REQUEST,
@@ -652,6 +785,12 @@ pub async fn connect(
     let ssid = request.ssid.to_display_string();
 
     if !shared.submit(request).await {
+        if reply == Reply::Json {
+            return json_reply(
+                StatusCode::CONFLICT,
+                serde_json::json!({ "error": "a join is already in progress" }),
+            );
+        }
         return no_store(
             (
                 StatusCode::CONFLICT,
@@ -663,6 +802,9 @@ pub async fn connect(
 
     // Answer now, before the state machine tears the access point down.
     // Anything not already flushed dies with the client's connection.
+    if reply == Reply::Json {
+        return json_reply(StatusCode::ACCEPTED, serde_json::json!({ "ssid": ssid }));
+    }
     no_store(
         (
             StatusCode::ACCEPTED,
@@ -1074,6 +1216,46 @@ mod tests {
             security,
             Some(2437),
         )]
+    }
+
+    /// Upstream clients branch on these four values to decide which fields
+    /// to ask for, so the mapping follows what each type needs.
+    #[test]
+    fn security_maps_onto_upstreams_four_values() {
+        for (security, want) in [
+            (Security::Open, "none"),
+            (Security::Owe, "none"),
+            (Security::Wep, "wep"),
+            (Security::WpaPsk, "wpa"),
+            (Security::Sae, "wpa"),
+            (Security::SaeTransitional, "wpa"),
+            (Security::Enterprise, "enterprise"),
+        ] {
+            assert_eq!(upstream_security(security), want, "{security:?}");
+        }
+    }
+
+    /// A name upstream's API sends is matched against the scan, so a listed
+    /// network keeps its exact bytes and scanned security; an unknown one
+    /// is joined as hidden.
+    #[test]
+    fn an_upstream_ssid_is_matched_against_the_scan() {
+        let body = |ssid: &str| UpstreamConnect {
+            ssid: ssid.into(),
+            passphrase: "abcde".into(),
+            ..UpstreamConnect::default()
+        };
+        let listed = validate(
+            &body("Home").into_form(&scanned(Security::Wep)),
+            &scanned(Security::Wep),
+        )
+        .unwrap();
+        assert!(!listed.hidden);
+        assert!(listed.wep, "the scanned security must carry through");
+
+        let f = body("Elsewhere").into_form(&scanned(Security::Wep));
+        assert!(f.ssid_hex.is_empty());
+        assert_eq!(f.ssid, "Elsewhere");
     }
 
     /// A 40-bit WEP key is five characters, below WPA's minimum of eight,

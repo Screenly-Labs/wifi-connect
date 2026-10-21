@@ -35,6 +35,8 @@ things that bit us in production:
 | Wrong password | frequently just hangs | the portal comes back and says so |
 | Static IP | not supported ([#110](https://github.com/balena-os/wifi-connect/issues/110), open since 2017) | IPv4 and IPv6, set from the portal |
 | Architectures | ARMv6 binary silently dropped in 4.4.6 | amd64, arm64, armv7 **and armv6**, each executed in CI |
+| Hidden networks | dropped from the list, cannot be joined | typed by name in the portal |
+| Enterprise | PEAP/MSCHAPv2 only | PEAP, TTLS/MSCHAPv2 and TTLS/PAP |
 
 The encryption is the headline. A captive portal cannot use TLS — there is
 no publicly trusted certificate for `192.168.42.1`, and a self-signed one
@@ -174,7 +176,22 @@ environment variables. Two behaviours changed:
   is not interchangeable with upstream's: see
   [Replacing the pages](#replacing-the-pages---ui-directory).
 
-`--portal-interface` is accepted as a hidden alias for `--interface`.
+`--portal-interface` is accepted as a hidden alias for `--interface`, and
+its variable `PORTAL_INTERFACE` is read when neither the flag nor
+`WIFI_CONNECT_INTERFACE` is set.
+
+Upstream's HTTP API is kept too, for scripts and front ends written
+against it:
+
+- `GET /networks` returns `[{"ssid": "…", "security": "…"}]` with
+  upstream's four security values: `none`, `wep`, `wpa` and
+  `enterprise`. (`/api/networks` has more: exact SSID bytes, signal and
+  frequency.)
+- `POST /connect` with `Content-Type: application/json` takes
+  `{"ssid", "identity", "passphrase"}`. A name the scan listed is joined
+  by its exact bytes, anything else as a hidden network. It answers `202`
+  with `{"ssid": …}` once the join is under way, or `400`, `403` or `409`
+  with `{"error": …}`. The same cross-site checks as the form apply.
 
 ## Getting the passphrase to the user
 
@@ -291,9 +308,12 @@ wifi-connect --ui-directory /etc/wifi-connect/ui
   `{{BANNER}}`, `{{SSID}}`, `{{BRAND_NAME}}`, `{{BRAND_HEADING}}`,
   `{{BRAND_CSS}}`, `{{THEME_ATTR}}`, `{{THEME_TOGGLE}}`) and must keep the
   form fields the server reads. Start by copying `ui/dist`. **balena's
-  React UI build will not work** — it expects an API this portal does not
-  have — and an `index.html` with no `{{NETWORKS}}` token is refused at
-  startup for that reason. Any other token the built-in pages use but
+  React UI build will not work** — it is a client-side app loading
+  `/static/` paths this portal does not serve, not a template — and an
+  `index.html` with no `{{NETWORKS}}` token is refused at startup for
+  that reason. A front end hosted elsewhere can still drive the portal
+  through upstream's API (see
+  [Migrating](#migrating-from-balena-wifi-connect)). Any other token the built-in pages use but
   yours lack is logged as a warning at startup: a template copied from an
   older release still works, but without `{{BRAND_CSS}}` or
   `{{BRAND_HEADING}}`, `--brand-css` and `--brand-logo` have nowhere to go.
@@ -343,6 +363,12 @@ failed unit.
 - **Architectures:** amd64, arm64, armv7 and armv6. ARMv6 covers the
   Raspberry Pi 1 and Pi Zero, which is the architecture upstream dropped in
   v4.4.6 without anyone noticing for three years.
+- **WEP networks can be joined**, since some legacy installations still
+  run them, with the key as the router shows it: 5 or 13 characters, 10
+  or 26 hex digits, or a passphrase up to 64 characters. The portal labels
+  them "WEP (insecure)" because WEP's encryption has been broken for two
+  decades. Only a network the scan lists as WEP is joined that way; a
+  hidden WEP network cannot be.
 - **Enterprise WiFi is PEAP/MSCHAPv2, TTLS/MSCHAPv2 or TTLS/PAP.** The
   portal offers the three as a *sign-in method* next to the username,
   PEAP by default. Certificate-based EAP-TLS needs key and certificate
