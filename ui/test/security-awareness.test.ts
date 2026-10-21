@@ -58,6 +58,7 @@ describe('switching between enterprise and PSK networks', () => {
     expect(input('server-domain').disabled).toBe(false)
     expect(input('pw').hasAttribute('maxlength')).toBe(false)
     expect(input('pw').hasAttribute('minlength')).toBe(false)
+    expect(document.getElementById('pw-hint')?.textContent).not.toMatch(/63/)
   })
 
   test('a username typed for enterprise is not submitted with a PSK network', () => {
@@ -73,6 +74,7 @@ describe('switching between enterprise and PSK networks', () => {
     expect(posted.passphrase).toBe('abcdefgh')
     expect(input('pw').getAttribute('maxlength')).toBe('63')
     expect(input('pw').getAttribute('minlength')).toBe('8')
+    expect(document.getElementById('pw-hint')?.textContent).toMatch(/8 to 63/)
   })
 
   test('switching back to enterprise re-enables the username', () => {
