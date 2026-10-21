@@ -29,7 +29,7 @@ use super::proxies::{
     is_device_busy,
 };
 use super::security;
-use super::settings::{ApProfile, ap_settings, apply_station_ip};
+use super::settings::{ApProfile, ap_settings, apply_station_ip, apply_station_wep};
 use super::{
     ApConfig, ApHandle, Connectivity, DeviceInfo, EapMethod, JoinFailure, JoinOutcome, JoinRequest,
     NetworkControl, NetworkError, WifiNetwork,
@@ -157,6 +157,8 @@ impl NmrsControl {
 
         builder = match classify_credentials(request) {
             Credential::Psk(psk) => builder.wpa_psk(psk.expose()),
+            // Built open; the security section goes in after `build`.
+            Credential::Wep(_) => builder.open(),
             Credential::Eap {
                 identity,
                 password,
@@ -181,6 +183,9 @@ impl NmrsControl {
         if let Some(connection) = settings.get_mut("connection") {
             connection.insert("uuid", zbus::zvariant::Value::from(uuid.clone()));
         }
+        if let Credential::Wep(key) = classify_credentials(request) {
+            apply_station_wep(&mut settings, key);
+        }
         apply_station_ip(&mut settings, &request.ip);
 
         // nmrs waits for activation here under its own 30 s timeout, which
@@ -201,7 +206,8 @@ impl NmrsControl {
         .await;
         let failure = match activated {
             Ok(Ok(_)) => {
-                if !request.ip.is_automatic() {
+                // What nmrs's `replaces` would have done on its own path.
+                if !request.ip.is_automatic() || request.wep {
                     self.replace_older_profiles(&request.ssid, &uuid).await;
                 }
                 return Ok(JoinOutcome::Joined);
@@ -366,6 +372,9 @@ impl NmrsControl {
 /// server-rendered `needs-*` booleans set out to remove on the UI side.
 enum Credential<'a> {
     Psk(&'a Secret),
+    // nmrs has no WEP variant, so these always build their own profile:
+    // see [`route_join`].
+    Wep(&'a Secret),
     // PEAP/MSCHAPv2 (nmrs's default method) is the bulk of enterprise
     // WiFi. Certificate-based EAP-TLS needs key and certificate paths that
     // a captive portal has no way to collect.
@@ -385,6 +394,7 @@ enum Credential<'a> {
 
 fn classify_credentials(request: &JoinRequest) -> Credential<'_> {
     match (&request.passphrase, &request.identity) {
+        (Some(key), None) if request.wep => Credential::Wep(key),
         (Some(psk), None) => Credential::Psk(psk),
         (Some(password), Some(identity)) => Credential::Eap {
             identity: identity.as_str(),
@@ -505,9 +515,10 @@ enum JoinRoute {
 ///
 /// Hand-configured addressing always builds its own profile: nmrs's
 /// `try_connect` has no way to carry it, and reusing a saved profile would
-/// silently keep that profile's addressing instead.
+/// silently keep that profile's addressing instead. So does WEP, which
+/// nmrs's `WifiSecurity` cannot express at all.
 fn route_join(request: &JoinRequest, saved: Option<&[String]>) -> JoinRoute {
-    if !request.ip.is_automatic() {
+    if !request.ip.is_automatic() || matches!(classify_credentials(request), Credential::Wep(_)) {
         return JoinRoute::OwnProfile;
     }
     if !matches!(classify_credentials(request), Credential::Open) {
@@ -555,6 +566,7 @@ fn credentials_for(request: &JoinRequest, check: EapServerCheck) -> WifiSecurity
         Credential::Psk(psk) => WifiSecurity::WpaPsk {
             psk: psk.expose().to_string(),
         },
+        Credential::Wep(_) => unreachable!("WEP joins build their own profile: see route_join"),
         Credential::Eap {
             identity,
             password,
@@ -1269,6 +1281,7 @@ mod tests {
             passphrase: Some(Secret::new("hunter2")),
             server_domain: server_domain.map(str::to_string),
             eap_method: Default::default(),
+            wep: false,
             hidden: false,
             ip: Default::default(),
         }
@@ -1426,6 +1439,7 @@ mod tests {
             hidden,
             server_domain: None,
             eap_method: Default::default(),
+            wep: false,
             ip: Default::default(),
         }
     }
@@ -1495,6 +1509,19 @@ mod tests {
         ] {
             let mut request = join("Home", passphrase, false);
             request.ip = ip.clone();
+            assert_eq!(route_join(&request, saved), JoinRoute::OwnProfile);
+        }
+    }
+
+    /// nmrs's `WifiSecurity` has no WEP, so handing it a WEP key would send
+    /// it as a WPA pre-shared key, which can never associate.
+    #[test]
+    fn a_wep_join_always_builds_its_own_profile() {
+        let saved = ["legacy-uuid".to_string()];
+        for saved in [Some(&saved[..]), Some(&[][..]), None] {
+            let mut request = join("Legacy", Some("abcde"), false);
+            request.wep = true;
+            assert!(matches!(classify_credentials(&request), Credential::Wep(_)));
             assert_eq!(route_join(&request, saved), JoinRoute::OwnProfile);
         }
     }

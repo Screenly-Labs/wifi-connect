@@ -434,11 +434,14 @@ fn render_networks(networks: &[WifiNetwork]) -> String {
         // is how OWE ends up prompting for a password that does not exist.
         let needs_pw = n.security.needs_passphrase();
         let needs_id = n.security.needs_identity();
+        // WEP keys follow other rules than WPA passphrases (a 40-bit key is
+        // five characters), so the script must not hold them to 8 to 63.
+        let wep = n.security == Security::Wep;
 
         out.push_str(&format!(
             "<label class=\"net\">\
                <input type=\"radio\" name=\"ssid_hex\" value=\"{hex}\" \
-                data-needs-passphrase=\"{needs_pw}\" data-needs-identity=\"{needs_id}\" required{checked}>\
+                data-needs-passphrase=\"{needs_pw}\" data-needs-identity=\"{needs_id}\" data-wep=\"{wep}\" required{checked}>\
                <span class=\"net__name\">{name}</span>\
                <span class=\"net__meta\">\
                  <span>{label}</span>\
@@ -1052,6 +1055,20 @@ mod tests {
         assert!(html.contains(r#"data-needs-identity="true""#));
         assert!(html.contains(r#"data-needs-passphrase="false""#));
         assert!(html.contains("Enterprise"));
+    }
+
+    #[test]
+    fn wep_rows_say_so_and_others_do_not() {
+        let html = render_index(
+            &plain("B"),
+            &[
+                net("Old", 80, Security::Wep),
+                net("New", 70, Security::WpaPsk),
+            ],
+            &PortalState::Portal,
+        );
+        assert_eq!(html.matches(r#"data-wep="true""#).count(), 1);
+        assert_eq!(html.matches(r#"data-wep="false""#).count(), 1);
     }
 
     #[test]
