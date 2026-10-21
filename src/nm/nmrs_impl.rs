@@ -100,18 +100,20 @@ impl NmrsControl {
     ///   family cannot set `802-11-wireless.hidden`, without which the
     ///   supplicant never sends a directed probe and the association never
     ///   completes.
-    /// * An open network that already has a saved profile; see
-    ///   [`needs_own_profile`] for why nmrs must not handle that one.
+    /// * An open join for a network that already has a saved profile, when
+    ///   that profile cannot be listed or does not come up; see
+    ///   [`route_join`] for why nmrs must not handle that one.
     ///
     /// The profile gets a UUID we mint, so on failure we delete exactly that
     /// profile and nothing that merely shares its name.
     ///
-    /// The tradeoff is weaker failure reporting: `add_and_activate_connection`
-    /// returns once activation has *started*, not once it has finished, so
-    /// there is no merged device/active-connection signal to read a reason
-    /// from and we can only distinguish success from timeout. Acceptable on
-    /// both: a hidden SSID was typed by the user, so they already know which
-    /// network they meant, and an open network has no password to get wrong.
+    /// The tradeoff is less precise failure reporting than `try_connect`,
+    /// which merges the device's and the active connection's state signals
+    /// to recover the real reason; here a failure is classified from
+    /// whatever error activation returns, and often reads as a timeout.
+    /// Acceptable on both: a hidden SSID was typed by the user, so they
+    /// already know which network they meant, and the open fallback reports
+    /// the saved profile's reason instead of its own.
     async fn join_with_own_profile(
         &self,
         device: &DeviceInfo,
@@ -147,17 +149,29 @@ impl NmrsControl {
             connection.insert("uuid", zbus::zvariant::Value::from(uuid.clone()));
         }
 
-        if let Err(e) = self
-            .nm
-            .add_and_activate_connection(settings, Some(&device.interface), None)
-            .await
-        {
-            debug!(error = %e, "activating our own station profile failed");
+        // nmrs waits for activation here under its own 30 s timeout, which
+        // knows nothing of our budget; cap it, so a fallback attempt given
+        // the remainder of one cannot overrun it.
+        let activated = tokio::time::timeout(
+            budget,
+            self.nm
+                .add_and_activate_connection(settings, Some(&device.interface), None),
+        )
+        .await;
+        let failure = match activated {
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                debug!(error = %e, "activating our own station profile failed");
+                Some(classify_failure(&e))
+            }
+            Err(_) => Some(JoinFailure::Timeout),
+        };
+        if let Some(failure) = failure {
             // `add_and_activate_connection` persists the profile before it
             // reports the failure, so delete it rather than leaving an
             // autoconnect-enabled bad profile behind.
             self.delete_profile_quietly(&uuid).await;
-            return Ok(JoinOutcome::Failed(classify_failure(&e)));
+            return Ok(JoinOutcome::Failed(failure));
         }
 
         let deadline = tokio::time::Instant::now() + budget;
@@ -189,15 +203,59 @@ impl NmrsControl {
         }
     }
 
-    /// Whether any saved station profile for `ssid` exists. A listing
-    /// failure reads as "yes", the answer that keeps nmrs away from it.
-    async fn has_station_profile(&self, ssid: &Ssid) -> bool {
-        match self.station_profile_uuids(ssid).await {
-            Ok(uuids) => !uuids.is_empty(),
-            Err(e) => {
-                debug!(error = %e, "could not list saved profiles; assuming one exists");
-                true
+    /// Activate an existing saved profile for an open join, by its UUID.
+    ///
+    /// What nmrs's `connect` does with an open join over a saved profile
+    /// (`UseSaved`), minus the destructive part: when the saved profile does
+    /// not come up, nmrs deletes it before retrying. Here it is left alone,
+    /// and the retry with a fresh open profile goes through
+    /// [`Self::join_with_own_profile`], whose profile has a UUID we minted
+    /// and is the only one deleted if that fails too.
+    ///
+    /// Trying the saved profile first matters: the portal lets a user submit
+    /// a secured network with the password left blank, which is how "use
+    /// the password this device already knows" is spelled. A fresh open
+    /// profile against a WPA network can only fail.
+    async fn join_via_saved_profile(
+        &self,
+        device: &DeviceInfo,
+        request: &JoinRequest,
+        uuid: &str,
+        budget: Duration,
+    ) -> Result<JoinOutcome, NetworkError> {
+        let started = tokio::time::Instant::now();
+        let attempt = tokio::time::timeout(
+            budget,
+            self.nm.connect_by_uuid(
+                uuid,
+                nmrs::ConnectByUuidConfig::default().with_interface(&device.interface),
+            ),
+        )
+        .await;
+
+        let saved_failure = match attempt {
+            Ok(Ok(())) => return Ok(JoinOutcome::Joined),
+            Ok(Err(e)) => {
+                debug!(error = %e, uuid, "the saved profile did not come up");
+                classify_failure(&e)
             }
+            Err(_) => return Ok(JoinOutcome::Failed(JoinFailure::Timeout)),
+        };
+
+        // The network may have become open since the profile was saved. Try
+        // a fresh open profile in whatever budget is left, but report the
+        // saved profile's reason if that fails as well: "bad password" tells
+        // the user to type one, which is the likelier fix.
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining < MIN_FALLBACK_BUDGET {
+            return Ok(JoinOutcome::Failed(saved_failure));
+        }
+        match self
+            .join_with_own_profile(device, request, remaining)
+            .await?
+        {
+            JoinOutcome::Joined => Ok(JoinOutcome::Joined),
+            JoinOutcome::Failed(_) => Ok(JoinOutcome::Failed(saved_failure)),
         }
     }
 
@@ -286,28 +344,51 @@ fn classify_credentials(request: &JoinRequest) -> Credential<'_> {
     }
 }
 
-/// Whether a join must build its own profile instead of going through
-/// nmrs's `try_connect`.
+/// Shortest budget worth spending on a fresh open profile after a saved one
+/// failed to come up. Below this the attempt cannot realistically associate
+/// and get a lease, and would only delay the portal's return.
+const MIN_FALLBACK_BUDGET: Duration = Duration::from_secs(10);
+
+/// How a broadcast (non-hidden) join is carried out. Hidden joins always
+/// build their own profile: see [`NmrsControl::join_with_own_profile`].
+#[derive(Debug, PartialEq, Eq)]
+enum JoinRoute {
+    /// nmrs's `try_connect`, with its precise failure reasons.
+    Nmrs,
+    /// Activate this saved profile, then fall back to our own open profile.
+    Saved(String),
+    /// Build our own profile, with a UUID we mint.
+    OwnProfile,
+}
+
+/// Decide how to carry out a broadcast join.
 ///
-/// Hidden networks always do: see [`NmrsControl::join_with_own_profile`].
+/// `saved` is the list of station profiles already saved for the SSID, or
+/// `None` if it could not be read. Only consulted for an open join.
 ///
-/// An **open** join for an SSID that already has a saved station profile
-/// does too, because of what nmrs 3.5.7's `connect` does with that profile.
-/// With no credentials to offer it decides to *reuse* the saved profile
-/// (`decide_saved_connection` -> `UseSaved`), and when that activation fails
-/// it treats the saved profile as corrupt: `connect_via_saved` **deletes
-/// it** and retries with a fresh open profile. So "join this network with no
-/// password", aimed at the device's working PSK profile for the same SSID,
-/// would cost the device that profile whenever the attempt fails — and the
-/// pre-existing profile is gone before we get control back, so nothing we do
-/// afterwards can undo it.
+/// An **open** join must not reach nmrs 3.5.7's `connect` while a station
+/// profile for that SSID is saved. With no credentials it decides to
+/// *reuse* that profile (`decide_saved_connection` -> `UseSaved`), and when
+/// activation fails it treats the profile as corrupt: `connect_via_saved`
+/// **deletes it** and retries with a fresh open profile. So an open join
+/// aimed at the device's working PSK profile for the same SSID would cost
+/// the device that profile whenever the attempt fails, and it is gone
+/// before we get control back. We do the reuse ourselves instead, without
+/// the delete. If the listing failed we cannot rule a profile out, so we
+/// stay away from nmrs and build our own.
 ///
 /// With credentials (PSK or EAP), nmrs is safe and stays in charge: it
 /// builds a *new* profile, deletes that new one itself if activation fails,
 /// and removes the old one (`replaces`) only once the new one has come up.
-fn needs_own_profile(request: &JoinRequest, has_saved_profile: bool) -> bool {
-    request.hidden
-        || (matches!(classify_credentials(request), Credential::Open) && has_saved_profile)
+fn route_join(request: &JoinRequest, saved: Option<&[String]>) -> JoinRoute {
+    if !matches!(classify_credentials(request), Credential::Open) {
+        return JoinRoute::Nmrs;
+    }
+    match saved {
+        Some([]) => JoinRoute::Nmrs,
+        Some([first, ..]) => JoinRoute::Saved(first.clone()),
+        None => JoinRoute::OwnProfile,
+    }
 }
 
 /// Whether a saved profile is a station profile for `want`.
@@ -656,10 +737,27 @@ impl NetworkControl for NmrsControl {
         // An open join must not be handed to nmrs when a profile for this
         // SSID is already saved: on failure nmrs deletes that profile. Only
         // looked up when it can change the answer.
-        if matches!(classify_credentials(request), Credential::Open)
-            && needs_own_profile(request, self.has_station_profile(&request.ssid).await)
-        {
-            return self.join_with_own_profile(device, request, budget).await;
+        let saved = if matches!(classify_credentials(request), Credential::Open) {
+            match self.station_profile_uuids(&request.ssid).await {
+                Ok(uuids) => Some(uuids),
+                Err(e) => {
+                    debug!(error = %e, "could not list saved profiles; assuming one exists");
+                    None
+                }
+            }
+        } else {
+            Some(Vec::new())
+        };
+        match route_join(request, saved.as_deref()) {
+            JoinRoute::Nmrs => {}
+            JoinRoute::Saved(uuid) => {
+                return self
+                    .join_via_saved_profile(device, request, &uuid, budget)
+                    .await;
+            }
+            JoinRoute::OwnProfile => {
+                return self.join_with_own_profile(device, request, budget).await;
+            }
         }
 
         let attempt = tokio::time::timeout(
@@ -898,30 +996,45 @@ mod tests {
 
     /// nmrs 3.5.7 deletes a saved profile it was asked to reuse when that
     /// activation fails and it has no credentials to fall back on, so an
-    /// open join must never reach nmrs while such a profile exists.
+    /// open join must never reach nmrs while such a profile exists. We reuse
+    /// it ourselves, by UUID, so a blank password over a saved secured
+    /// network still joins with the stored secret.
     #[test]
-    fn an_open_join_over_a_saved_profile_builds_its_own() {
-        assert!(needs_own_profile(&join("Home", None, false), true));
+    fn an_open_join_over_a_saved_profile_reuses_it_without_nmrs() {
+        let saved = ["home-uuid".to_string(), "dup-uuid".to_string()];
+        assert_eq!(
+            route_join(&join("Home", None, false), Some(&saved)),
+            JoinRoute::Saved("home-uuid".into())
+        );
+    }
+
+    /// Unable to list, we cannot rule a saved profile out, so nmrs (which
+    /// would delete one on failure) is not used.
+    #[test]
+    fn an_open_join_with_unreadable_profiles_builds_its_own() {
+        assert_eq!(
+            route_join(&join("Home", None, false), None),
+            JoinRoute::OwnProfile
+        );
     }
 
     /// With credentials nmrs builds a new profile and deletes only that one
     /// on failure, so it can keep its better failure reporting.
     #[test]
     fn a_join_with_credentials_or_nothing_saved_goes_through_nmrs() {
-        assert!(!needs_own_profile(
-            &join("Home", Some("abcdefgh"), false),
-            true
-        ));
-        assert!(!needs_own_profile(&join("Cafe", None, false), false));
-    }
-
-    #[test]
-    fn a_hidden_join_always_builds_its_own() {
-        assert!(needs_own_profile(&join("Lab", None, true), false));
-        assert!(needs_own_profile(
-            &join("Lab", Some("abcdefgh"), true),
-            true
-        ));
+        let saved = ["home-uuid".to_string()];
+        assert_eq!(
+            route_join(&join("Home", Some("abcdefgh"), false), Some(&saved)),
+            JoinRoute::Nmrs
+        );
+        assert_eq!(
+            route_join(&join("Home", Some("abcdefgh"), false), None),
+            JoinRoute::Nmrs
+        );
+        assert_eq!(
+            route_join(&join("Cafe", None, false), Some(&[])),
+            JoinRoute::Nmrs
+        );
     }
 
     /// Only station WiFi profiles for this exact network count. A wired or
