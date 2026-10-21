@@ -99,6 +99,11 @@ function initSecurityAwareness(): void {
       password.removeAttribute('minlength')
     }
     if (identityField instanceof HTMLElement) identityField.hidden = !needsIdentity
+    // The server domain shares the enterprise block. A hidden field still
+    // submits, so clear it when the block hides: a domain typed for one
+    // network must not ride along with a join to another.
+    const serverDomain = document.getElementById('server-domain')
+    if (!needsIdentity && serverDomain instanceof HTMLInputElement) serverDomain.value = ''
   }
 
   for (const el of document.querySelectorAll('input[name="ssid_hex"]')) {

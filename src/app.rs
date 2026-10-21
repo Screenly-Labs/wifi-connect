@@ -353,6 +353,7 @@ mod tests {
             ssid: Ssid::from(ssid),
             identity: None,
             passphrase: Some(Secret::new("abcdefgh")),
+            server_domain: None,
             hidden: false,
         }
     }

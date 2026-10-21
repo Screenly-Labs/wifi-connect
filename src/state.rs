@@ -161,6 +161,7 @@ mod tests {
             ssid: Ssid::from(ssid),
             identity: None,
             passphrase: Some(crate::secret::Secret::new("abcdefgh")),
+            server_domain: None,
             hidden: false,
         }
     }

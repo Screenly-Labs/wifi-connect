@@ -200,6 +200,27 @@ color-scheme: dark;
             spellcheck="false"
           />
           <p class="hint">This network uses enterprise (802.1X) sign-in.</p>
+          <!-- Optional. Becomes 802-1x.domain-suffix-match, pinning the
+               RADIUS server's certificate to a name. The server validates
+               it again; the pattern only catches typos early. -->
+          <label for="server-domain">Server domain (optional)</label>
+          <input
+            id="server-domain"
+            name="server_domain"
+            type="text"
+            inputmode="url"
+            autocapitalize="none"
+            autocorrect="off"
+            autocomplete="off"
+            spellcheck="false"
+            maxlength="254"
+            pattern="[A-Za-z0-9.\-]+"
+            aria-describedby="server-domain-hint"
+          />
+          <p class="hint" id="server-domain-hint">
+            The name on the network's server certificate, such as radius.example.com. Ask your IT
+            team if unsure.
+          </p>
         </div>
 
         <div class="field">
@@ -237,7 +258,7 @@ color-scheme: dark;
     </main>
 
     <script>
-function writeStored(key,value){try{localStorage.setItem(key,value)}catch{}}function resolvedTheme(){let explicit=document.documentElement.getAttribute("data-theme");if(explicit==="light"||explicit==="dark")return explicit;return window.matchMedia?.("(prefers-color-scheme: dark)").matches?"dark":"light"}function initThemeToggle(){let button=document.getElementById("theme-toggle");if(!(button instanceof HTMLButtonElement))return;button.hidden=!1,button.addEventListener("click",()=>{let next=resolvedTheme()==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next),writeStored("wc-theme",next)})}function initPasswordToggle(){let toggle=document.getElementById("pw-toggle"),input=document.getElementById("pw");if(!(toggle instanceof HTMLButtonElement)||!(input instanceof HTMLInputElement))return;toggle.hidden=!1,toggle.addEventListener("click",()=>{let revealed=input.type==="text";input.type=revealed?"password":"text",toggle.textContent=revealed?"Show":"Hide",toggle.setAttribute("aria-pressed",String(!revealed)),input.focus()})}function initSecurityAwareness(){let password=document.getElementById("pw"),identityField=document.getElementById("identity-field");if(!(password instanceof HTMLInputElement))return;let apply=(radio)=>{let needsPassphrase=radio.dataset.needsPassphrase!=="false",needsIdentity=radio.dataset.needsIdentity==="true",needsPassword=needsPassphrase||needsIdentity;if(password.disabled=!needsPassword,password.required=!1,!needsPassword)password.value="";if(needsPassphrase)password.setAttribute("minlength","8");else password.removeAttribute("minlength");if(identityField instanceof HTMLElement)identityField.hidden=!needsIdentity};for(let el of document.querySelectorAll('input[name="ssid_hex"]')){if(!(el instanceof HTMLInputElement))continue;if(el.addEventListener("change",()=>apply(el)),el.checked)apply(el)}}function initStatusPolling(){let text=document.getElementById("status-text");if(!(text instanceof HTMLElement))return;let poll=async()=>{try{let controller=new AbortController,timer=setTimeout(()=>controller.abort(),3000),response=await fetch("/api/status",{signal:controller.signal,cache:"no-store"});if(clearTimeout(timer),!response.ok)return;let status=await response.json();if(status.state==="failed"&&status.error)text.textContent=status.error,document.getElementById("status")?.setAttribute("role","alert");else if(status.state==="connected")text.textContent=`Connected to ${status.ssid??"the network"}.`}catch{}};poll(),setInterval(()=>void poll(),2000)}function main(){initThemeToggle(),initPasswordToggle(),initSecurityAwareness(),initStatusPolling()}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",main);else main();
+function writeStored(key,value){try{localStorage.setItem(key,value)}catch{}}function resolvedTheme(){let explicit=document.documentElement.getAttribute("data-theme");if(explicit==="light"||explicit==="dark")return explicit;return window.matchMedia?.("(prefers-color-scheme: dark)").matches?"dark":"light"}function initThemeToggle(){let button=document.getElementById("theme-toggle");if(!(button instanceof HTMLButtonElement))return;button.hidden=!1,button.addEventListener("click",()=>{let next=resolvedTheme()==="dark"?"light":"dark";document.documentElement.setAttribute("data-theme",next),writeStored("wc-theme",next)})}function initPasswordToggle(){let toggle=document.getElementById("pw-toggle"),input=document.getElementById("pw");if(!(toggle instanceof HTMLButtonElement)||!(input instanceof HTMLInputElement))return;toggle.hidden=!1,toggle.addEventListener("click",()=>{let revealed=input.type==="text";input.type=revealed?"password":"text",toggle.textContent=revealed?"Show":"Hide",toggle.setAttribute("aria-pressed",String(!revealed)),input.focus()})}function initSecurityAwareness(){let password=document.getElementById("pw"),identityField=document.getElementById("identity-field");if(!(password instanceof HTMLInputElement))return;let apply=(radio)=>{let needsPassphrase=radio.dataset.needsPassphrase!=="false",needsIdentity=radio.dataset.needsIdentity==="true",needsPassword=needsPassphrase||needsIdentity;if(password.disabled=!needsPassword,password.required=!1,!needsPassword)password.value="";if(needsPassphrase)password.setAttribute("minlength","8");else password.removeAttribute("minlength");if(identityField instanceof HTMLElement)identityField.hidden=!needsIdentity;let serverDomain=document.getElementById("server-domain");if(!needsIdentity&&serverDomain instanceof HTMLInputElement)serverDomain.value=""};for(let el of document.querySelectorAll('input[name="ssid_hex"]')){if(!(el instanceof HTMLInputElement))continue;if(el.addEventListener("change",()=>apply(el)),el.checked)apply(el)}}function initStatusPolling(){let text=document.getElementById("status-text");if(!(text instanceof HTMLElement))return;let poll=async()=>{try{let controller=new AbortController,timer=setTimeout(()=>controller.abort(),3000),response=await fetch("/api/status",{signal:controller.signal,cache:"no-store"});if(clearTimeout(timer),!response.ok)return;let status=await response.json();if(status.state==="failed"&&status.error)text.textContent=status.error,document.getElementById("status")?.setAttribute("role","alert");else if(status.state==="connected")text.textContent=`Connected to ${status.ssid??"the network"}.`}catch{}};poll(),setInterval(()=>void poll(),2000)}function main(){initThemeToggle(),initPasswordToggle(),initSecurityAwareness(),initStatusPolling()}if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",main);else main();
 
 </script>
   </body>

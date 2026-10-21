@@ -124,6 +124,10 @@ pub struct ConnectForm {
     pub identity: String,
     #[serde(default)]
     pub passphrase: String,
+    /// Enterprise only: the domain the RADIUS server's certificate must
+    /// belong to. Optional; see [`server_domain`].
+    #[serde(default)]
+    pub server_domain: String,
 }
 
 /// Why a submission was rejected before we touched the radio.
@@ -131,6 +135,7 @@ pub struct ConnectForm {
 pub enum FormError {
     NoNetwork,
     BadPassphrase(String),
+    BadServerDomain,
 }
 
 impl FormError {
@@ -138,8 +143,54 @@ impl FormError {
         match self {
             FormError::NoNetwork => "Choose a network, or enter its name.".into(),
             FormError::BadPassphrase(m) => m.clone(),
+            FormError::BadServerDomain => {
+                "The server domain must be a host name such as radius.example.com.".into()
+            }
         }
     }
+}
+
+/// The longest DNS name, in its dotted text form.
+const MAX_DOMAIN_LEN: usize = 253;
+
+/// Validate the optional "server domain" an enterprise user may supply.
+///
+/// It becomes `802-1x.domain-suffix-match`, which pins the RADIUS server's
+/// certificate to a name rather than to "anything the CA store will sign".
+/// We accept only what a host name can be — LDH labels of 1 to 63
+/// characters, 253 in all — because the value is handed to the supplicant
+/// verbatim: wpa_supplicant reads `;` in that field as a separator between
+/// alternatives, so letting punctuation through would let one field
+/// quietly widen the match. A trailing dot (the absolute form) is dropped
+/// rather than refused, since people paste it from DNS tools.
+///
+/// Blank means "not supplied", which is not an error: system-CA validation
+/// still applies without it.
+pub fn server_domain(raw: &str) -> Result<Option<String>, FormError> {
+    let t = raw.trim();
+    let t = t.strip_suffix('.').unwrap_or(t);
+    if t.is_empty() {
+        return if raw.trim().is_empty() {
+            Ok(None)
+        } else {
+            // A lone "." is not a domain.
+            Err(FormError::BadServerDomain)
+        };
+    }
+    if t.len() > MAX_DOMAIN_LEN {
+        return Err(FormError::BadServerDomain);
+    }
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    if !t.split('.').all(label_ok) {
+        return Err(FormError::BadServerDomain);
+    }
+    // Certificate name matching is case-insensitive; store one spelling.
+    Ok(Some(t.to_ascii_lowercase()))
 }
 
 /// Turn a submitted form into a join request.
@@ -179,10 +230,13 @@ pub fn validate(form: &ConnectForm) -> Result<JoinRequest, FormError> {
         (!t.is_empty()).then(|| t.to_string())
     };
 
+    let server_domain = server_domain(&form.server_domain)?;
+
     Ok(JoinRequest {
         ssid,
         identity,
         passphrase,
+        server_domain,
         hidden,
     })
 }
@@ -248,6 +302,7 @@ mod tests {
             ssid: ssid.into(),
             identity: String::new(),
             passphrase: passphrase.into(),
+            server_domain: String::new(),
         }
     }
 
@@ -329,5 +384,75 @@ mod tests {
     fn the_passphrase_does_not_leak_through_the_request_debug() {
         let r = validate(&form("486f6d65", "", "sup3rsecret")).unwrap();
         assert!(!format!("{r:?}").contains("sup3rsecret"));
+    }
+
+    #[test]
+    fn a_server_domain_is_carried_normalised() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.identity = "alice@example.com".into();
+        f.server_domain = "  Radius.Example.COM.  ".into();
+        let r = validate(&f).unwrap();
+        assert_eq!(
+            r.server_domain.as_deref(),
+            Some("radius.example.com"),
+            "trimmed, lower-cased, and without the absolute-form dot"
+        );
+    }
+
+    #[test]
+    fn a_blank_server_domain_is_simply_not_supplied() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.server_domain = "   ".into();
+        assert!(validate(&f).unwrap().server_domain.is_none());
+    }
+
+    /// The value goes to the supplicant verbatim, and wpa_supplicant reads
+    /// `;` in `domain_suffix_match` as "or". Anything but a host name must
+    /// be refused before it can widen the match.
+    #[test]
+    fn a_server_domain_that_is_not_a_host_name_is_rejected() {
+        for bad in [
+            ".",
+            "example.com;evil.net",
+            "example .com",
+            "example..com",
+            ".example.com",
+            "-radius.example.com",
+            "radius-.example.com",
+            "radius_1.example.com",
+            "*.example.com",
+            "exämple.com",
+            "radius.example.com/x",
+        ] {
+            assert_eq!(
+                server_domain(bad).unwrap_err(),
+                FormError::BadServerDomain,
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_domain_length_limits_are_enforced() {
+        let label63 = "a".repeat(63);
+        assert!(server_domain(&format!("{label63}.com")).is_ok());
+        assert!(server_domain(&format!("{}a.com", label63)).is_err());
+
+        // 4 x 63 + 3 dots = 255 > 253.
+        let long = [label63.as_str(); 4].join(".");
+        assert!(server_domain(&long).is_err());
+        // A single label is a valid suffix to match on.
+        assert_eq!(server_domain("corp").unwrap().as_deref(), Some("corp"));
+    }
+
+    /// Rejected before the radio is touched, like a bad passphrase: a typo
+    /// here would otherwise cost an access-point bounce and come back as a
+    /// generic authentication failure.
+    #[test]
+    fn a_bad_server_domain_fails_the_whole_submission() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.identity = "alice".into();
+        f.server_domain = "example.com;evil.net".into();
+        assert_eq!(validate(&f).unwrap_err(), FormError::BadServerDomain);
     }
 }
