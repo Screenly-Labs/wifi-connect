@@ -36,7 +36,7 @@
   <body>
     <main class="wrap">
       <header class="hdr">
-        <h1>{{BRAND_NAME}}</h1>
+        <h1>{{BRAND_HEADING}}</h1>
         <p class="sub">Choose a WiFi network for this device.</p>
       </header>
 
@@ -75,6 +75,27 @@
             spellcheck="false"
           />
           <p class="hint">This network uses enterprise (802.1X) sign-in.</p>
+          <!-- Optional. Becomes 802-1x.domain-suffix-match, pinning the
+               RADIUS server's certificate to a name. The server validates
+               it again; the pattern only catches typos early. -->
+          <label for="server-domain">Server domain (optional)</label>
+          <input
+            id="server-domain"
+            name="server_domain"
+            type="text"
+            inputmode="url"
+            autocapitalize="none"
+            autocorrect="off"
+            autocomplete="off"
+            spellcheck="false"
+            maxlength="254"
+            pattern="[A-Za-z0-9.\-]+"
+            aria-describedby="server-domain-hint"
+          />
+          <p class="hint" id="server-domain-hint">
+            The name on the network's server certificate, such as radius.example.com. Ask your IT
+            team if unsure.
+          </p>
         </div>
 
         <div class="field">

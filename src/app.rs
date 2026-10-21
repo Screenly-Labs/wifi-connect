@@ -20,7 +20,10 @@
 //!    stare at a blank screen for a minute is how the setup flow loses them.
 //! 3. **A failed join deletes the station profile before re-raising.**
 //!    Otherwise NetworkManager's autoconnect retries a known-bad profile
-//!    forever and fights the portal for the radio.
+//!    forever and fights the portal for the radio. It deletes *only* the
+//!    profile that attempt created, identified by UUID, never by name: the
+//!    SSID comes from whoever is on the portal, and a name can equal an
+//!    unrelated saved profile's.
 //!
 //! The retry loop and the connectivity probe live here, in the binary,
 //! rather than in a shell wrapper. The previous integration learned that the
@@ -36,10 +39,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::nm::{
-    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinOutcome, JoinRequest, NetworkControl,
-    NetworkError,
+    ApConfig, ApHandle, DeviceInfo, JoinOutcome, JoinRequest, NetworkControl, NetworkError,
 };
 
+use crate::ssid::Ssid;
 use crate::state::{PortalState, Shared};
 
 /// Why the program stopped, and with what exit code.
@@ -124,7 +127,12 @@ pub async fn preflight<N: NetworkControl>(
         return Ok(Some(device));
     }
 
-    if nm.check_connectivity().await? == Connectivity::Full {
+    // Not merely "connectivity is Full": where NetworkManager's checking is
+    // disabled (the Debian-family default) the verdict is always Unknown,
+    // and treating that as offline raised the access point on the very
+    // radio that was already connected as a station, dropping that link.
+    // A wired-only device still gets the portal; see `is_online`.
+    if nm.is_online(&device).await? {
         info!("already online; the portal is not needed");
         return Ok(None);
     }
@@ -274,6 +282,18 @@ async fn portal_loop<N: NetworkControl>(
             warn!(error = %e, "could not tear down the access point before joining");
         }
 
+        // Note which profiles for this SSID exist *before* the attempt, so
+        // that afterwards we can tell the one it created from ones that were
+        // already there — possibly the device's real, working profile for
+        // this network, which a mistyped password must not cost it.
+        let before = match nm.station_profile_uuids(&request.ssid).await {
+            Ok(uuids) => Some(uuids),
+            Err(e) => {
+                warn!(error = %e, "could not list saved profiles before joining");
+                None
+            }
+        };
+
         match nm.join(device, &request, config.join_budget).await? {
             JoinOutcome::Joined => {
                 info!(%ssid, "joined");
@@ -285,12 +305,39 @@ async fn portal_loop<N: NetworkControl>(
                 // Delete the profile we just created. Leaving it behind
                 // means NM autoconnect retries a known-bad profile forever
                 // and fights us for the radio.
-                if let Err(e) = nm.forget(&request.ssid).await {
-                    warn!(error = %e, "could not delete the failed profile");
-                }
+                delete_profiles_created_since(nm, &request.ssid, before.as_deref()).await;
                 shared.record_failure(&ssid, failure);
                 // Loop: re-raise the AP so the user can see why and retry.
             }
+        }
+    }
+}
+
+/// Delete the station profiles for `ssid` that did not exist in `before`.
+///
+/// When either listing failed we cannot tell ours from someone else's, and
+/// we delete nothing. That trade is deliberate: a stray bad profile costs
+/// some autoconnect noise until the next attempt; deleting the wrong one
+/// costs the device a network it was configured for.
+async fn delete_profiles_created_since<N: NetworkControl>(
+    nm: &N,
+    ssid: &Ssid,
+    before: Option<&[String]>,
+) {
+    let Some(before) = before else {
+        warn!("not deleting the failed profile: could not tell it apart from existing ones");
+        return;
+    };
+    let after = match nm.station_profile_uuids(ssid).await {
+        Ok(uuids) => uuids,
+        Err(e) => {
+            warn!(error = %e, "not deleting the failed profile: could not list saved profiles");
+            return;
+        }
+    };
+    for uuid in after.iter().filter(|u| !before.contains(u)) {
+        if let Err(e) = nm.delete_profile(uuid).await {
+            warn!(error = %e, %uuid, "could not delete the failed profile");
         }
     }
 }
@@ -310,7 +357,15 @@ pub fn report(result: &Result<Outcome, NetworkError>) -> i32 {
                 | NetworkError::Unmanaged(_)
                 | NetworkError::RadioBlocked => 4,
                 NetworkError::Unreachable(_) => 5,
-                NetworkError::PortalUnavailable(_) => 6,
+                // NOT 6. That is Outcome::TimedOut, which is an ordinary
+                // ending — the portal ran, nobody joined, we gave up — and
+                // an integrator's systemd unit lists it in
+                // SuccessExitStatus for exactly that reason. Sharing the
+                // code made a bind failure (something else on the port,
+                // every single time) indistinguishable from it, so the one
+                // misconfiguration that can never fix itself was reported
+                // as a clean exit and retried silently forever.
+                NetworkError::PortalUnavailable(_) => 7,
                 _ => 1,
             }
         }
@@ -320,9 +375,9 @@ pub fn report(result: &Result<Outcome, NetworkError>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nm::fake::{Call, FakeNm};
+    use crate::nm::fake::{Call, FakeNm, FakeProfile};
     use crate::nm::security::Security;
-    use crate::nm::{ApSecurity, JoinFailure, WifiNetwork};
+    use crate::nm::{ApSecurity, Connectivity, JoinFailure, WifiNetwork};
     use crate::secret::Secret;
     use crate::ssid::Ssid;
     use crate::state::Branding;
@@ -354,6 +409,7 @@ mod tests {
             ssid: Ssid::from(ssid),
             identity: None,
             passphrase: Some(Secret::new("abcdefgh")),
+            server_domain: None,
             hidden: false,
         }
     }
@@ -368,6 +424,68 @@ mod tests {
             !nm.calls().iter().any(|c| matches!(c, Call::RaiseAp { .. })),
             "an online device must not broadcast a setup network"
         );
+    }
+
+    /// With connectivity checking disabled (Debian, Raspberry Pi OS, Ubuntu
+    /// Server) NM never says Full. A radio already connected as a station
+    /// must not be turned into an access point on that basis: doing so
+    /// drops the working connection, and with no activity timeout the
+    /// device never gets it back.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_over_a_connected_station_does_not_raise_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(1)
+            .with_station_activated(true);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+        assert!(
+            !nm.calls().contains(&Call::AwaitAutoconnect),
+            "already connected; there is nothing to wait for"
+        );
+    }
+
+    /// The fallback must not swallow the case the portal exists for. This
+    /// also covers a device online only over ethernet: with checking
+    /// disabled nothing distinguishes a LAN with internet from one without,
+    /// so the portal comes up as it always did.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_without_a_connected_station_raises_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(0)
+            .with_station_activated(false);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_some());
+        assert!(nm.calls().contains(&Call::StationActivated));
+    }
+
+    /// Saved profiles, nothing up yet, checking disabled: the autoconnect
+    /// wait still runs and, when nothing comes up, the portal is raised.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_with_saved_profiles_still_waits_then_raises_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(1)
+            .with_station_activated(false);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_some());
+        assert!(nm.calls().contains(&Call::AwaitAutoconnect));
+    }
+
+    /// A definite verdict from a probe stands. An associated station that
+    /// NM *knows* cannot reach the internet is exactly when the user may
+    /// need the portal to pick another network, so the station is not even
+    /// consulted.
+    #[tokio::test(start_paused = true)]
+    async fn a_definite_offline_verdict_is_not_overridden_by_a_connected_station() {
+        for verdict in [Connectivity::None, Connectivity::Limited] {
+            let nm = FakeNm::new()
+                .with_connectivity(verdict)
+                .with_station_activated(true);
+            assert!(preflight(&nm, &config()).await.unwrap().is_some());
+            assert!(!nm.calls().contains(&Call::StationActivated));
+        }
     }
 
     /// Associating, DHCP and a probe take 15-30s from cold. Without this
@@ -580,7 +698,7 @@ mod tests {
         let calls = nm.calls();
         let forget = calls
             .iter()
-            .position(|c| matches!(c, Call::Forget { .. }))
+            .position(|c| matches!(c, Call::DeleteProfile { .. }))
             .expect("the failed profile must be deleted");
         let second_raise = calls
             .iter()
@@ -596,6 +714,115 @@ mod tests {
              autoconnect fights the portal for the radio: {calls:?}"
         );
         assert_eq!(nm.ap_raise_count(), 2);
+    }
+
+    /// Submit one join that fails, let the portal come back, then stop.
+    async fn run_one_failed_join(nm: &FakeNm, request: JoinRequest) {
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+        shared.submit(request).await;
+
+        let cancel = CancellationToken::new();
+        let handle = {
+            let (nm, shared, cancel, cfg) = (nm.clone(), shared.clone(), cancel.clone(), config());
+            tokio::spawn(async move { run_portal(&nm, &device, &cfg, &shared, rx, cancel).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        assert_eq!(handle.await.unwrap().unwrap(), Outcome::Cancelled);
+    }
+
+    /// The device's real, working profile for a network must survive
+    /// someone on the portal typing the wrong password for that network.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_join_keeps_an_existing_profile_for_the_same_ssid() {
+        let nm = FakeNm::new()
+            .with_profiles(vec![FakeProfile::station("home-uuid", "Office")])
+            .with_join_results(vec![JoinOutcome::Failed(JoinFailure::BadPassword)]);
+
+        run_one_failed_join(&nm, request("Office")).await;
+
+        assert_eq!(
+            nm.deleted(),
+            vec!["join-1".to_string()],
+            "only the profile the failed attempt created may be deleted"
+        );
+        let left: Vec<_> = nm.profiles().into_iter().map(|p| p.uuid).collect();
+        assert!(
+            left.contains(&"home-uuid".to_string()),
+            "the pre-existing profile was deleted: {left:?}"
+        );
+        assert!(!left.contains(&"join-1".to_string()), "bad profile left");
+    }
+
+    /// A hidden SSID is free text. Typing the name of an unrelated profile —
+    /// the wired connection, a VPN — and getting the join wrong must not
+    /// delete that profile, as a delete-by-name would.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_join_never_deletes_an_unrelated_profile_with_that_name() {
+        let nm = FakeNm::new()
+            .with_profiles(vec![
+                FakeProfile::other("wired-uuid", "Wired connection 1"),
+                FakeProfile::other("vpn-uuid", "Office VPN"),
+            ])
+            .with_join_results(vec![
+                JoinOutcome::Failed(JoinFailure::Timeout),
+                JoinOutcome::Failed(JoinFailure::SsidNotFound),
+            ]);
+
+        let mut wired = request("Wired connection 1");
+        wired.hidden = true;
+        run_one_failed_join(&nm, wired).await;
+        let mut vpn = request("Office VPN");
+        vpn.hidden = true;
+        run_one_failed_join(&nm, vpn).await;
+
+        assert_eq!(
+            nm.deleted(),
+            vec!["join-1".to_string(), "join-2".to_string()]
+        );
+        let left: Vec<_> = nm.profiles().into_iter().map(|p| p.uuid).collect();
+        assert!(left.contains(&"wired-uuid".to_string()), "{left:?}");
+        assert!(left.contains(&"vpn-uuid".to_string()), "{left:?}");
+    }
+
+    /// If we cannot list profiles, we cannot tell ours from anyone else's.
+    /// A stray bad profile is the lesser harm, so nothing is deleted.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_join_deletes_nothing_when_profiles_cannot_be_listed() {
+        let nm = FakeNm::new()
+            .with_unreadable_profiles()
+            .with_profiles(vec![FakeProfile::station("home-uuid", "Office")])
+            .with_join_results(vec![JoinOutcome::Failed(JoinFailure::BadPassword)]);
+
+        run_one_failed_join(&nm, request("Office")).await;
+
+        assert!(nm.deleted().is_empty(), "deleted: {:?}", nm.deleted());
+    }
+
+    /// Teardown must target the access point this run raised, by the UUID
+    /// its handle carries, and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn ap_teardown_targets_the_handles_uuid() {
+        let nm = FakeNm::new()
+            .with_profiles(vec![FakeProfile::station("home-uuid", "Home")])
+            .with_join_results(vec![JoinOutcome::Failed(JoinFailure::BadPassword)]);
+
+        run_one_failed_join(&nm, request("Office")).await;
+
+        let torn_down: Vec<_> = nm
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::TearDownAp { uuid } => Some(uuid),
+                _ => None,
+            })
+            .collect();
+        // Raised twice (before and after the failed join), torn down twice,
+        // each time by the UUID that raise returned.
+        assert_eq!(torn_down, vec!["ap-1".to_string(), "ap-2".to_string()]);
+        let left: Vec<_> = nm.profiles().into_iter().map(|p| p.uuid).collect();
+        assert_eq!(left, vec!["home-uuid".to_string()]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -621,7 +848,10 @@ mod tests {
             .iter()
             .position(|c| matches!(c, Call::RaiseAp { .. }))
             .unwrap();
-        let down = calls.iter().position(|c| *c == Call::TearDownAp).unwrap();
+        let down = calls
+            .iter()
+            .position(|c| matches!(c, Call::TearDownAp { .. }))
+            .unwrap();
         let join = calls
             .iter()
             .position(|c| matches!(c, Call::Join { .. }))
@@ -669,7 +899,10 @@ mod tests {
         assert_eq!(outcome.exit_code(), 0);
 
         let calls = nm.calls();
-        assert!(calls.contains(&Call::TearDownAp), "AP left up: {calls:?}");
+        assert!(
+            calls.iter().any(|c| matches!(c, Call::TearDownAp { .. })),
+            "AP left up: {calls:?}"
+        );
         assert!(
             calls.contains(&Call::Restore),
             "radio not restored: {calls:?}"
@@ -704,5 +937,24 @@ mod tests {
         assert_eq!(report(&Err(NetworkError::NoWifiDevice)), 3);
         assert_eq!(report(&Err(NetworkError::RadioBlocked)), 4);
         assert_eq!(report(&Err(NetworkError::Unreachable("bus".into()))), 5);
+        assert_eq!(
+            report(&Err(NetworkError::PortalUnavailable("in use".into()))),
+            7
+        );
+    }
+
+    /// The distinction an integrator's unit file is built on.
+    ///
+    /// A timeout is a normal ending and belongs in SuccessExitStatus; a
+    /// portal that could not bind is a misconfiguration that will recur on
+    /// every run until someone changes something. Sharing one code means
+    /// either the timeout shows up as a failed unit on every offline
+    /// device, or the bind failure never shows up at all.
+    #[test]
+    fn a_timeout_and_a_failed_bind_are_not_the_same_ending() {
+        let timed_out = report(&Ok(Outcome::TimedOut));
+        let unavailable = report(&Err(NetworkError::PortalUnavailable("in use".into())));
+
+        assert_ne!(timed_out, unavailable);
     }
 }

@@ -182,6 +182,22 @@ fn render_theme_toggle(theme: ThemeMode) -> &'static str {
     }
 }
 
+/// The page heading: the logo if there is one, else the product name.
+///
+/// The logo replaces the name rather than sitting above it — a wordmark
+/// under a wordmark is what the Anthias splash screen deliberately does
+/// not do — and carries the name as alt text, so the heading still reads
+/// correctly to a screen reader and to anyone whose image did not load.
+fn render_brand_heading(branding: &Branding) -> String {
+    match branding.logo {
+        None => escape(&branding.name),
+        Some(_) => format!(
+            r#"<img class="brand-logo" src="/brand-logo" alt="{}" />"#,
+            escape(&branding.name)
+        ),
+    }
+}
+
 /// Render the portal page.
 pub fn render_index(branding: &Branding, networks: &[WifiNetwork], state: &PortalState) -> String {
     chrome(template("index.html"), branding)
@@ -191,7 +207,8 @@ pub fn render_index(branding: &Branding, networks: &[WifiNetwork], state: &Porta
 
 /// Substitute everything that is the same on every page.
 fn chrome(html: String, branding: &Branding) -> String {
-    html.replace("{{BRAND_NAME}}", &escape(&branding.name))
+    html.replace("{{BRAND_HEADING}}", &render_brand_heading(branding))
+        .replace("{{BRAND_NAME}}", &escape(&branding.name))
         .replace("{{BRAND_CSS}}", render_brand_css(branding.css.is_some()))
         .replace("{{THEME_ATTR}}", render_theme_attr(branding.theme))
         .replace("{{THEME_TOGGLE}}", render_theme_toggle(branding.theme))
@@ -256,6 +273,17 @@ mod tests {
     fn branded(name: &str) -> Branding {
         Branding {
             css: Some(std::sync::Arc::from(":root{--color-accent:#ffe11a}")),
+            ..Branding::new(name)
+        }
+    }
+
+    /// With a logo configured.
+    fn with_logo(name: &str) -> Branding {
+        Branding {
+            logo: Some(crate::state::BrandLogo {
+                bytes: std::sync::Arc::from(&b"<svg/>"[..]),
+                content_type: "image/svg+xml",
+            }),
             ..Branding::new(name)
         }
     }
@@ -551,5 +579,39 @@ mod tests {
         for page in pages {
             assert!(!page.contains("{{"), "unsubstituted token: {page:.0}");
         }
+    }
+
+    #[test]
+    fn the_heading_is_the_name_until_a_logo_replaces_it() {
+        let plain_html = render_index(&plain("Anthias"), &[], &PortalState::Portal);
+        assert!(plain_html.contains("<h1>Anthias</h1>"));
+        // The <img>, not the class: the .brand-logo rule is in the inlined
+        // stylesheet on every page whether or not a logo is configured.
+        assert!(!plain_html.contains("<img"));
+
+        let logo_html = render_index(&with_logo("Anthias"), &[], &PortalState::Portal);
+        assert!(
+            logo_html.contains(r#"<img class="brand-logo" src="/brand-logo" alt="Anthias" />"#)
+        );
+        assert!(
+            !logo_html.contains("<h1>Anthias</h1>"),
+            "the logo replaces the wordmark rather than stacking under it"
+        );
+    }
+
+    #[test]
+    fn a_hostile_brand_name_cannot_escape_the_alt_attribute() {
+        // --brand-name is operator-supplied, but it lands in an attribute
+        // now as well as in text, and the two escape differently.
+        let html = render_index(
+            &with_logo(r#"x" onerror="alert(1)"#),
+            &[],
+            &PortalState::Portal,
+        );
+        assert!(
+            !html.contains(r#"onerror="alert"#),
+            "attribute escape: {html:.0}"
+        );
+        assert!(html.contains("&quot;"));
     }
 }
