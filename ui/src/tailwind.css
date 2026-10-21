@@ -96,7 +96,8 @@
   }
 
   input[type="text"],
-  input[type="password"] {
+  input[type="password"],
+  select {
     width: 100%;
     box-sizing: border-box;
     min-height: 2.75rem;

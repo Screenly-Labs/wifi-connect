@@ -122,6 +122,14 @@ function initSecurityAwareness(): void {
       input.disabled = !needsIdentity
       if (!needsIdentity) input.value = ''
     }
+    // The method is ignored without a username, but it goes the same way:
+    // nothing from a hidden block is posted, and the next enterprise
+    // network starts from the default again.
+    const method = document.getElementById('eap-method')
+    if (method instanceof HTMLSelectElement) {
+      method.disabled = !needsIdentity
+      if (!needsIdentity) method.selectedIndex = 0
+    }
   }
 
   for (const el of document.querySelectorAll('input[name="ssid_hex"]')) {

@@ -75,6 +75,15 @@
             spellcheck="false"
           />
           <p class="hint">This network uses enterprise (802.1X) sign-in.</p>
+          <!-- PEAP first: it is what most networks run, and what a blank
+               value means to the server. -->
+          <label for="eap-method">Sign-in method</label>
+          <select id="eap-method" name="eap_method" aria-describedby="eap-method-hint">
+            <option value="peap" selected>PEAP (MSCHAPv2)</option>
+            <option value="ttls-mschapv2">TTLS (MSCHAPv2)</option>
+            <option value="ttls-pap">TTLS (PAP)</option>
+          </select>
+          <p class="hint" id="eap-method-hint">PEAP unless your IT team says otherwise.</p>
           <!-- Optional. Becomes 802-1x.domain-suffix-match, pinning the
                RADIUS server's certificate to a name. The server validates
                it again; the pattern only catches typos early. -->

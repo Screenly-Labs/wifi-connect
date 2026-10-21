@@ -77,6 +77,24 @@ describe('switching between enterprise and PSK networks', () => {
     expect(document.getElementById('pw-hint')?.textContent).toMatch(/8 to 63/)
   })
 
+  test('the sign-in method is posted for enterprise and nothing else', () => {
+    const method = document.getElementById('eap-method') as HTMLSelectElement
+    pick('436f7270')
+    expect(method.disabled).toBe(false)
+    expect(submitted().eap_method).toBe('peap')
+    method.value = 'ttls-pap'
+    expect(submitted().eap_method).toBe('ttls-pap')
+
+    // Disabled is what keeps it out of the POST. happy-dom's FormData still
+    // lists a disabled <select> (browsers do not), so assert the cause.
+    pick('486f6d65')
+    expect(method.disabled).toBe(true)
+
+    // The next enterprise network starts from the default again.
+    pick('436f7270')
+    expect(submitted().eap_method).toBe('peap')
+  })
+
   test('switching back to enterprise re-enables the username', () => {
     pick('436f7270')
     input('identity').value = 'alice'
