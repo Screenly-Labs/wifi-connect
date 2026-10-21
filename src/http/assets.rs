@@ -11,18 +11,180 @@
 //! four tokens and the page is a fixed shape; a dependency that could render
 //! arbitrary templates would be more machinery than the problem has.
 
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::cli::ThemeMode;
 use crate::nm::WifiNetwork;
 use crate::nm::security::Security;
-use crate::state::{Branding, PortalState};
+use crate::state::{Branding, PortalState, Shared};
 
 #[derive(rust_embed::Embed)]
 #[folder = "ui/dist/"]
 struct Assets;
+
+/// The most a `--ui-directory` may hold, in total.
+///
+/// The embedded UI is under 40 KB because the pages inline their own CSS
+/// and script. Eight megabytes is two orders of magnitude of headroom for
+/// fonts and images, and small enough that pointing the flag at the wrong
+/// directory — `/`, a home directory, a node_modules — fails at boot
+/// instead of pulling it into the memory of a Pi Zero-class board.
+const UI_DIRECTORY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The most files a `--ui-directory` may hold. Same reasoning as the
+/// byte cap; a real portal is a handful of files.
+const UI_DIRECTORY_MAX_FILES: usize = 256;
+
+/// How deep a `--ui-directory` may nest. Also what stops a symlink to an
+/// ancestor *inside* the directory from recursing forever.
+const UI_DIRECTORY_MAX_DEPTH: usize = 8;
+
+/// The pages the portal renders. A `--ui-directory` must supply both.
+const TEMPLATES: [&str; 2] = ["index.html", "connecting.html"];
+
+/// A `--ui-directory`, read into memory at startup.
+///
+/// It replaces the embedded UI wholesale rather than file by file: when
+/// the flag is set, the pages and everything under `/assets/` come from
+/// the directory and nothing falls back to the embedded copy. A per-file
+/// fallback would mean an operator who misspells `conecting.html` gets the
+/// stock page after the join with their own page before it, and nothing
+/// in the log to say why.
+///
+/// Read eagerly, for the same reason as `--brand-css`: a missing directory
+/// or template stops the portal at boot with the path in the message.
+/// Reading everything up front is also the path-traversal defence. Requests
+/// are answered by an exact lookup in a map whose keys were built from the
+/// directory listing, so no request path ever reaches the filesystem and
+/// `..`, absolute paths and NUL bytes have nothing to resolve against.
+pub struct UiDirectory {
+    files: std::collections::HashMap<String, Box<[u8]>>,
+}
+
+impl UiDirectory {
+    /// Read `dir` and check it is a UI this portal can render.
+    pub fn load(dir: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
+
+        let root = std::fs::canonicalize(dir)?;
+        if !root.is_dir() {
+            return Err(Error::new(ErrorKind::InvalidInput, "not a directory"));
+        }
+
+        let mut ui = Self {
+            files: std::collections::HashMap::new(),
+        };
+        let mut total = 0u64;
+        ui.read_dir(&root, &root, "", 0, &mut total)?;
+
+        for name in TEMPLATES {
+            let Some(bytes) = ui.files.get(name) else {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("{name} is missing; the directory must supply both {TEMPLATES:?}"),
+                ));
+            };
+            if std::str::from_utf8(bytes).is_err() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{name} is not valid UTF-8"),
+                ));
+            }
+        }
+
+        // The tell for upstream's React build, which is what most people
+        // carrying `--ui-directory` over from balena will be pointing at.
+        // Its index.html renders an empty <div id="root"> and expects an
+        // API this portal does not have; served as-is it is a blank page.
+        let index = String::from_utf8_lossy(&ui.files["index.html"]);
+        if !index.contains("{{NETWORKS}}") {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "index.html has no {{NETWORKS}} token; the directory must hold \
+                 templates written for this portal (start from ui/dist), not \
+                 balena's React build",
+            ));
+        }
+
+        Ok(ui)
+    }
+
+    /// Recurse into `dir`, keying each file by its path below `root`.
+    fn read_dir(
+        &mut self,
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        prefix: &str,
+        depth: usize,
+        total: &mut u64,
+    ) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+
+        if depth > UI_DIRECTORY_MAX_DEPTH {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "nested more than {UI_DIRECTORY_MAX_DEPTH} levels deep at {}",
+                    dir.display()
+                ),
+            ));
+        }
+
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{} is not a UTF-8 file name", entry.path().display()),
+                ));
+            };
+            // Dotfiles are an editor's swap file or a .git directory, never
+            // part of a page, and the second would publish the operator's
+            // history to anyone on the access point.
+            if name.starts_with('.') {
+                continue;
+            }
+
+            // Resolve symlinks, then insist the target is still inside the
+            // directory. A link to /etc/shadow inside the UI directory must
+            // not make it servable at /assets/shadow.
+            let path = std::fs::canonicalize(entry.path())?;
+            if !path.starts_with(root) {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("{} links outside the UI directory", entry.path().display()),
+                ));
+            }
+
+            let key = format!("{prefix}{name}");
+            let meta = std::fs::metadata(&path)?;
+            if meta.is_dir() {
+                self.read_dir(root, &path, &format!("{key}/"), depth + 1, total)?;
+            } else if meta.is_file() {
+                *total += meta.len();
+                if *total > UI_DIRECTORY_MAX_BYTES || self.files.len() >= UI_DIRECTORY_MAX_FILES {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "more than {UI_DIRECTORY_MAX_FILES} files or \
+                             {UI_DIRECTORY_MAX_BYTES} bytes; is this the right directory?"
+                        ),
+                    ));
+                }
+                self.files.insert(key, std::fs::read(&path)?.into());
+            }
+            // Sockets, FIFOs and devices are skipped: opening a FIFO would
+            // block startup forever, and none of them is a web asset.
+        }
+        Ok(())
+    }
+
+    fn get(&self, name: &str) -> Option<&[u8]> {
+        self.files.get(name).map(|b| &b[..])
+    }
+}
 
 /// Escape text for interpolation into HTML.
 ///
@@ -45,7 +207,11 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn template(name: &str) -> String {
+fn template(branding: &Branding, name: &str) -> String {
+    // Checked at load: both templates exist and are UTF-8.
+    if let Some(ui) = &branding.ui {
+        return String::from_utf8_lossy(ui.get(name).unwrap_or_default()).into_owned();
+    }
     Assets::get(name)
         .map(|f| String::from_utf8_lossy(f.data.as_ref()).into_owned())
         .unwrap_or_else(|| {
@@ -200,7 +366,7 @@ fn render_brand_heading(branding: &Branding) -> String {
 
 /// Render the portal page.
 pub fn render_index(branding: &Branding, networks: &[WifiNetwork], state: &PortalState) -> String {
-    chrome(template("index.html"), branding)
+    chrome(template(branding, "index.html"), branding)
         .replace("{{NETWORKS}}", &render_networks(networks))
         .replace("{{BANNER}}", &render_banner(state))
 }
@@ -220,7 +386,7 @@ pub fn render_index_with_error(
     networks: &[WifiNetwork],
     error: &str,
 ) -> String {
-    chrome(template("index.html"), branding)
+    chrome(template(branding, "index.html"), branding)
         .replace("{{NETWORKS}}", &render_networks(networks))
         .replace(
             "{{BANNER}}",
@@ -233,13 +399,22 @@ pub fn render_index_with_error(
 
 /// Render the "connecting…" page.
 pub fn render_connecting(branding: &Branding, ssid: &str) -> String {
-    chrome(template("connecting.html"), branding).replace("{{SSID}}", &escape(ssid))
+    chrome(template(branding, "connecting.html"), branding).replace("{{SSID}}", &escape(ssid))
 }
 
-/// Serve a file from `ui/dist` under `/assets/`.
-pub async fn serve(Path(path): Path<String>) -> Response {
-    match Assets::get(&path) {
-        Some(file) => {
+/// Serve a file under `/assets/`: from `--ui-directory` when it is set,
+/// otherwise from the embedded `ui/dist`.
+///
+/// Never the filesystem at request time: both sources are exact-match
+/// lookups, so a path like `../../etc/passwd` is just a key that is not
+/// there.
+pub async fn serve(State(shared): State<Shared>, Path(path): Path<String>) -> Response {
+    let data = match &shared.branding.ui {
+        Some(ui) => ui.get(&path).map(<[u8]>::to_vec),
+        None => Assets::get(&path).map(|f| f.data.into_owned()),
+    };
+    match data {
+        Some(data) => {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
             (
                 StatusCode::OK,
@@ -252,13 +427,59 @@ pub async fn serve(Path(path): Path<String>) -> Response {
                     ),
                     (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
                 ],
-                file.data.into_owned(),
+                data,
             )
                 .into_response()
         }
         // A 404 here, never the portal redirect: a redirected script or
         // stylesheet would be served HTML and fail in a confusing way.
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// A throwaway `--ui-directory` for tests, removed on drop.
+///
+/// Hand-rolled rather than a tempfile dev-dependency: it is a dozen lines
+/// and only this module and the router tests need it.
+#[cfg(test)]
+pub(crate) struct TestUiDir(pub std::path::PathBuf);
+
+#[cfg(test)]
+impl TestUiDir {
+    /// A directory holding minimal, valid templates.
+    pub(crate) fn new() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wifi-connect-ui-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ui = Self(dir);
+        ui.write(
+            "index.html",
+            "<title>{{BRAND_NAME}}</title>OVERRIDE-INDEX{{BRAND_CSS}}{{BANNER}}{{NETWORKS}}",
+        );
+        ui.write("connecting.html", "OVERRIDE-CONNECTING {{SSID}}");
+        ui
+    }
+
+    pub(crate) fn write(&self, name: &str, contents: &str) {
+        let path = self.0.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    pub(crate) fn load(&self) -> std::io::Result<UiDirectory> {
+        UiDirectory::load(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestUiDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -613,5 +834,133 @@ mod tests {
             "attribute escape: {html:.0}"
         );
         assert!(html.contains("&quot;"));
+    }
+
+    fn with_ui(name: &str, ui: UiDirectory) -> Branding {
+        Branding {
+            ui: Some(std::sync::Arc::new(ui)),
+            ..Branding::new(name)
+        }
+    }
+
+    #[test]
+    fn a_ui_directory_replaces_both_pages() {
+        let dir = TestUiDir::new();
+        let branding = with_ui("Anthias", dir.load().unwrap());
+
+        let index = render_index(
+            &branding,
+            &[net("<b>Home</b>", 80, Security::WpaPsk)],
+            &PortalState::Portal,
+        );
+        assert!(index.contains("OVERRIDE-INDEX"), "embedded page served");
+        assert!(index.contains("<title>Anthias</title>"));
+        // The override gets the same rendering, escaping included: an
+        // integrator's template is no reason to trust a neighbour's SSID.
+        assert!(index.contains("&lt;b&gt;Home&lt;/b&gt;"));
+        assert!(!index.contains("{{"), "unsubstituted token: {index:.0}");
+
+        let connecting = render_connecting(&branding, "Office");
+        assert_eq!(connecting, "OVERRIDE-CONNECTING Office");
+    }
+
+    #[test]
+    fn a_missing_ui_directory_fails_to_load() {
+        let dir = TestUiDir::new();
+        let gone = dir.0.join("not-here");
+        let err = UiDirectory::load(&gone)
+            .err()
+            .expect("loaded a missing dir");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_file_is_not_a_ui_directory() {
+        let dir = TestUiDir::new();
+        assert!(UiDirectory::load(&dir.0.join("index.html")).is_err());
+    }
+
+    /// All-or-nothing: no per-file fallback to the embedded page, which
+    /// would serve a mixed portal with nothing in the log to say why.
+    #[test]
+    fn a_ui_directory_missing_a_template_fails_to_load() {
+        let dir = TestUiDir::new();
+        std::fs::remove_file(dir.0.join("connecting.html")).unwrap();
+        let err = dir.load().err().expect("loaded without connecting.html");
+        assert!(err.to_string().contains("connecting.html"), "{err}");
+    }
+
+    /// What someone migrating from balena will point the flag at.
+    #[test]
+    fn a_ui_directory_without_the_portal_tokens_is_refused() {
+        let dir = TestUiDir::new();
+        dir.write(
+            "index.html",
+            r#"<!doctype html><div id="root"></div><script src="/static/js/main.js"></script>"#,
+        );
+        let err = dir.load().err().expect("loaded balena's React build");
+        assert!(err.to_string().contains("{{NETWORKS}}"), "{err}");
+    }
+
+    #[test]
+    fn a_ui_directory_serves_nested_files_by_relative_path() {
+        let dir = TestUiDir::new();
+        dir.write("fonts/brand.woff2", "font");
+        let ui = dir.load().unwrap();
+        assert_eq!(ui.get("fonts/brand.woff2"), Some(&b"font"[..]));
+    }
+
+    #[test]
+    fn dotfiles_in_a_ui_directory_are_never_served() {
+        let dir = TestUiDir::new();
+        dir.write(".git/config", "[remote]");
+        dir.write(".index.html.swp", "swap");
+        let ui = dir.load().unwrap();
+        assert!(ui.get(".git/config").is_none());
+        assert!(ui.get(".index.html.swp").is_none());
+    }
+
+    /// A symlink is how a file outside the directory would become
+    /// servable at /assets/. It is refused at boot, not skipped, because
+    /// an operator who made one meant something by it.
+    #[test]
+    fn a_symlink_out_of_the_ui_directory_is_refused() {
+        let dir = TestUiDir::new();
+        let outside = TestUiDir::new();
+        outside.write("secret", "s3cret");
+        std::os::unix::fs::symlink(outside.0.join("secret"), dir.0.join("secret")).unwrap();
+
+        let err = dir.load().err().expect("followed a symlink out");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn a_symlink_within_the_ui_directory_is_followed() {
+        let dir = TestUiDir::new();
+        dir.write("real.css", "body{}");
+        std::os::unix::fs::symlink(dir.0.join("real.css"), dir.0.join("alias.css")).unwrap();
+        assert_eq!(dir.load().unwrap().get("alias.css"), Some(&b"body{}"[..]));
+    }
+
+    /// A link to an ancestor would otherwise recurse until the stack ran
+    /// out; the depth cap turns it into a startup error.
+    #[test]
+    fn a_symlink_loop_in_the_ui_directory_fails_rather_than_recursing() {
+        let dir = TestUiDir::new();
+        std::fs::create_dir(dir.0.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&dir.0, dir.0.join("sub").join("loop")).unwrap();
+        assert!(dir.load().is_err());
+    }
+
+    /// Pointing the flag at `/` or a node_modules must fail at boot, not
+    /// read it into memory.
+    #[test]
+    fn an_oversized_ui_directory_is_refused() {
+        let dir = TestUiDir::new();
+        for i in 0..=UI_DIRECTORY_MAX_FILES {
+            dir.write(&format!("f{i}.txt"), "x");
+        }
+        let err = dir.load().err().expect("loaded too many files");
+        assert!(err.to_string().contains("right directory"), "{err}");
     }
 }

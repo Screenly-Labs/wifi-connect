@@ -324,4 +324,92 @@ mod tests {
             );
         }
     }
+
+    async fn get_path_with_ui(
+        ui: &crate::http::assets::TestUiDir,
+        path: &str,
+    ) -> axum::response::Response {
+        let (shared, _rx) = Shared::new(
+            "http://192.168.42.1/".into(),
+            Branding {
+                ui: Some(std::sync::Arc::new(ui.load().unwrap())),
+                ..Branding::new("WiFi Connect")
+            },
+        );
+        router(shared)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_ui_directory_serves_the_index_and_its_assets() {
+        let ui = crate::http::assets::TestUiDir::new();
+        ui.write("img/logo.svg", "<svg/>");
+
+        let resp = get_path_with_ui(&ui, "/").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("OVERRIDE-INDEX"));
+
+        let resp = get_path_with_ui(&ui, "/assets/img/logo.svg").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"<svg/>");
+    }
+
+    /// All-or-nothing: with a directory set, the embedded files are gone
+    /// from /assets/ too, not quietly mixed in.
+    #[tokio::test]
+    async fn a_ui_directory_hides_the_embedded_assets() {
+        assert_eq!(
+            get_path("/assets/brand.example.css").await.status(),
+            StatusCode::OK
+        );
+        let ui = crate::http::assets::TestUiDir::new();
+        assert_eq!(
+            get_path_with_ui(&ui, "/assets/brand.example.css")
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// The wildcard is percent-decoded before it reaches the handler, so
+    /// these arrive as `../`, absolute paths, a backslash and an embedded
+    /// NUL. None of them may name a file outside the UI, whichever source
+    /// is serving.
+    #[tokio::test]
+    async fn asset_paths_cannot_traverse_out_of_the_ui() {
+        let ui = crate::http::assets::TestUiDir::new();
+        // A real file next to the UI directory, so a traversal that
+        // worked would have something to find.
+        let outside_name = format!(
+            "{}-outside.txt",
+            ui.0.file_name().unwrap().to_string_lossy()
+        );
+        let outside = ui.0.parent().unwrap().join(&outside_name);
+        std::fs::write(&outside, "outside").unwrap();
+
+        let attempts = [
+            format!("/assets/..%2f{outside_name}"),
+            format!("/assets/%2e%2e%2f{outside_name}"),
+            format!("/assets/img/..%2f..%2f{outside_name}"),
+            format!(
+                "/assets/{}",
+                outside.display().to_string().replace('/', "%2f")
+            ),
+            "/assets/%2fetc%2fpasswd".to_owned(),
+            "/assets/..%2f..%2f..%2f..%2f..%2fetc%2fpasswd".to_owned(),
+            "/assets/index.html%00.css".to_owned(),
+            "/assets/..%5cindex.html".to_owned(),
+        ];
+        for path in &attempts {
+            for resp in [get_path_with_ui(&ui, path).await, get_path(path).await] {
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path} was served");
+            }
+        }
+        let _ = std::fs::remove_file(outside);
+    }
 }

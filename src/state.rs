@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::cli::ThemeMode;
+use crate::http::assets::UiDirectory;
 use crate::nm::{JoinFailure, JoinRequest, WifiNetwork};
 
 /// What the portal is doing, as the browser sees it.
@@ -86,6 +87,12 @@ pub struct Branding {
     /// of two colour schemes it uses is the integrator's decision, not
     /// something to ask the person holding the phone.
     pub theme: ThemeMode,
+    /// `--ui-directory`, replacing the embedded pages and `/assets/`.
+    ///
+    /// Read at startup like the rest of this struct; see `UiDirectory`
+    /// for why it is all-or-nothing and why that is also the
+    /// path-traversal defence.
+    pub ui: Option<Arc<UiDirectory>>,
 }
 
 /// An image and the content type to serve it as.
@@ -107,6 +114,7 @@ impl Branding {
             css: None,
             logo: None,
             theme: ThemeMode::System,
+            ui: None,
         }
     }
 }

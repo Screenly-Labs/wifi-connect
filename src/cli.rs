@@ -125,6 +125,11 @@ pub struct Cli {
     pub activity_timeout: u64,
 
     /// Serve the portal UI from this directory instead of the embedded copy.
+    ///
+    /// Replaces it wholesale: index.html and connecting.html must both be
+    /// present and written for this portal (with its {{TOKENS}}; start from
+    /// ui/dist), and /assets/ serves only this directory. Read once at
+    /// startup; balena's React build is refused.
     #[arg(short = 'u', long, env = "UI_DIRECTORY")]
     pub ui_directory: Option<PathBuf>,
 

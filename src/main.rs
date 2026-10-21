@@ -216,9 +216,26 @@ async fn run() -> ExitCode {
         },
     };
 
+    // Read eagerly and whole, like --brand-css: a missing directory or
+    // template stops the portal here with the path in the message.
+    let ui = match &args.ui_directory {
+        None => None,
+        Some(path) => match http::assets::UiDirectory::load(path) {
+            Ok(ui) => {
+                info!(path = %path.display(), "serving the portal UI from --ui-directory");
+                Some(std::sync::Arc::new(ui))
+            }
+            Err(e) => {
+                error!(error = %e, path = %path.display(), "could not read --ui-directory");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
     let branding = state::Branding {
         css: brand_css,
         logo: brand_logo,
+        ui,
         theme: args.default_theme,
         ..state::Branding::new(args.brand_name.clone())
     };
