@@ -135,6 +135,7 @@ Every flag has an environment variable. Flags win.
 |---|---|---|---|
 | `--portal-ssid` | `-s` | `PORTAL_SSID` | `WiFi Connect` |
 | `--portal-ssid-suffix` | | `PORTAL_SSID_SUFFIX` | `4` |
+| `--state-file` | | `WIFI_CONNECT_STATE_FILE` | |
 | `--portal-passphrase` | `-p` | `PORTAL_PASSPHRASE` | *generated per run* |
 | `--portal-security` | | `WIFI_CONNECT_PORTAL_SECURITY` | `auto` |
 | `--portal-gateway` | `-g` | `PORTAL_GATEWAY` | `192.168.42.1` |
@@ -334,6 +335,69 @@ wifi-connect --ui-directory /etc/wifi-connect/ui
   `{{TOKEN}}` inside a block changes its bytes per request; the browser
   blocks both, so both are logged as a warning at startup. Inline event
   handlers (`onclick="…"`) and `style="…"` attributes are blocked too.
+
+## Telling the host application what is going on
+
+A device that raises a setup access point usually has a screen on it, and
+that screen is the only way the generated passphrase reaches the person
+standing in front of it — the passphrase is what gets you *onto* the
+network, so it cannot be served over the network.
+
+`--state-file` is the supported way to drive that screen:
+
+```bash
+wifi-connect --state-file /data/hotspot/state.json
+```
+
+```json
+{
+  "schema": 1,
+  "portal_active": true,
+  "ssid": "Anthias Setup-G4VV",
+  "security": "wpa",
+  "passphrase": "brave-plum-42",
+  "qr_payload": "WIFI:T:WPA;S:Anthias Setup-G4VV;P:brave-plum-42;H:false;;",
+  "portal_url": "http://192.168.42.1:8000/",
+  "gateway": "192.168.42.1",
+  "port": 8000,
+  "started_at_unix": 1761048000
+}
+```
+
+**Presence is the liveness signal.** The file appears once a run has
+committed to raising the access point and is removed when the run ends,
+on every exit including the failures. It is deliberately not written by
+the runs that exit immediately because the device turned out to be
+online — which is exactly why `--qr-output`'s files cannot answer the
+question: they are written *before* that check, so a healthy device also
+has them.
+
+Do not probe the portal's HTTP listener to find out whether it is up.
+It is bound to the gateway address scoped to the wireless device, so
+that a setup portal cannot answer requests arriving over the customer's
+wired LAN; anything not on the access point — including a sibling
+container on the same host — is refused by design.
+
+Notes for consumers:
+
+- `ssid` is the name **on the air**, suffix included, not the configured
+  prefix. Print this one or you will send someone looking for a network
+  nobody is broadcasting.
+- `security` is `wpa` or `open`. On `open` there is no passphrase and no
+  join payload, and both fields are `null` — say "no password needed"
+  rather than rendering a null.
+- `qr_payload` is the same string the QR encodes, so you can render the
+  code at whatever size your screen wants without re-deriving the
+  `WIFI:` escaping rules.
+- Parse leniently: new fields may appear without `schema` changing. It
+  is bumped only when a field is removed or changes meaning.
+- A `SIGKILL` leaves the file behind. If showing a stale passphrase would
+  be worse than showing none, corroborate with something the kernel owns
+  — the gateway address is on the wireless interface for exactly as long
+  as the access point is up.
+- It holds a WPA passphrase in clear text. It is written `0640`,
+  atomically, and never through a symlink at the target — put it
+  somewhere the host application can read and the network cannot.
 
 ## The setup network's name
 

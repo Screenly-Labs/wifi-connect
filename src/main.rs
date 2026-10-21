@@ -17,6 +17,7 @@ mod dns;
 mod http;
 mod nm;
 mod passphrase;
+mod portal_state;
 mod private_file;
 mod qr;
 mod secret;
@@ -318,6 +319,21 @@ async fn run() -> ExitCode {
         Ok(Some(d)) => d,
         Err(e) => return ExitCode::from(app::report(&Err(e)) as u8),
     };
+
+    // The portal is going to come up: preflight said so, and the file is
+    // written here rather than beside the QR so that a consumer can treat
+    // its presence as "a portal run is live". The guard removes it again
+    // on every exit from here down, including the error paths.
+    let _state_file = args.state_file.as_ref().and_then(|path| {
+        portal_state::PortalState::new(
+            &ssid,
+            passphrase.as_ref(),
+            args.portal_url(),
+            args.portal_gateway,
+            args.portal_listening_port,
+        )
+        .publish(path)
+    });
 
     let branding = state::Branding {
         css: brand_css,

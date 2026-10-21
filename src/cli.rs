@@ -180,6 +180,23 @@ pub struct Cli {
     #[arg(long, env = "WIFI_CONNECT_QR_OUTPUT")]
     pub qr_output: Option<PathBuf>,
 
+    /// Write the portal's state, as JSON, to this path.
+    ///
+    /// The machine-readable half of the same job `--qr-output` does by
+    /// hand: the SSID actually on the air, the passphrase, the join
+    /// payload and the portal's address, in one atomic write with a
+    /// documented schema (see `portal_state`, and the README). Written
+    /// once the run commits to raising the access point and removed when
+    /// it ends, so its presence answers "is a portal up" without anyone
+    /// probing a listener that is deliberately unreachable from
+    /// elsewhere on the network.
+    ///
+    /// It carries the passphrase in plain text and is written 0640, like
+    /// the QR files. Put it somewhere the host application can read and
+    /// the network cannot.
+    #[arg(long, env = "WIFI_CONNECT_STATE_FILE")]
+    pub state_file: Option<PathBuf>,
+
     /// Never print the QR code to stdout. Wins over `--qr-stdout`.
     ///
     /// Under systemd or Docker, stdout is captured into the journal or the
@@ -736,6 +753,17 @@ mod tests {
         let r = parse_dhcp_range("10.0.0.1,10.0.0.253", Ipv4Addr::new(10, 0, 0, 254)).unwrap();
         assert_eq!(r.first, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(r.last, Ipv4Addr::new(10, 0, 0, 253));
+    }
+
+    /// The state file is opt-in: an integrator who does not ask for one
+    /// must not find a passphrase written into their working directory.
+    #[test]
+    fn the_state_file_is_off_unless_a_path_is_given() {
+        assert_eq!(cli(&[]).state_file, None);
+        assert_eq!(
+            cli(&["--state-file", "/data/hotspot/state.json"]).state_file,
+            Some(std::path::PathBuf::from("/data/hotspot/state.json"))
+        );
     }
 
     #[test]
