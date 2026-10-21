@@ -15,6 +15,8 @@ pub mod assets;
 pub mod captive;
 
 use axum::Router;
+use axum::http::{HeaderValue, header};
+use axum::response::Response;
 use axum::routing::{get, post};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -44,7 +46,42 @@ pub fn router(shared: Shared) -> Router {
         app = app.route(path, get(api::probe_html));
     }
 
-    app.fallback(api::probe_redirect).with_state(shared)
+    app.fallback(api::probe_redirect)
+        .layer(axum::middleware::map_response(security_headers))
+        .with_state(shared)
+}
+
+/// Headers every portal response carries, whatever route produced it.
+///
+/// A layer rather than per-handler calls so that a route added later, the
+/// fallback, and axum's own 404/405 responses cannot miss them.
+///
+/// They go on every response, not only HTML: `/assets/` serves the raw
+/// templates as text/html and `/brand-logo` may be an SVG, which is a
+/// document that can carry script; on JSON, CSS and redirects they are
+/// inert. The page is reached over the setup access point, but the phone
+/// may still have a cellular connection, so a page from the internet could
+/// otherwise frame the password form and dress it up as something else.
+async fn security_headers(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        assets::content_security_policy(),
+    );
+    // frame-ancestors supersedes this where it is understood; the header is
+    // for the captive-portal webviews old enough not to.
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    // The portal URL is not secret, but there is no reason for a page that
+    // asks for a WiFi password to tell anything where the user came from.
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    resp
 }
 
 /// Serve the portal on `addr` until `cancel` fires.
@@ -323,5 +360,89 @@ mod tests {
                 "{path} is cacheable"
             );
         }
+    }
+
+    /// Every security header, on a response that came back from `resp`.
+    fn assert_security_headers(resp: &axum::response::Response, what: &str) {
+        let get = |name: header::HeaderName| {
+            resp.headers()
+                .get(&name)
+                .map(|v| v.to_str().unwrap().to_owned())
+                .unwrap_or_else(|| panic!("{what}: no {name} header"))
+        };
+        assert_eq!(get(header::X_CONTENT_TYPE_OPTIONS), "nosniff", "{what}");
+        assert_eq!(get(header::X_FRAME_OPTIONS), "DENY", "{what}");
+        assert_eq!(get(header::REFERRER_POLICY), "no-referrer", "{what}");
+
+        let csp = get(header::CONTENT_SECURITY_POLICY);
+        for directive in [
+            "default-src 'none'",
+            "frame-ancestors 'none'",
+            "form-action 'self'",
+            "base-uri 'none'",
+        ] {
+            assert!(csp.contains(directive), "{what}: CSP lacks {directive}");
+        }
+        // The point of the hashes: inline script must never be allowed
+        // wholesale, or the policy is no backstop for an escaping bug.
+        assert!(!csp.contains("unsafe-inline"), "{what}: {csp}");
+        assert!(csp.contains("script-src 'sha256-"), "{what}: {csp}");
+    }
+
+    #[tokio::test]
+    async fn every_page_carries_the_security_headers() {
+        // The pages a user sees, the probe that opens the sign-in sheet on
+        // Apple devices, a redirecting probe, JSON, and the fallback.
+        for path in [
+            "/",
+            "/connecting",
+            "/hotspot-detect.html",
+            "/generate_204",
+            "/api/status",
+            "/brand.css",
+            "/assets/index.html",
+            "/no/such/path",
+        ] {
+            let resp = get_path(path).await;
+            assert_security_headers(&resp, path);
+        }
+    }
+
+    /// The validation-error page is rendered by the POST handler, a
+    /// different path from GET /, and is the one carrying the form back.
+    #[tokio::test]
+    async fn the_connect_error_page_carries_the_security_headers() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connect")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("ssid_hex=&ssid=&passphrase="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_security_headers(&resp, "POST /connect (error)");
+    }
+
+    /// The layer adds headers; it must not take away the ones handlers set.
+    #[tokio::test]
+    async fn the_layer_keeps_the_handlers_own_headers() {
+        let resp = get_path("/").await;
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
     }
 }
