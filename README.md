@@ -37,6 +37,7 @@ things that bit us in production:
 | Architectures | ARMv6 binary silently dropped in 4.4.6 | amd64, arm64, armv7 **and armv6**, each executed in CI |
 | Hidden networks | dropped from the list, cannot be joined | typed by name in the portal |
 | Enterprise | PEAP/MSCHAPv2 only | PEAP, TTLS/MSCHAPv2 and TTLS/PAP |
+| WEP networks | joined | refused, and the portal says why |
 
 The encryption is the headline. A captive portal cannot use TLS — there is
 no publicly trusted certificate for `192.168.42.1`, and a self-signed one
@@ -184,8 +185,9 @@ Upstream's HTTP API is kept too, for scripts and front ends written
 against it:
 
 - `GET /networks` returns `[{"ssid": "…", "security": "…"}]` with
-  upstream's four security values: `none`, `wep`, `wpa` and
-  `enterprise`. (`/api/networks` has more: exact SSID bytes, signal and
+  upstream's security values `none`, `wpa` and `enterprise`. WEP
+  networks are left out, since they cannot be joined (see
+  [Requirements](#requirements-and-limitations)). (`/api/networks` has more: exact SSID bytes, signal and
   frequency.)
 - `POST /connect` with `Content-Type: application/json` takes
   `{"ssid", "identity", "passphrase"}`. A name the scan listed is joined
@@ -363,12 +365,12 @@ failed unit.
 - **Architectures:** amd64, arm64, armv7 and armv6. ARMv6 covers the
   Raspberry Pi 1 and Pi Zero, which is the architecture upstream dropped in
   v4.4.6 without anyone noticing for three years.
-- **WEP networks can be joined**, since some legacy installations still
-  run them, with the key as the router shows it: 5 or 13 characters, 10
-  or 26 hex digits, or a passphrase up to 64 characters. The portal labels
-  them "WEP (insecure)" because WEP's encryption has been broken for two
-  decades. Only a network the scan lists as WEP is joined that way; a
-  hidden WEP network cannot be.
+- **WEP is not supported.** Its encryption has been broken for two
+  decades, so a device set up on it is open to anyone in radio range. A
+  WEP network is listed as "WEP (not supported)" so the user can find it
+  and learn why, but it cannot be chosen, and a submission naming it is
+  refused before the access point comes down. Switch the router to WPA2
+  or WPA3.
 - **Enterprise WiFi is PEAP/MSCHAPv2, TTLS/MSCHAPv2 or TTLS/PAP.** The
   portal offers the three as a *sign-in method* next to the username,
   PEAP by default. Certificate-based EAP-TLS needs key and certificate

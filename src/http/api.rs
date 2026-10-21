@@ -214,6 +214,8 @@ pub enum FormError {
     BadEapMethod,
     /// TTLS/PAP while server verification is switched off.
     PlaintextPasswordToUnverifiedServer,
+    /// The scan says WEP; see [`Security::is_supported`].
+    UnsupportedSecurity,
     BadIp(String),
 }
 
@@ -226,6 +228,12 @@ impl FormError {
                 "The server domain must be a host name such as radius.example.com.".into()
             }
             FormError::BadEapMethod => "Choose a sign-in method from the list.".into(),
+            FormError::UnsupportedSecurity => {
+                "This network uses WEP, which is not supported: its encryption has been \
+                 broken for years. Switch the router to WPA2 or WPA3, or choose another \
+                 network."
+                    .into()
+            }
             FormError::PlaintextPasswordToUnverifiedServer => {
                 "TTLS with PAP is turned off on this device: it sends your password as it is, \
                  and this device is set not to check the network's server certificate, so \
@@ -322,6 +330,11 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
             .find(|n| n.ssid_hex == hex)
             .map(|n| n.security)
     };
+    // Refused here, before the access point goes down, rather than sent to
+    // NetworkManager as a WPA join that can only fail.
+    if known_security.is_some_and(|s| !s.is_supported()) {
+        return Err(FormError::UnsupportedSecurity);
+    }
 
     let identity = {
         let t = form.identity.trim();
@@ -591,9 +604,12 @@ fn upstream_security(security: Security) -> &'static str {
 /// pages never call it; `/api/networks` carries more (the exact SSID bytes,
 /// strength, frequency).
 pub async fn upstream_networks(State(shared): State<Shared>) -> Response {
+    // Networks we refuse to join are left out, so a client offering
+    // whatever this lists never offers one.
     let rows: Vec<UpstreamNetwork> = shared
         .networks()
         .into_iter()
+        .filter(|n| n.security.is_supported())
         .map(|n| UpstreamNetwork {
             security: upstream_security(n.security),
             ssid: n.ssid,
@@ -1225,6 +1241,18 @@ mod tests {
         let f = body("Elsewhere").into_form(&scanned(Security::WpaPsk));
         assert!(f.ssid_hex.is_empty());
         assert_eq!(f.ssid, "Elsewhere");
+    }
+
+    /// WEP is refused before the radio is touched, whatever was typed.
+    #[test]
+    fn a_scanned_wep_network_is_refused() {
+        for key in ["", "abcde", "abcdefgh"] {
+            assert_eq!(
+                validate(&form("486f6d65", "", key), &scanned(Security::Wep)).unwrap_err(),
+                FormError::UnsupportedSecurity,
+                "{key:?}"
+            );
+        }
     }
 
     /// The portal hides the username block for a PSK network but a hidden

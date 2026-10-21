@@ -868,6 +868,33 @@ mod tests {
         );
     }
 
+    /// A network the portal refuses to join is not offered to API clients.
+    #[tokio::test]
+    async fn the_upstream_networks_endpoint_leaves_out_wep() {
+        use crate::nm::WifiNetwork;
+        use crate::nm::security::Security;
+        use crate::ssid::Ssid;
+        let (shared, _rx) =
+            Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"));
+        shared.set_networks(vec![
+            WifiNetwork::new(Ssid::from("Old"), 90, Security::Wep, None),
+            WifiNetwork::new(Ssid::from("Home"), 80, Security::WpaPsk, None),
+        ]);
+        let resp = router(shared)
+            .oneshot(
+                Request::builder()
+                    .uri("/networks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(resp).await,
+            serde_json::json!([{ "ssid": "Home", "security": "wpa" }])
+        );
+    }
+
     fn json_connect(body: &str, origin: Option<&str>) -> Request<Body> {
         let mut req = Request::builder()
             .method("POST")

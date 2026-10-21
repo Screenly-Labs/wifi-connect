@@ -75,6 +75,16 @@ impl Security {
         )
     }
 
+    /// Will we join it at all?
+    ///
+    /// WEP is listed, so a user looking for their network finds it and
+    /// learns why it cannot be used, but never joined: its encryption has
+    /// been broken for two decades, and a device set up on it is exposed
+    /// to anyone in radio range.
+    pub fn is_supported(self) -> bool {
+        !matches!(self, Security::Wep)
+    }
+
     /// Does it also need a username?
     pub fn needs_identity(self) -> bool {
         matches!(self, Security::Enterprise)
