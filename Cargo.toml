@@ -4,7 +4,7 @@ name = "wifi-connect"
 # compatibility contract this tool does not have: there is no library API,
 # and the surface that actually needs stability is the CLI, which is pinned
 # to upstream's flags by the migration table rather than to a major number.
-version = "2026.10.1"
+version = "2026.10.2"
 edition = "2024"
 rust-version = "1.90"
 description = "Minimal tool for joining WiFi networks: raises an encrypted setup access point with a captive portal and joins the chosen network via NetworkManager."
