@@ -240,8 +240,18 @@ async fn portal_loop<N: NetworkControl>(
     cancel: &CancellationToken,
     teardown: &mut Teardown<'_, N>,
 ) -> Result<Outcome, NetworkError> {
-    let deadline = (!config.activity_timeout.is_zero())
-        .then(|| tokio::time::Instant::now() + config.activity_timeout);
+    // An IDLE timeout, not a session cap. The deadline is recomputed
+    // from the last time somebody touched the portal, so a session in
+    // progress is never cut off -- an installer reading a passphrase off
+    // one screen while standing in front of another can easily be
+    // thirteen minutes into a fifteen-minute window when they start
+    // typing, and losing the access point at that moment costs them the
+    // credentials too: the next run generates a new passphrase and a new
+    // SSID suffix, so their phone will not even reconnect.
+    //
+    // An untouched portal still stands down exactly as before, which is
+    // what stops an unattended screen sitting in setup mode.
+    let idle_timeout = config.activity_timeout;
 
     loop {
         // Raise (or re-raise) the access point. The SSID and passphrase are
@@ -255,13 +265,26 @@ async fn portal_loop<N: NetworkControl>(
             biased;
             () = cancel.cancelled() => return Ok(Outcome::Cancelled),
             _ = async {
-                match deadline {
-                    Some(d) => tokio::time::sleep_until(d).await,
-                    // No timeout configured: never fire.
-                    None => std::future::pending::<()>().await,
+                // Zero means never.
+                if idle_timeout.is_zero() {
+                    std::future::pending::<()>().await;
+                }
+                loop {
+                    let deadline = shared.last_activity() + idle_timeout;
+                    if tokio::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    // Someone may touch the portal while we sleep, which
+                    // moves the deadline out from under us -- so wake and
+                    // re-read it rather than firing.
+                    tokio::time::sleep_until(deadline).await;
                 }
             } => {
-                info!("activity timeout elapsed with no successful join");
+                info!(
+                    timeout_s = idle_timeout.as_secs(),
+                    "the portal has been idle for the activity timeout with no \
+                     successful join"
+                );
                 return Ok(Outcome::TimedOut);
             }
             r = joins.recv() => match r {
@@ -880,6 +903,96 @@ mod tests {
             .unwrap();
 
         assert!(raise < down && down < join, "bad ordering: {calls:?}");
+    }
+
+    /// The scenario this is for: an installer unboxes five screens and
+    /// reaches the last one thirteen minutes after its portal came up.
+    /// They join, scan, and start typing a long passphrase -- and under
+    /// a hard session cap the access point vanishes under them at
+    /// fifteen. Worse than an interruption: the next run generates a new
+    /// passphrase AND a new SSID suffix, so their phone does not
+    /// reconnect and the screen now shows different credentials.
+    #[tokio::test(start_paused = true)]
+    async fn a_portal_someone_is_using_is_not_torn_down_under_them() {
+        let nm = FakeNm::new();
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+
+        let mut cfg = config();
+        cfg.activity_timeout = Duration::from_secs(900);
+
+        let toucher = {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                // Someone working the portal for an hour, well past the
+                // fifteen-minute window.
+                for _ in 0..12 {
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    shared.mark_activity();
+                }
+            })
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3600),
+            run_portal(&nm, &device, &cfg, &shared, rx, CancellationToken::new()),
+        )
+        .await;
+
+        toucher.abort();
+        assert!(
+            outcome.is_err(),
+            "the portal gave up while it was being used: {outcome:?}"
+        );
+    }
+
+    /// And the other half: the protection has to still work. An
+    /// unattended screen must not sit in setup mode forever, which is
+    /// what the whole backoff above it depends on.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_portal_still_stands_down() {
+        let nm = FakeNm::new();
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+
+        let mut cfg = config();
+        cfg.activity_timeout = Duration::from_secs(900);
+
+        let started = tokio::time::Instant::now();
+        let outcome = run_portal(&nm, &device, &cfg, &shared, rx, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::TimedOut);
+        // Not a second later than the old hard cap for a portal nobody
+        // touched: this is a change of meaning, not of duration.
+        assert_eq!(started.elapsed(), Duration::from_secs(900));
+    }
+
+    /// The timeout counts from the LAST touch, not the first.
+    #[tokio::test(start_paused = true)]
+    async fn the_window_runs_from_the_last_touch() {
+        let nm = FakeNm::new();
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+
+        let mut cfg = config();
+        cfg.activity_timeout = Duration::from_secs(900);
+
+        let shared_for_touch = shared.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            shared_for_touch.mark_activity();
+        });
+
+        let started = tokio::time::Instant::now();
+        let outcome = run_portal(&nm, &device, &cfg, &shared, rx, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Outcome::TimedOut);
+        // Touched at 600s, so it should give up at 1500s, not 900s.
+        assert_eq!(started.elapsed(), Duration::from_secs(1500));
     }
 
     #[tokio::test(start_paused = true)]

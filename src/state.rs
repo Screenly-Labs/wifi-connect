@@ -39,6 +39,18 @@ struct Inner {
     networks: Vec<WifiNetwork>,
     state: PortalState,
     attempts: u32,
+    /// When a human was last doing something with the portal.
+    ///
+    /// Drives `--activity-timeout`, which is an IDLE timeout: a session
+    /// someone is in the middle of must not be cut off, and a session
+    /// nobody is using must not hold a screen in setup mode forever.
+    ///
+    /// Captive-portal probe endpoints deliberately do not touch this.
+    /// A phone that joins the access point and sits there polls
+    /// /hotspot-detect.html on its own for as long as it stays
+    /// associated, so counting those would mean one forgotten phone in
+    /// an installer's pocket keeps a screen in setup indefinitely.
+    last_activity: tokio::time::Instant,
 }
 
 /// Handle shared by every HTTP handler.
@@ -135,6 +147,7 @@ impl Shared {
                     networks: Vec::new(),
                     state: PortalState::Portal,
                     attempts: 0,
+                    last_activity: tokio::time::Instant::now(),
                 })),
                 join_tx,
                 ap_raised: Arc::new(watch::Sender::new(false)),
@@ -188,6 +201,26 @@ impl Shared {
     /// after startup changes anything.
     pub fn mark_ap_raised(&self) {
         self.ap_raised.send_replace(true);
+    }
+
+    /// Note that someone is using the portal right now.
+    ///
+    /// Called by a layer over the human-facing routes, so a route added
+    /// later cannot forget to — and so the probe endpoints, which are
+    /// registered after that layer, cannot accidentally start counting.
+    pub fn mark_activity(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.last_activity = tokio::time::Instant::now();
+        }
+    }
+
+    /// When the portal was last used. The idle deadline is this plus
+    /// `--activity-timeout`.
+    pub fn last_activity(&self) -> tokio::time::Instant {
+        self.inner
+            .lock()
+            .map(|inner| inner.last_activity)
+            .unwrap_or_else(|poisoned| poisoned.into_inner().last_activity)
     }
 
     /// Resolve once the access point has been up at least once.

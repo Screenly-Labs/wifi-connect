@@ -47,7 +47,18 @@ pub fn router(shared: Shared) -> Router {
         .route("/api/captive-portal", get(api::captive_portal_api))
         .route("/brand.css", get(api::brand_css))
         .route("/brand-logo", get(api::brand_logo))
-        .route("/assets/{*path}", get(assets::serve));
+        .route("/assets/{*path}", get(assets::serve))
+        // Everything above is a human using the portal, so it resets the
+        // idle timeout. Everything registered BELOW is an operating
+        // system probing for a captive portal on its own schedule, and
+        // must not: a phone that joins the access point and is put back
+        // in a pocket keeps polling for as long as it stays associated,
+        // and counting that would hold the screen in setup mode until
+        // someone walks away with the phone.
+        .layer(axum::middleware::from_fn_with_state(
+            shared.clone(),
+            mark_activity,
+        ));
 
     // OS probe endpoints. Registered explicitly so they are covered by
     // tests, but the fallback below is what actually catches the probe URLs
@@ -66,6 +77,21 @@ pub fn router(shared: Shared) -> Router {
             security_headers,
         ))
         .with_state(shared)
+}
+
+/// Reset the idle timeout, for the routes a person actually drives.
+///
+/// A layer rather than a call in each handler: the point of the timeout
+/// is that an unattended portal stands down, and a handler added later
+/// that forgot to call this would silently start cutting users off
+/// mid-session.
+async fn mark_activity(
+    axum::extract::State(shared): axum::extract::State<Shared>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    shared.mark_activity();
+    next.run(request).await
 }
 
 /// Headers every portal response carries, whatever route produced it.
@@ -360,6 +386,59 @@ mod tests {
         let (shared, _rx) =
             Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"));
         router(shared)
+    }
+
+    /// Hit `path` and report whether it counted as someone using the
+    /// portal. Paused clock, so "did the stamp move" is exact.
+    async fn touches_the_idle_timer(path: &str) -> bool {
+        let (shared, _rx) =
+            Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"));
+        let before = shared.last_activity();
+
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        let _ = router(shared.clone())
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        shared.last_activity() > before
+    }
+
+    /// A phone that joins the setup network and goes back in a pocket
+    /// polls these on its own, forever, for as long as it stays
+    /// associated. If that counted as activity, one forgotten phone
+    /// would hold a screen in setup mode indefinitely -- and the backoff
+    /// that protects an unattended site is built on the portal standing
+    /// down.
+    #[tokio::test(start_paused = true)]
+    async fn an_os_probing_for_a_captive_portal_is_not_someone_using_it() {
+        for path in captive::HTML_PROBE_PATHS
+            .iter()
+            .chain(captive::REDIRECT_PROBE_PATHS)
+        {
+            assert!(
+                !touches_the_idle_timer(path).await,
+                "{path} reset the idle timeout"
+            );
+        }
+
+        // The fallback exists to catch probe URLs we have never heard
+        // of, so it must not count either.
+        assert!(
+            !touches_the_idle_timer("/some/unknown/probe").await,
+            "the probe fallback reset the idle timeout"
+        );
+    }
+
+    /// ...and the routes a person actually drives must.
+    #[tokio::test(start_paused = true)]
+    async fn a_person_working_the_portal_keeps_it_alive() {
+        for path in ["/", "/api/networks", "/api/status", "/connecting"] {
+            assert!(
+                touches_the_idle_timer(path).await,
+                "{path} did not reset the idle timeout"
+            );
+        }
     }
 
     async fn get_path(path: &str) -> axum::response::Response {

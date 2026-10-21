@@ -336,6 +336,24 @@ wifi-connect --ui-directory /etc/wifi-connect/ui
   blocks both, so both are logged as a warning at startup. Inline event
   handlers (`onclick="…"`) and `style="…"` attributes are blocked too.
 
+## When the portal stands down
+
+`--activity-timeout` is an **idle** timeout, not a cap on the session.
+The clock restarts whenever somebody loads a page, lists networks or
+submits a join, so a portal in use is never taken away mid-session —
+which matters more than it sounds, because the next run generates a
+new passphrase *and* a new SSID suffix, so an interrupted user does not
+simply reconnect and carry on.
+
+Captive-portal probe endpoints deliberately do not count. A phone that
+joins the setup network and goes back into a pocket keeps polling
+`/hotspot-detect.html` and friends for as long as it stays associated,
+and counting that would hold a screen in setup mode until someone
+walked away with the phone.
+
+An untouched portal stands down after exactly the configured interval,
+as before.
+
 ## Telling the host application what is going on
 
 A device that raises a setup access point usually has a screen on it, and

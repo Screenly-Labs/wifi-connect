@@ -160,7 +160,18 @@ pub struct Cli {
     )]
     pub interface: Option<String>,
 
-    /// Exit after this many seconds with no successful join. 0 disables it.
+    /// Stand down after this many seconds IDLE. 0 disables it.
+    ///
+    /// Idle, not a session cap: the clock restarts whenever someone
+    /// loads a page, lists networks or submits a join, so a portal
+    /// being used is never taken away mid-session. Captive-portal
+    /// probe endpoints do not count -- a phone left associated polls
+    /// them by itself and would otherwise hold the portal open for as
+    /// long as it is in range.
+    ///
+    /// What it is really protecting is the screen: an unattended
+    /// device with nothing to join should go back to doing its job
+    /// rather than showing a setup page forever.
     #[arg(short = 'a', long, env = "ACTIVITY_TIMEOUT", default_value_t = 0)]
     pub activity_timeout: u64,
 
