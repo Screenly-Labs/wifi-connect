@@ -173,9 +173,11 @@ pub fn respond(
             None
         }
 
+        // Only honoured when this MAC holds the address; see
+        // `Leases::decline` for why.
         MessageType::Decline => {
             if let Some(ip) = requested_ip(req) {
-                leases.decline(mac, ip);
+                leases.decline(mac, ip, now);
             }
             None
         }
@@ -193,6 +195,7 @@ mod tests {
     use std::time::Duration;
 
     const CLIENT: MacAddr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+    const OTHER: MacAddr = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
     const GW: Ipv4Addr = Ipv4Addr::new(192, 168, 42, 1);
 
     fn cfg() -> ServerConfig {
@@ -337,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn release_and_decline_get_no_reply() {
+    fn release_gets_no_reply_and_frees_the_address() {
         let (c, mut l) = (cfg(), leases());
         let now = Instant::now();
         let ip = Ipv4Addr::new(192, 168, 42, 10);
@@ -346,6 +349,15 @@ mod tests {
         let mut rel = request(MessageType::Release);
         rel.set_ciaddr(ip);
         assert!(respond(&rel, &c, &mut l, now).is_none());
+        assert!(l.may_use(OTHER, ip, now));
+    }
+
+    #[test]
+    fn decline_of_our_own_lease_gets_no_reply_and_withdraws_it() {
+        let (c, mut l) = (cfg(), leases());
+        let now = Instant::now();
+        let ip = Ipv4Addr::new(192, 168, 42, 10);
+        l.commit(CLIENT, ip, now);
 
         let mut dec = request(MessageType::Decline);
         dec.opts_mut().insert(DhcpOption::RequestedIpAddress(ip));
@@ -354,6 +366,81 @@ mod tests {
             !l.may_use(CLIENT, ip, now),
             "declined address must be withdrawn"
         );
+        assert!(!l.may_use(OTHER, ip, now), "from everyone");
+
+        // The client starts over and is steered elsewhere.
+        let offer = respond(&request(MessageType::Discover), &c, &mut l, now).unwrap();
+        assert_eq!(kind_of(&offer), MessageType::Offer);
+        assert_ne!(offer.yiaddr(), ip);
+    }
+
+    /// Any client on the AP can put any MAC in chaddr. A DECLINE naming an
+    /// address it does not hold must not evict the client that does, nor
+    /// take the address out of the pool.
+    #[test]
+    fn decline_of_someone_elses_lease_is_ignored() {
+        let (c, mut l) = (cfg(), leases());
+        let now = Instant::now();
+        let ip = Ipv4Addr::new(192, 168, 42, 10);
+        l.commit(OTHER, ip, now);
+
+        let mut dec = request(MessageType::Decline);
+        dec.opts_mut().insert(DhcpOption::RequestedIpAddress(ip));
+        assert!(respond(&dec, &c, &mut l, now).is_none());
+
+        // OTHER renews and is still ACKed for its address.
+        let mut renew = request(MessageType::Request);
+        renew.set_chaddr(&OTHER).set_ciaddr(ip);
+        let ack = respond(&renew, &c, &mut l, now).unwrap();
+        assert_eq!(kind_of(&ack), MessageType::Ack);
+        assert_eq!(ack.yiaddr(), ip);
+    }
+
+    /// Declining every pool address it was never given must leave the pool
+    /// usable for the next client.
+    #[test]
+    fn declines_for_unleased_addresses_do_not_drain_the_pool() {
+        let (c, mut l) = (cfg(), leases());
+        let now = Instant::now();
+        for last in 10..=12u8 {
+            let mut dec = request(MessageType::Decline);
+            dec.opts_mut()
+                .insert(DhcpOption::RequestedIpAddress(Ipv4Addr::new(
+                    192, 168, 42, last,
+                )));
+            assert!(respond(&dec, &c, &mut l, now).is_none());
+        }
+
+        let mut disc = request(MessageType::Discover);
+        disc.set_chaddr(&OTHER);
+        let offer = respond(&disc, &c, &mut l, now).unwrap();
+        assert_eq!(offer.yiaddr(), Ipv4Addr::new(192, 168, 42, 10));
+    }
+
+    /// The residual starvation risk, pinned so it stays bounded: REQUESTs
+    /// under made-up MACs can fill the pool, but only for one lease time.
+    #[test]
+    fn a_pool_filled_by_spoofed_requests_recovers_after_a_lease_time() {
+        let (c, mut l) = (cfg(), leases());
+        let t0 = Instant::now();
+        for last in 10..=12u8 {
+            let mut req = request(MessageType::Request);
+            req.set_chaddr(&[0x02, 0, 0, 0, 0, last]);
+            req.opts_mut()
+                .insert(DhcpOption::RequestedIpAddress(Ipv4Addr::new(
+                    192, 168, 42, last,
+                )));
+            let ack = respond(&req, &c, &mut l, t0).unwrap();
+            assert_eq!(kind_of(&ack), MessageType::Ack);
+        }
+
+        let mut disc = request(MessageType::Discover);
+        disc.set_chaddr(&OTHER);
+        assert!(respond(&disc, &c, &mut l, t0).is_none(), "pool is full");
+
+        let later = t0 + l.lease_time();
+        let offer = respond(&disc, &c, &mut l, later).unwrap();
+        assert_eq!(kind_of(&offer), MessageType::Offer);
     }
 
     #[test]
