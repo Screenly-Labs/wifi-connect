@@ -98,7 +98,48 @@ pub struct JoinRequest {
     /// For enterprise networks: the domain the RADIUS server's certificate
     /// must belong to (`802-1x.domain-suffix-match`). Ignored otherwise.
     pub server_domain: Option<String>,
+    /// For enterprise networks: how the password is proved. Ignored
+    /// otherwise.
+    pub eap_method: EapMethod,
     pub hidden: bool,
+}
+
+/// How an enterprise (802.1X) join proves the user's password, inside the
+/// TLS tunnel to the RADIUS server.
+///
+/// Only the password-based methods: certificate-based EAP-TLS needs a key
+/// and certificate that a captive portal has no way to collect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EapMethod {
+    /// PEAP with MSCHAPv2. What Windows networks, and most others, run.
+    #[default]
+    PeapMschapv2,
+    /// EAP-TTLS with MSCHAPv2 inside.
+    TtlsMschapv2,
+    /// EAP-TTLS with PAP inside: the password itself crosses the tunnel.
+    /// Common where accounts live in LDAP, which can check a password but
+    /// not an MSCHAPv2 response.
+    TtlsPap,
+}
+
+impl EapMethod {
+    /// The portal's form value for each method.
+    pub fn from_form(value: &str) -> Option<Self> {
+        match value {
+            "peap" => Some(Self::PeapMschapv2),
+            "ttls-mschapv2" => Some(Self::TtlsMschapv2),
+            "ttls-pap" => Some(Self::TtlsPap),
+            _ => None,
+        }
+    }
+
+    /// Whether the password itself, rather than a challenge response, goes
+    /// to whoever terminates the tunnel. Under PAP that is the plaintext
+    /// password, so the tunnel is only as good as the check on the server
+    /// at its far end.
+    pub fn sends_password_in_clear(self) -> bool {
+        matches!(self, Self::TtlsPap)
+    }
 }
 
 /// Why a join did not work, in terms the portal can explain.

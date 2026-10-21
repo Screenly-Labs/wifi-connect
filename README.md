@@ -342,8 +342,13 @@ failed unit.
 - **Architectures:** amd64, arm64, armv7 and armv6. ARMv6 covers the
   Raspberry Pi 1 and Pi Zero, which is the architecture upstream dropped in
   v4.4.6 without anyone noticing for three years.
-- **Enterprise WiFi is PEAP/MSCHAPv2 only.** Certificate-based EAP-TLS
-  needs key and certificate paths a portal cannot collect. The RADIUS
+- **Enterprise WiFi is PEAP/MSCHAPv2, TTLS/MSCHAPv2 or TTLS/PAP.** The
+  portal offers the three as a *sign-in method* next to the username,
+  PEAP by default. Certificate-based EAP-TLS needs key and certificate
+  paths a portal cannot collect. TTLS/PAP sends the password itself
+  through the tunnel, so it is refused while
+  `--insecure-eap-skip-server-verification` is set: without a verified
+  server, the tunnel could end at a look-alike network. The RADIUS
   server's certificate must chain to the **host's** system CA store
   (NetworkManager's `system-ca-certs`; it is the host's wpa_supplicant that
   reads it, so the `FROM scratch` container image is irrelevant). The

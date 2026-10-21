@@ -31,7 +31,7 @@ use super::proxies::{
 use super::security;
 use super::settings::{ApProfile, ap_settings};
 use super::{
-    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinFailure, JoinOutcome, JoinRequest,
+    ApConfig, ApHandle, Connectivity, DeviceInfo, EapMethod, JoinFailure, JoinOutcome, JoinRequest,
     NetworkControl, NetworkError, WifiNetwork,
 };
 use crate::secret::Secret;
@@ -161,11 +161,13 @@ impl NmrsControl {
                 identity,
                 password,
                 server_domain,
+                method,
             } => builder
                 .try_wpa_eap(eap_options(
                     identity,
                     password,
                     server_domain,
+                    method,
                     self.eap_server_check,
                 ))
                 .map_err(|e| NetworkError::Other(e.to_string()))?,
@@ -347,6 +349,7 @@ enum Credential<'a> {
         identity: &'a str,
         password: &'a Secret,
         server_domain: Option<&'a str>,
+        method: EapMethod,
     },
     // An identity with no password, or neither: treat as open.
     // NetworkManager rejects a security section with nothing in it.
@@ -360,6 +363,7 @@ fn classify_credentials(request: &JoinRequest) -> Credential<'_> {
             identity: identity.as_str(),
             password,
             server_domain: request.server_domain.as_deref(),
+            method: request.eap_method,
         },
         _ => Credential::Open,
     }
@@ -394,13 +398,25 @@ fn anonymous_identity(identity: &str) -> String {
 /// A public CA alone still admits any certificate a public CA will issue,
 /// for any name, so the user's server domain, when given, narrows it to
 /// the one name that should be there.
+///
+/// The anonymous outer identity and the server checks apply to TTLS
+/// exactly as to PEAP: both run the inner exchange in a TLS tunnel, and
+/// both send the outer identity before it exists.
 fn eap_options(
     identity: &str,
     password: &Secret,
     server_domain: Option<&str>,
+    method: EapMethod,
     check: EapServerCheck,
 ) -> nmrs::EapOptions {
+    let (outer, inner) = match method {
+        EapMethod::PeapMschapv2 => (nmrs::EapMethod::Peap, nmrs::Phase2::Mschapv2),
+        EapMethod::TtlsMschapv2 => (nmrs::EapMethod::Ttls, nmrs::Phase2::Mschapv2),
+        EapMethod::TtlsPap => (nmrs::EapMethod::Ttls, nmrs::Phase2::Pap),
+    };
     let mut opts = nmrs::EapOptions::new(identity, password.expose())
+        .with_method(outer)
+        .with_phase2(inner)
         .with_anonymous_identity(anonymous_identity(identity))
         .with_system_ca_certs(check == EapServerCheck::SystemCa);
     if let Some(domain) = server_domain {
@@ -411,6 +427,16 @@ fn eap_options(
         opts = opts.with_domain_suffix_match(domain);
     }
     opts
+}
+
+/// TTLS/PAP sends the password itself through the tunnel, so it is never
+/// attempted when the far end of that tunnel is not verified.
+fn refuses_plaintext(request: &JoinRequest, check: EapServerCheck) -> bool {
+    check == EapServerCheck::Insecure
+        && matches!(
+            classify_credentials(request),
+            Credential::Eap { method, .. } if method.sends_password_in_clear()
+        )
 }
 
 /// Shortest budget worth spending on a fresh open profile after a saved one
@@ -499,8 +525,9 @@ fn credentials_for(request: &JoinRequest, check: EapServerCheck) -> WifiSecurity
             identity,
             password,
             server_domain,
+            method,
         } => WifiSecurity::WpaEap {
-            opts: eap_options(identity, password, server_domain, check),
+            opts: eap_options(identity, password, server_domain, method, check),
         },
         Credential::Open => WifiSecurity::Open,
     }
@@ -841,6 +868,14 @@ impl NetworkControl for NmrsControl {
         budget: Duration,
     ) -> Result<JoinOutcome, NetworkError> {
         let ssid = request.ssid.to_display_string();
+
+        // The portal refuses this before the access point goes down (see
+        // `http::api::check_policy`); this is the backstop, so no other
+        // caller can send a plaintext password to an unverified server.
+        if refuses_plaintext(request, self.eap_server_check) {
+            warn!("refusing TTLS/PAP with server verification off");
+            return Ok(JoinOutcome::Failed(JoinFailure::Other));
+        }
 
         // A hidden network needs `802-11-wireless.hidden = true` in the
         // profile, or the supplicant never sends a directed probe and the
@@ -1197,6 +1232,7 @@ mod tests {
             identity: Some(identity.into()),
             passphrase: Some(Secret::new("hunter2")),
             server_domain: server_domain.map(str::to_string),
+            eap_method: Default::default(),
             hidden: false,
         }
     }
@@ -1281,6 +1317,57 @@ mod tests {
         assert_eq!(opts.domain_suffix_match.as_deref(), Some("example.com"));
     }
 
+    #[test]
+    fn each_method_maps_to_its_outer_and_inner_method() {
+        for (method, outer, inner) in [
+            (
+                EapMethod::PeapMschapv2,
+                nmrs::EapMethod::Peap,
+                nmrs::Phase2::Mschapv2,
+            ),
+            (
+                EapMethod::TtlsMschapv2,
+                nmrs::EapMethod::Ttls,
+                nmrs::Phase2::Mschapv2,
+            ),
+            (EapMethod::TtlsPap, nmrs::EapMethod::Ttls, nmrs::Phase2::Pap),
+        ] {
+            let mut r = enterprise("alice@example.com", Some("radius.example.com"));
+            r.eap_method = method;
+            let opts = eap_of(credentials_for(&r, EapServerCheck::SystemCa));
+            assert_eq!((opts.method, opts.phase2), (outer, inner), "{method:?}");
+            // TTLS gets the same protections as PEAP.
+            assert!(opts.system_ca_certs, "{method:?}");
+            assert_eq!(
+                opts.anonymous_identity.as_deref(),
+                Some("anonymous@example.com")
+            );
+            assert_eq!(
+                opts.domain_suffix_match.as_deref(),
+                Some("radius.example.com")
+            );
+        }
+    }
+
+    /// The backstop behind the portal's own check.
+    #[test]
+    fn ttls_pap_is_never_sent_to_an_unverified_server() {
+        let mut r = enterprise("alice", None);
+        r.eap_method = EapMethod::TtlsPap;
+        assert!(refuses_plaintext(&r, EapServerCheck::Insecure));
+        assert!(!refuses_plaintext(&r, EapServerCheck::SystemCa));
+
+        for method in [EapMethod::PeapMschapv2, EapMethod::TtlsMschapv2] {
+            r.eap_method = method;
+            assert!(!refuses_plaintext(&r, EapServerCheck::Insecure));
+        }
+
+        // Without a username it is not an enterprise join at all.
+        r.eap_method = EapMethod::TtlsPap;
+        r.identity = None;
+        assert!(!refuses_plaintext(&r, EapServerCheck::Insecure));
+    }
+
     /// A domain is an enterprise setting; on a PSK network it must not turn
     /// the join into something else.
     #[test]
@@ -1301,6 +1388,7 @@ mod tests {
             passphrase: passphrase.map(Secret::new),
             hidden,
             server_domain: None,
+            eap_method: Default::default(),
         }
     }
 

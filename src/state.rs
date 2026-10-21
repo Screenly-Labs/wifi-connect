@@ -56,6 +56,10 @@ pub struct Shared {
     pub portal_url: String,
     /// Everything an integrator can change about how the portal looks.
     pub branding: Branding,
+    /// Whether enterprise joins check the RADIUS server's certificate,
+    /// i.e. `--insecure-eap-skip-server-verification` is off. The portal
+    /// refuses TTLS/PAP when it is not; see `http::api::check_policy`.
+    pub eap_server_verified: bool,
 }
 
 /// The white-labelling surface, resolved at startup.
@@ -136,6 +140,7 @@ impl Shared {
                 ap_raised: Arc::new(watch::Sender::new(false)),
                 portal_url,
                 branding,
+                eap_server_verified: true,
             },
             join_rx,
         )
@@ -238,6 +243,7 @@ mod tests {
             identity: None,
             passphrase: Some(crate::secret::Secret::new("abcdefgh")),
             server_domain: None,
+            eap_method: Default::default(),
             hidden: false,
         }
     }

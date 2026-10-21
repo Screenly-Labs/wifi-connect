@@ -320,7 +320,8 @@ async fn run() -> ExitCode {
         theme: args.default_theme,
         ..state::Branding::new(args.brand_name.clone())
     };
-    let (shared, joins) = state::Shared::new(args.portal_url(), branding);
+    let (mut shared, joins) = state::Shared::new(args.portal_url(), branding);
+    shared.eap_server_verified = !args.insecure_eap_skip_server_verification;
     let cancel = CancellationToken::new();
 
     // DHCP, DNS and HTTP. All three are pinned to the access-point interface

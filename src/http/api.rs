@@ -7,7 +7,7 @@ use axum::response::{Html, IntoResponse, Response};
 use tracing::warn;
 
 use crate::nm::security::Security;
-use crate::nm::{JoinRequest, WifiNetwork};
+use crate::nm::{EapMethod, JoinRequest, WifiNetwork};
 use crate::passphrase;
 use crate::secret::Secret;
 use crate::ssid::Ssid;
@@ -171,7 +171,7 @@ pub async fn connecting(State(shared): State<Shared>) -> Response {
 ///
 /// `ssid_hex` carries the exact SSID bytes; `ssid` is the fallback for a
 /// manually typed (hidden) network, where there are no bytes to carry.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct ConnectForm {
     #[serde(default)]
     pub ssid_hex: String,
@@ -185,6 +185,11 @@ pub struct ConnectForm {
     /// belong to. Optional; see [`server_domain`].
     #[serde(default)]
     pub server_domain: String,
+    /// Enterprise only: `peap`, `ttls-mschapv2` or `ttls-pap`. Blank is
+    /// PEAP, which is what every enterprise join was before there was a
+    /// choice.
+    #[serde(default)]
+    pub eap_method: String,
 }
 
 /// Why a submission was rejected before we touched the radio.
@@ -193,6 +198,9 @@ pub enum FormError {
     NoNetwork,
     BadPassphrase(String),
     BadServerDomain,
+    BadEapMethod,
+    /// TTLS/PAP while server verification is switched off.
+    PlaintextPasswordToUnverifiedServer,
 }
 
 impl FormError {
@@ -202,6 +210,14 @@ impl FormError {
             FormError::BadPassphrase(m) => m.clone(),
             FormError::BadServerDomain => {
                 "The server domain must be a host name such as radius.example.com.".into()
+            }
+            FormError::BadEapMethod => "Choose a sign-in method from the list.".into(),
+            FormError::PlaintextPasswordToUnverifiedServer => {
+                "TTLS with PAP is turned off on this device: it sends your password as it is, \
+                 and this device is set not to check the network's server certificate, so \
+                 any look-alike network could read it. Choose another sign-in method, or ask \
+                 the device's administrator."
+                    .into()
             }
         }
     }
@@ -329,10 +345,14 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
 
     // Only meaningful next to a username; otherwise ignored rather than
     // validated, so a leftover value cannot fail a PSK join either.
-    let server_domain = if enterprise {
-        server_domain(&form.server_domain)?
+    let (server_domain, eap_method) = if enterprise {
+        let method = match form.eap_method.trim() {
+            "" => EapMethod::default(),
+            m => EapMethod::from_form(m).ok_or(FormError::BadEapMethod)?,
+        };
+        (server_domain(&form.server_domain)?, method)
     } else {
-        None
+        (None, EapMethod::default())
     };
 
     Ok(JoinRequest {
@@ -340,8 +360,28 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
         identity,
         passphrase,
         server_domain,
+        eap_method,
         hidden,
     })
+}
+
+/// Refuse a join this device's configuration makes unsafe.
+///
+/// Separate from [`validate`] because it depends on how the operator set
+/// the device up, not on the form. TTLS/PAP hands the password itself to
+/// whatever terminates the tunnel; with `--insecure-eap-skip-server-verification`
+/// that can be any access point copying the network's name. PEAP and
+/// TTLS/MSCHAPv2 are weak there too, but what they leak is a challenge
+/// response that has to be cracked; PAP would leak the password outright,
+/// so it is the one combination refused rather than warned about.
+pub fn check_policy(request: &JoinRequest, server_verified: bool) -> Result<(), FormError> {
+    if request.identity.is_some()
+        && request.eap_method.sends_password_in_clear()
+        && !server_verified
+    {
+        return Err(FormError::PlaintextPasswordToUnverifiedServer);
+    }
+    Ok(())
 }
 
 /// The longest enterprise password we pass on, in characters.
@@ -531,7 +571,9 @@ pub async fn connect(
         );
     }
 
-    let request = match validate(&form, &shared.networks()) {
+    let request = match validate(&form, &shared.networks())
+        .and_then(|r| check_policy(&r, shared.eap_server_verified).map(|()| r))
+    {
         Ok(r) => r,
         Err(e) => {
             // No teardown: the user stays on the portal and fixes the typo.
@@ -582,7 +624,7 @@ mod tests {
             ssid: ssid.into(),
             identity: String::new(),
             passphrase: passphrase.into(),
-            server_domain: String::new(),
+            ..ConnectForm::default()
         }
     }
 
@@ -1044,6 +1086,58 @@ mod tests {
         let r = validate(&f, &scanned(Security::WpaPsk)).unwrap();
         assert!(r.hidden);
         assert_eq!(r.identity.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn an_enterprise_join_without_a_method_is_peap() {
+        let r = validate(&enterprise("abc123"), &[]).unwrap();
+        assert_eq!(r.eap_method, EapMethod::PeapMschapv2);
+    }
+
+    #[test]
+    fn each_enterprise_method_is_read_from_the_form() {
+        for (value, method) in [
+            ("peap", EapMethod::PeapMschapv2),
+            ("ttls-mschapv2", EapMethod::TtlsMschapv2),
+            (" ttls-pap ", EapMethod::TtlsPap),
+        ] {
+            let mut f = enterprise("abc123");
+            f.eap_method = value.into();
+            assert_eq!(validate(&f, &[]).unwrap().eap_method, method, "{value}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_fails_the_submission() {
+        let mut f = enterprise("abc123");
+        f.eap_method = "tls".into();
+        assert_eq!(validate(&f, &[]).unwrap_err(), FormError::BadEapMethod);
+    }
+
+    /// Like the server domain: meaningless without a username, so ignored
+    /// rather than validated.
+    #[test]
+    fn a_leftover_method_does_not_touch_a_psk_join() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.eap_method = "nonsense".into();
+        let r = validate(&f, &[]).unwrap();
+        assert_eq!(r.eap_method, EapMethod::default());
+    }
+
+    #[test]
+    fn ttls_pap_is_refused_only_when_the_server_goes_unchecked() {
+        let mut f = enterprise("abc123");
+        f.eap_method = "ttls-pap".into();
+        let r = validate(&f, &[]).unwrap();
+        assert_eq!(check_policy(&r, true), Ok(()));
+        assert_eq!(
+            check_policy(&r, false),
+            Err(FormError::PlaintextPasswordToUnverifiedServer)
+        );
+
+        f.eap_method = "ttls-mschapv2".into();
+        let r = validate(&f, &[]).unwrap();
+        assert_eq!(check_policy(&r, false), Ok(()));
     }
 
     fn enterprise(passphrase: &str) -> ConnectForm {
