@@ -17,6 +17,12 @@ updates:
       cargo:
         patterns:
           - "*"
+    # zbus must stay on the same major as nmrs's own requirement, or the
+    # proxies in src/nm/proxies.rs end up on a different `Connection` type
+    # (see the comment on zbus in Cargo.toml). Drop this once nmrs moves.
+    ignore:
+      - dependency-name: "zbus"
+        update-types: ["version-update:semver-major"]
 
   # The portal UI. "bun", not "npm": the lockfile is ui/bun.lock, which the
   # npm ecosystem does not read.
