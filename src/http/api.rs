@@ -262,15 +262,23 @@ fn origin_of(url: &str) -> Option<&str> {
 ///   [`serves_page_in_place`] keeps the form off every other host, so a
 ///   genuine submission never arrives from one.
 ///
-/// Evidence, in order of strength:
+/// Evidence, checked in this order:
 ///
 /// 1. `Sec-Fetch-Site: cross-site` or `same-site` — the browser itself says
-///    the form lives elsewhere. (`same-site` covers another port on the
-///    gateway; nothing legitimate posts from there.)
-/// 2. `Origin`, which every current browser sends on a POST. `Origin: null`
-///    (sandboxed iframes, `data:` and `file:` pages) is rejected: our own
-///    page never produces it, and it is the classic way to launder a
-///    cross-site POST past a naive "is the header present?" check.
+///    the form lives elsewhere. Defence in depth only: browsers send the
+///    `Sec-Fetch-*` headers only to potentially trustworthy (HTTPS or
+///    loopback) URLs, and the portal is plain HTTP on a private address,
+///    so today's browsers never send it here. (Were one to, our own form
+///    posts to the very origin it was served from, so it would say
+///    `same-origin`, including after the cross-host probe redirect; nothing
+///    legitimate is `same-site`.)
+/// 2. `Origin`, which every current browser sends on a POST. This is the
+///    check that does the work. `Origin: null` (sandboxed iframes, `data:`
+///    pages, a POST laundered through a cross-origin redirect) is rejected:
+///    it is the classic way past a naive "is the header present?" check.
+///    Our own page never produces it because the router pins
+///    `Referrer-Policy: same-origin`; under `no-referrer` a browser sends
+///    `null` even to its own origin.
 /// 3. `Referer`, consulted only when `Origin` is absent (old browsers).
 ///
 /// With none of the three present the request is let through. A client that
@@ -331,8 +339,10 @@ pub async fn connect(
     if let Some(reason) = cross_site_reason(&headers, &shared.portal_url) {
         warn!(
             reason,
+            host = ?headers.get(header::HOST),
             origin = ?headers.get(header::ORIGIN),
             referer = ?headers.get(header::REFERER),
+            sec_fetch_site = ?headers.get("sec-fetch-site"),
             "rejected a cross-site POST /connect"
         );
         return no_store(
@@ -341,8 +351,11 @@ pub async fn connect(
                 Html(assets::render_index_with_error(
                     &shared.branding,
                     &shared.networks(),
-                    "That request did not come from this setup page, so it was ignored. \
-                     Choose a network below to continue.",
+                    "That request did not come from this setup page, so it was ignored \
+                     and nothing was changed. To set up this device, choose a network \
+                     below and connect again. If this message comes back every time, \
+                     your browser is hiding where the request came from: try another \
+                     browser.",
                 )),
             )
                 .into_response(),

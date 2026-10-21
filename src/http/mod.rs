@@ -43,7 +43,31 @@ pub fn router(shared: Shared) -> Router {
         app = app.route(path, get(api::probe_html));
     }
 
-    app.fallback(api::probe_redirect).with_state(shared)
+    app.fallback(api::probe_redirect)
+        .layer(axum::middleware::map_response(referrer_policy))
+        .with_state(shared)
+}
+
+/// `Referrer-Policy: same-origin` on every response.
+///
+/// `POST /connect` refuses a request whose `Origin` is `null` (see
+/// `api::connect`), and the Fetch standard makes a form POST carry
+/// `Origin: null` — *even to its own origin* — when the posting page's
+/// referrer policy is `no-referrer`. Chrome and the Android WebView do
+/// exactly that. Left to the browser's default the page is fine, but a
+/// user who has set their browser's default policy to `no-referrer`, or a
+/// later change that sends `no-referrer` from here, would lock every such
+/// browser out of setup with a 403.
+///
+/// `same-origin` keeps the real `Origin` on our own form's POST and still
+/// tells no other site anything, which is all `no-referrer` would buy. An
+/// explicit header also overrides a browser's configured default.
+async fn referrer_policy(mut resp: axum::response::Response) -> axum::response::Response {
+    resp.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("same-origin"),
+    );
+    resp
 }
 
 /// Serve the portal on `addr` until `cancel` fires.
@@ -249,6 +273,29 @@ mod tests {
         let text = String::from_utf8_lossy(&body);
         assert!(text.contains("action=\"/connect\""), "not the portal page");
         assert!(text.contains("did not come from this setup page"));
+    }
+
+    /// Under `Referrer-Policy: no-referrer` browsers send `Origin: null` on
+    /// a form POST even to the page's own origin, which the check rejects,
+    /// so every page that can carry the form, the 403 page included, must
+    /// pin a policy that keeps the real Origin.
+    #[tokio::test]
+    async fn every_page_that_can_post_the_form_keeps_the_origin_header() {
+        let policy = |resp: &axum::response::Response| {
+            resp.headers()
+                .get(header::REFERRER_POLICY)
+                .map(|v| v.to_str().unwrap().to_owned())
+        };
+        for path in ["/", "/hotspot-detect.html", "/generate_204", "/connecting"] {
+            let resp = get_path(path).await;
+            assert_eq!(policy(&resp).as_deref(), Some("same-origin"), "{path}");
+        }
+        let forbidden = post_connect(&[("origin", "http://evil.example")]).await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_eq!(policy(&forbidden).as_deref(), Some("same-origin"));
+        let invalid = post_connect(&[("origin", "http://192.168.42.1")]).await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(policy(&invalid).as_deref(), Some("same-origin"));
     }
 
     #[tokio::test]
