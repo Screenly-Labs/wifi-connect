@@ -136,61 +136,12 @@ async fn run() -> ExitCode {
         }
     };
 
-    // Generated once per RUN, not per activation. A failed join re-raises
-    // the access point, and the user's phone only reassociates
-    // automatically if the SSID and passphrase are byte-identical to the
-    // ones it already stored.
-    let passphrase = if args.insecure_open_portal {
-        None
-    } else {
-        Some(
-            args.portal_passphrase
-                .clone()
-                .map(Secret::new)
-                .unwrap_or_else(passphrase::generate),
-        )
-    };
-
-    let ssid = Ssid::from(args.portal_ssid.as_str());
-    publish_qr(&args, &ssid, passphrase.as_ref());
-
-    let nm = match NmrsControl::connect().await {
-        Ok(nm) => nm,
-        Err(e) => {
-            error!("{e}");
-            error!(
-                "the bus address comes from $DBUS_SYSTEM_BUS_ADDRESS, defaulting \
-                 to /var/run/dbus/system_bus_socket. In a balena container set the \
-                 io.balena.features.dbus label and point it at \
-                 unix:path=/host/run/dbus/system_bus_socket."
-            );
-            return ExitCode::from(5);
-        }
-    };
-
-    let run_config = app::RunConfig {
-        ap: nm::ApConfig {
-            ssid: ssid.clone(),
-            passphrase: passphrase.clone(),
-            security: args.ap_security(),
-            gateway: args.portal_gateway,
-            prefix: 24,
-            channel: None,
-        },
-        interface: args.interface.clone(),
-        autoconnect_budget: args.wait_for_connection(),
-        join_budget: args.connection_timeout(),
-        activity_timeout: args.activity_timeout(),
-        force: args.force,
-    };
-
-    // Decide whether the portal is needed at all before binding a socket.
-    let device = match app::preflight(&nm, &run_config).await {
-        Ok(None) => return ExitCode::from(0),
-        Ok(Some(d)) => d,
-        Err(e) => return ExitCode::from(app::report(&Err(e)) as u8),
-    };
-
+    // The files the portal serves are read here, with the flags, and not
+    // after preflight decides whether a portal is needed: on a device that
+    // is already online preflight exits 0, so a typo checked any later
+    // would pass every boot on the bench and surface only in the field, on
+    // the day the WiFi goes and the portal it breaks is the way back.
+    //
     // Read eagerly. A mistyped --brand-css should stop the portal here,
     // with the path in the message, rather than quietly serving an
     // unbranded page that looks like the flag was ignored.
@@ -244,6 +195,61 @@ async fn run() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
+    };
+
+    // Generated once per RUN, not per activation. A failed join re-raises
+    // the access point, and the user's phone only reassociates
+    // automatically if the SSID and passphrase are byte-identical to the
+    // ones it already stored.
+    let passphrase = if args.insecure_open_portal {
+        None
+    } else {
+        Some(
+            args.portal_passphrase
+                .clone()
+                .map(Secret::new)
+                .unwrap_or_else(passphrase::generate),
+        )
+    };
+
+    let ssid = Ssid::from(args.portal_ssid.as_str());
+    publish_qr(&args, &ssid, passphrase.as_ref());
+
+    let nm = match NmrsControl::connect().await {
+        Ok(nm) => nm,
+        Err(e) => {
+            error!("{e}");
+            error!(
+                "the bus address comes from $DBUS_SYSTEM_BUS_ADDRESS, defaulting \
+                 to /var/run/dbus/system_bus_socket. In a balena container set the \
+                 io.balena.features.dbus label and point it at \
+                 unix:path=/host/run/dbus/system_bus_socket."
+            );
+            return ExitCode::from(5);
+        }
+    };
+
+    let run_config = app::RunConfig {
+        ap: nm::ApConfig {
+            ssid: ssid.clone(),
+            passphrase: passphrase.clone(),
+            security: args.ap_security(),
+            gateway: args.portal_gateway,
+            prefix: 24,
+            channel: None,
+        },
+        interface: args.interface.clone(),
+        autoconnect_budget: args.wait_for_connection(),
+        join_budget: args.connection_timeout(),
+        activity_timeout: args.activity_timeout(),
+        force: args.force,
+    };
+
+    // Decide whether the portal is needed at all before binding a socket.
+    let device = match app::preflight(&nm, &run_config).await {
+        Ok(None) => return ExitCode::from(0),
+        Ok(Some(d)) => d,
+        Err(e) => return ExitCode::from(app::report(&Err(e)) as u8),
     };
 
     let branding = state::Branding {
