@@ -248,8 +248,9 @@ pub trait NetworkControl: Send + Sync + 'static {
         config: &ApConfig,
     ) -> Result<ApHandle, NetworkError>;
 
-    /// Deactivate and delete the AP profile. Best-effort: a teardown that
-    /// fails must not stop the rest of the teardown running.
+    /// Deactivate and delete the AP profile this handle names, by its UUID.
+    /// Best-effort: a teardown that fails must not stop the rest of the
+    /// teardown running.
     async fn tear_down_ap(&self, handle: &ApHandle) -> Result<(), NetworkError>;
 
     /// Attempt to join, returning a *reason* on failure rather than an error.
@@ -260,10 +261,24 @@ pub trait NetworkControl: Send + Sync + 'static {
         budget: std::time::Duration,
     ) -> Result<JoinOutcome, NetworkError>;
 
-    /// Delete a station profile we created that turned out not to work.
-    /// Without this, NM's autoconnect retries a known-bad profile forever
-    /// and fights the portal for the radio.
-    async fn forget(&self, ssid: &Ssid) -> Result<(), NetworkError>;
+    /// The UUIDs of every saved *station* (not access-point) WiFi profile
+    /// whose SSID is `ssid`.
+    ///
+    /// Used to work out which profile a failed join created: snapshot before,
+    /// snapshot after, and the difference is ours. Matching on the SSID as
+    /// well as on "new" narrows that difference to the one network we were
+    /// asked to join, so a profile someone else adds through `nmcli` during
+    /// the join window is not swept up with it.
+    async fn station_profile_uuids(&self, ssid: &Ssid) -> Result<Vec<String>, NetworkError>;
+
+    /// Delete one saved profile, identified by UUID. "Already gone" is
+    /// success.
+    ///
+    /// There is deliberately no delete-by-name. Names are not identities: a
+    /// `connection.id` or an SSID typed into the portal can equal the name of
+    /// an unrelated profile — `Wired connection 1`, a VPN, the device's real
+    /// home network — and a by-name delete takes that profile out with it.
+    async fn delete_profile(&self, uuid: &str) -> Result<(), NetworkError>;
 
     /// Put the device back in managed station mode.
     async fn restore(&self, device: &DeviceInfo) -> Result<(), NetworkError>;
