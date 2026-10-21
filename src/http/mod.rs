@@ -204,6 +204,151 @@ mod tests {
         );
     }
 
+    /// POST /connect with an empty form: if the provenance check lets it
+    /// through it is rejected by validation with a 400, which proves the
+    /// request got past the check without ever reaching the radio.
+    async fn post_connect(extra: &[(&str, &str)]) -> axum::response::Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/connect")
+            .header(header::HOST, "192.168.42.1")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        app()
+            .oneshot(req.body(Body::from("ssid_hex=&ssid=")).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_same_origin_connect_reaches_validation() {
+        let resp = post_connect(&[
+            ("origin", "http://192.168.42.1"),
+            ("sec-fetch-site", "same-origin"),
+        ])
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The heart of the fix: a page on the open internet, loaded over
+    /// cellular, must not be able to make the device change networks.
+    #[tokio::test]
+    async fn a_cross_origin_connect_is_forbidden() {
+        let resp = post_connect(&[("origin", "http://evil.example")]).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("no-store")
+        );
+        // The portal page, so a confused human still has a way forward.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("action=\"/connect\""), "not the portal page");
+        assert!(text.contains("did not come from this setup page"));
+    }
+
+    #[tokio::test]
+    async fn a_null_origin_connect_is_forbidden() {
+        let resp = post_connect(&[("origin", "null")]).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_cross_site_fetch_metadata_connect_is_forbidden() {
+        let resp = post_connect(&[("sec-fetch-site", "cross-site")]).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_connect_with_only_a_matching_referer_reaches_validation() {
+        let resp = post_connect(&[("referer", "http://192.168.42.1/")]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_connect_with_only_a_foreign_referer_is_forbidden() {
+        let resp = post_connect(&[("referer", "http://evil.example/page")]).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_connect_without_provenance_headers_reaches_validation() {
+        let resp = post_connect(&[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// iOS end to end: the CNA's probe under Apple's host name gets the
+    /// portal page in place, and the form on it posts back to that host.
+    /// Both halves must work, or iPhones cannot be set up.
+    #[tokio::test]
+    async fn the_apple_probe_page_can_submit_back_to_its_own_host() {
+        let probe = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/hotspot-detect.html")
+                    .header(header::HOST, "captive.apple.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
+
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connect")
+                    .header(header::HOST, "captive.apple.com")
+                    .header(header::ORIGIN, "http://captive.apple.com")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("ssid_hex=&ssid="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The check is for state-changing requests only. Probes arrive with
+    /// foreign Host headers and an Origin is meaningless on them; none of
+    /// that may change how they are routed.
+    #[tokio::test]
+    async fn get_probes_with_a_foreign_host_and_origin_are_unaffected() {
+        for path in ["/generate_204", "/connecttest.txt", "/some/unknown/probe"] {
+            let resp = app()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::HOST, "connectivitycheck.gstatic.com")
+                        .header(header::ORIGIN, "http://evil.example")
+                        .header("sec-fetch-site", "cross-site")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(resp.status().is_redirection(), "{path}: {}", resp.status());
+        }
+
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/hotspot-detect.html")
+                    .header(header::HOST, "captive.apple.com")
+                    .header("sec-fetch-site", "cross-site")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn the_captive_portal_api_is_served_with_the_rfc_media_type() {
         let resp = get_path("/api/captive-portal").await;

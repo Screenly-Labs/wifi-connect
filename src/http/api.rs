@@ -2,8 +2,9 @@
 
 use axum::Form;
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
+use tracing::warn;
 
 use crate::nm::JoinRequest;
 use crate::passphrase;
@@ -175,7 +176,132 @@ pub fn validate(form: &ConnectForm) -> Result<JoinRequest, FormError> {
     })
 }
 
-pub async fn connect(State(shared): State<Shared>, Form(form): Form<ConnectForm>) -> Response {
+/// The `scheme://host[:port]` prefix of an absolute URL, or `None` if it
+/// has no scheme or no host.
+///
+/// That prefix is exactly how a browser serialises an origin (RFC 6454):
+/// the portal URL is built as `http://gateway[:port]/`, so its origin is the
+/// URL minus the trailing path, and a `Referer` reduces to its origin the
+/// same way. No URL crate: the result is only ever compared, never trusted.
+fn origin_of(url: &str) -> Option<&str> {
+    let after_scheme = url.find("://")? + 3;
+    let end = url[after_scheme..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| after_scheme + i);
+    (end > after_scheme).then(|| &url[..end])
+}
+
+/// Why a state-changing request looks forged from another site, if it does.
+///
+/// `POST /connect` makes the device leave its access point and join whatever
+/// network the form names. A phone associated to the setup AP but browsing
+/// over cellular can be made, by any web page it visits, to submit a form to
+/// `http://<gateway>/connect` — the subnet is on-link, so the POST reaches
+/// us. Without this check that page could send the device to a network of
+/// the attacker's choosing, or keep knocking it off its AP with failed joins.
+///
+/// A request is accepted from one of two origins:
+///
+/// - **the portal's own** (`Shared::portal_url`), which is where every
+///   redirect probe lands; and
+/// - **the one the request was addressed to** (`http://` + `Host`). Apple's
+///   Captive Network Assistant is answered with the portal page *in place*
+///   at `http://captive.apple.com/hotspot-detect.html` (see [`probe_html`]),
+///   and the form's relative `action="/connect"` then posts back to that
+///   same foreign host. Accepting only the portal origin would break setup
+///   on every iPhone. A page served from the very origin it posts to is
+///   same-origin by definition; that is not CSRF.
+///
+/// Evidence, in order of strength:
+///
+/// 1. `Sec-Fetch-Site: cross-site` or `same-site` — the browser itself says
+///    the form lives elsewhere. (`same-site` covers another port on the
+///    gateway; nothing legitimate posts from there.)
+/// 2. `Origin`, which every current browser sends on a POST. `Origin: null`
+///    (sandboxed iframes, `data:` and `file:` pages) is rejected: our own
+///    page never produces it, and it is the classic way to launder a
+///    cross-site POST past a naive "is the header present?" check.
+/// 3. `Referer`, consulted only when `Origin` is absent (old browsers).
+///
+/// With none of the three present the request is let through. A client that
+/// omits all of them is either a very old browser or not a browser at all —
+/// and anything that can speak HTTP to the AP directly can submit the form
+/// without our help, so refusing it buys nothing. Refusing it would, though,
+/// lock an old captive mini-browser out of setup with no way to recover.
+///
+/// Why headers rather than a hidden form token: a token stops exactly what
+/// this stops. A page on another origin cannot read ours, so it can neither
+/// learn a token nor forge the browser-set headers. The one attack that
+/// defeats the header check, DNS-rebinding an attacker's name onto the
+/// gateway, makes the attacker same-origin and so lets them read a token out
+/// of the page as well. A token would add state and a template field for no
+/// additional protection.
+fn cross_site_reason(headers: &HeaderMap, portal_url: &str) -> Option<&'static str> {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        let site = site.as_bytes();
+        if site.eq_ignore_ascii_case(b"cross-site") || site.eq_ignore_ascii_case(b"same-site") {
+            return Some("Sec-Fetch-Site says the form came from another site");
+        }
+    }
+
+    let portal = origin_of(portal_url);
+    // HTTP/1.1 makes Host mandatory, and HTTP/1 is the only listener we run.
+    let addressed = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(|h| format!("http://{h}"));
+    let allowed = |origin: &str| {
+        portal.is_some_and(|p| p.eq_ignore_ascii_case(origin))
+            || addressed
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(origin))
+    };
+
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        return match origin.to_str() {
+            Ok(o) if allowed(o) => None,
+            _ => Some("Origin is neither the portal's nor the request's own"),
+        };
+    }
+
+    if let Some(referer) = headers.get(header::REFERER) {
+        return match referer.to_str().ok().and_then(origin_of) {
+            Some(o) if allowed(o) => None,
+            _ => Some("Referer is neither the portal's nor the request's own"),
+        };
+    }
+
+    None
+}
+
+pub async fn connect(
+    State(shared): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<ConnectForm>,
+) -> Response {
+    // Before validation, so a forged request learns nothing about what the
+    // form would have accepted, and long before the radio is touched.
+    if let Some(reason) = cross_site_reason(&headers, &shared.portal_url) {
+        warn!(
+            reason,
+            origin = ?headers.get(header::ORIGIN),
+            referer = ?headers.get(header::REFERER),
+            "rejected a cross-site POST /connect"
+        );
+        return no_store(
+            (
+                StatusCode::FORBIDDEN,
+                Html(assets::render_index_with_error(
+                    &shared.branding,
+                    &shared.networks(),
+                    "That request did not come from this setup page, so it was ignored. \
+                     Choose a network below to continue.",
+                )),
+            )
+                .into_response(),
+        );
+    }
+
     let request = match validate(&form) {
         Ok(r) => r,
         Err(e) => {
@@ -302,6 +428,160 @@ mod tests {
         let mut f = form("486f6d65", "", "abcdefgh");
         f.identity = "   ".into();
         assert!(validate(&f).unwrap().identity.is_none());
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    const PORTAL: &str = "http://192.168.42.1/";
+
+    #[test]
+    fn the_origin_of_a_url_is_its_scheme_and_authority() {
+        assert_eq!(origin_of(PORTAL), Some("http://192.168.42.1"));
+        assert_eq!(
+            origin_of("http://10.0.0.1:8080/"),
+            Some("http://10.0.0.1:8080")
+        );
+        assert_eq!(
+            origin_of("http://192.168.42.1/connect?x=1#y"),
+            Some("http://192.168.42.1")
+        );
+        assert_eq!(
+            origin_of("http://192.168.42.1?x"),
+            Some("http://192.168.42.1")
+        );
+        assert_eq!(origin_of("http:///nohost"), None);
+        assert_eq!(origin_of("/relative"), None);
+    }
+
+    #[test]
+    fn a_post_from_the_portal_page_is_not_cross_site() {
+        let h = headers(&[
+            ("host", "192.168.42.1"),
+            ("origin", "http://192.168.42.1"),
+            ("sec-fetch-site", "same-origin"),
+        ]);
+        assert_eq!(cross_site_reason(&h, PORTAL), None);
+    }
+
+    /// The portal URL carries the port when it is not 80, and so does the
+    /// browser's Origin; the two must still match, and a different port is
+    /// a different origin.
+    #[test]
+    fn a_non_default_port_is_part_of_the_portal_origin() {
+        let portal = "http://10.0.0.1:8080/";
+        let ok = headers(&[
+            ("host", "10.0.0.1:8080"),
+            ("origin", "http://10.0.0.1:8080"),
+        ]);
+        assert_eq!(cross_site_reason(&ok, portal), None);
+
+        let other_port = headers(&[("host", "10.0.0.1:8080"), ("origin", "http://10.0.0.1")]);
+        assert!(cross_site_reason(&other_port, portal).is_some());
+    }
+
+    /// iOS: the CNA loads `captive.apple.com/hotspot-detect.html`, we answer
+    /// with the portal page in place, and its relative form action posts
+    /// back to `captive.apple.com`. Rejecting this would break every iPhone.
+    #[test]
+    fn a_post_from_the_portal_served_in_place_under_a_probe_host_is_accepted() {
+        let h = headers(&[
+            ("host", "captive.apple.com"),
+            ("origin", "http://captive.apple.com"),
+            ("sec-fetch-site", "same-origin"),
+        ]);
+        assert_eq!(cross_site_reason(&h, PORTAL), None);
+    }
+
+    #[test]
+    fn a_post_from_another_origin_is_cross_site() {
+        for origin in [
+            "http://evil.example",
+            "https://192.168.42.1",
+            "http://192.168.42.1:8080",
+            "http://192.168.42.10",
+            "http://192.168.42.1.evil.example",
+        ] {
+            let h = headers(&[("host", "192.168.42.1"), ("origin", origin)]);
+            assert!(cross_site_reason(&h, PORTAL).is_some(), "{origin} accepted");
+        }
+    }
+
+    /// The portal is plain HTTP, so an https page that merely shares the
+    /// Host's name cannot be one we served.
+    #[test]
+    fn an_https_origin_matching_the_host_name_is_still_rejected() {
+        let h = headers(&[
+            ("host", "captive.apple.com"),
+            ("origin", "https://captive.apple.com"),
+        ]);
+        assert!(cross_site_reason(&h, PORTAL).is_some());
+    }
+
+    #[test]
+    fn a_null_origin_is_rejected() {
+        let h = headers(&[("host", "192.168.42.1"), ("origin", "null")]);
+        assert!(cross_site_reason(&h, PORTAL).is_some());
+    }
+
+    /// Origin outranks Referer: a matching Referer cannot rescue a foreign
+    /// Origin.
+    #[test]
+    fn a_matching_referer_does_not_rescue_a_foreign_origin() {
+        let h = headers(&[
+            ("host", "192.168.42.1"),
+            ("origin", "http://evil.example"),
+            ("referer", "http://192.168.42.1/"),
+        ]);
+        assert!(cross_site_reason(&h, PORTAL).is_some());
+    }
+
+    #[test]
+    fn referer_decides_when_origin_is_absent() {
+        let ok = headers(&[
+            ("host", "192.168.42.1"),
+            ("referer", "http://192.168.42.1/?error=1"),
+        ]);
+        assert_eq!(cross_site_reason(&ok, PORTAL), None);
+
+        // A Referer whose *path* mentions the portal is not the portal.
+        let bad = headers(&[
+            ("host", "192.168.42.1"),
+            ("referer", "http://evil.example/http://192.168.42.1/"),
+        ]);
+        assert!(cross_site_reason(&bad, PORTAL).is_some());
+
+        let garbage = headers(&[("host", "192.168.42.1"), ("referer", "not a url")]);
+        assert!(cross_site_reason(&garbage, PORTAL).is_some());
+    }
+
+    #[test]
+    fn sec_fetch_site_alone_can_reject() {
+        for site in ["cross-site", "same-site", "Cross-Site"] {
+            let h = headers(&[
+                ("host", "192.168.42.1"),
+                ("origin", "http://192.168.42.1"),
+                ("sec-fetch-site", site),
+            ]);
+            assert!(cross_site_reason(&h, PORTAL).is_some(), "{site} accepted");
+        }
+    }
+
+    /// No Origin, no Referer, no Sec-Fetch-Site: not something a browser
+    /// can be tricked into sending cross-site, so nothing to defend.
+    #[test]
+    fn a_request_without_any_provenance_headers_is_accepted() {
+        let h = headers(&[("host", "192.168.42.1")]);
+        assert_eq!(cross_site_reason(&h, PORTAL), None);
+        assert_eq!(cross_site_reason(&HeaderMap::new(), PORTAL), None);
     }
 
     #[test]
