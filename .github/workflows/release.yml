@@ -216,17 +216,48 @@ jobs:
           name: snap-${{ matrix.platform }}
           path: ${{ steps.snapcraft.outputs.snap }}
 
-      # Publishing is gated on the secret existing, so a fork — and the
-      # first few releases, before the store listing exists — still produce
-      # a downloadable .snap rather than failing the run.
+      # Publishing is gated on the secret existing, so a fork still
+      # produces a downloadable .snap rather than failing the run.
+      #
+      # The gate is its own step. It used to be `if: env.SNAPCRAFT_...`
+      # on the publish step, reading the `env:` of that same step — but a
+      # step's `if` is evaluated before its own `env` is applied, so the
+      # condition was always false and the publish was skipped on every
+      # release whether the secret existed or not. Nothing ever reached
+      # the store. A job-level env would also fix it, at the cost of
+      # handing the store credentials to every action in the job.
+      - name: are store credentials configured
+        id: store
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [ -n "${SNAPCRAFT_STORE_CREDENTIALS}" ]; then
+            echo "configured=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "configured=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: publish to the snap store
-        if: ${{ env.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        if: ${{ steps.store.outputs.configured == 'true' }}
         uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40 # v1.2.0
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
         with:
           snap: ${{ steps.snapcraft.outputs.snap }}
-          release: edge
+          # A tag is a release, and the GitHub Release it produces is not
+          # marked pre-release, so the snap goes where `snap install`
+          # looks by default.
+          release: stable
+
+      # Skipping is right for a fork and wrong here. Say so on the run
+      # summary rather than skipping silently, which is how the missing
+      # store listing went unnoticed.
+      - name: say so when the store publish was skipped
+        if: ${{ steps.store.outputs.configured != 'true' && github.repository == 'Screenly-Labs/wifi-connect' }}
+        run: |
+          echo "::warning::SNAPCRAFT_STORE_CREDENTIALS is not set, so the" \
+               "${{ matrix.platform }} snap was NOT published to the Snap" \
+               "Store. See docs/snap.md, 'Publishing'."
 
   release:
     needs: [image, snap]

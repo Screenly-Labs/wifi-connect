@@ -21,6 +21,7 @@ grade: stable
 confinement: strict
 license: Apache-2.0
 source-code: https://github.com/Screenly-Labs/wifi-connect
+website: https://github.com/Screenly-Labs/wifi-connect
 issues: https://github.com/Screenly-Labs/wifi-connect/issues
 
 # core24 replaces core22's `architectures:` key with `platforms:`.
@@ -90,9 +91,18 @@ parts:
       }
       craftctl set version="${VERSION}"
 
+  # Maps `snap set` keys onto the binary's environment variables; see
+  # snap/local/launch. The configure hook in snap/hooks is picked up by
+  # snapcraft without a part.
+  launch:
+    plugin: dump
+    source: snap/local
+    organize:
+      launch: bin/launch
+
 apps:
   wifi-connect:
-    command: bin/wifi-connect
+    command: bin/launch
     daemon: simple
 
     # Installing the snap must NOT immediately start broadcasting a setup

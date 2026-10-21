@@ -248,6 +248,7 @@ async fn portal_loop<N: NetworkControl>(
         // byte-identical every time, which is what lets a phone that joined
         // once reassociate automatically after a failed attempt.
         teardown.ap = Some(nm.raise_ap(device, &config.ap).await?);
+        shared.mark_ap_raised();
         info!(ssid = %config.ap.ssid, "access point is up; portal is live");
 
         let request = tokio::select! {
@@ -608,6 +609,25 @@ mod tests {
             "scanned after raising the AP: {:?}",
             nm.calls()
         );
+    }
+
+    /// DNS and HTTP wait on this before binding the gateway address.
+    #[tokio::test(start_paused = true)]
+    async fn raising_the_access_point_releases_the_servers() {
+        let nm = FakeNm::new();
+        let (shared, rx) = shared();
+        let cancel = CancellationToken::new();
+        let device = nm.find_device(None).await.unwrap();
+
+        let handle = {
+            let (nm, shared, cancel, cfg) = (nm.clone(), shared.clone(), cancel.clone(), config());
+            tokio::spawn(async move { run_portal(&nm, &device, &cfg, &shared, rx, cancel).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), shared.ap_raised())
+            .await
+            .expect("the servers were never told the access point is up");
+        cancel.cancel();
+        handle.await.unwrap().unwrap();
     }
 
     /// The CRA requirement, asserted end-to-end: no run raises an
