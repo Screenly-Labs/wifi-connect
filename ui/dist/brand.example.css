@@ -3,12 +3,28 @@
  * Loaded last, so it overrides the role tokens. Override ROLES only --
  * never the --c-* primitives and never the markup -- and a rebrand cannot
  * come adrift when the portal's layout changes.
+ *
+ * The block below is the whole job: the portal's own dark arms carry no
+ * more weight than the light defaults, so one :root block brands BOTH
+ * schemes.
  */
 :root {
   --color-accent: #ea4aaa;
   --color-accent-hover: #d43d98;
   --color-on-accent: #ffffff;
   --color-focus-ring: rgb(234 74 170 / 0.45);
+}
+
+/* Only needed to use a DIFFERENT value in dark rather than the same one in
+ * both. It takes two arms for the same reason the portal has two: the media
+ * query carries a webview with no JS or no storage, and the attribute
+ * carries the in-page theme toggle. Either alone leaves a gap.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --color-accent: #f472b6;
+    --color-on-accent: #2a0a1c;
+  }
 }
 
 :root[data-theme='dark'] {

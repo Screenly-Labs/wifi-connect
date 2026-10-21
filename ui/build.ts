@@ -45,16 +45,94 @@ async function darkThemeCss(): Promise<string> {
   if (!match) throw new Error('theme-dark.css is missing its @dark-roles markers')
 
   const roles = match[1].trim()
+  // :where() around the qualifying part, so each arm weighs exactly as much
+  // as the `:root` that sets the light defaults and wins on order alone.
+  //
+  // Written the obvious way — `:root:not([data-theme="light"])` — an arm
+  // weighs 0,2,0 and beats a brand stylesheet's `:root` block no matter
+  // what order they load in, so an integrator who sets --color-accent gets
+  // their colour in light mode and ours in dark. The seam has to hold in
+  // both, and an integrator cannot be asked to restate our internal
+  // selectors to get there.
   return [
     '@media (prefers-color-scheme: dark) {',
-    '  :root:not([data-theme="light"]) {',
+    '  :root:where(:not([data-theme="light"])) {',
     roles,
     '  }',
     '}',
-    ':root[data-theme="dark"] {',
+    ':root:where([data-theme="dark"]) {',
     roles,
     '}',
   ].join('\n')
+}
+
+/**
+ * Unwrap every `@layer` block, keeping the rules and their order.
+ *
+ * Cascade layers do NOT lose to document order — a normal declaration
+ * outside a layer beats one inside, at any specificity. So the unlayered
+ * skeleton below was overriding the design system on every browser, not
+ * just the ancient ones it exists for: `button{background:#2563eb}` beat
+ * `@layer components{.btn{background:var(--color-accent)}}`, which is why
+ * the default palette (--c-accent-600 is that same blue) hid it, and why
+ * a --brand-css that re-pointed --color-accent changed nothing on the one
+ * control that matters.
+ *
+ * Flattening puts the whole bundle on the same footing as the skeleton,
+ * where specificity and order decide: `.btn` beats `button`, the Tailwind
+ * reset follows the skeleton rather than yielding to it, and brand.css —
+ * last in the document — wins. The layers earn nothing here anyway; this
+ * portal has no utility/component conflicts to arbitrate, and the emitted
+ * order already matches the layer order.
+ *
+ * The scan is quote-aware because a declaration may legitimately carry a
+ * brace inside a string.
+ */
+function flattenCssLayers(css: string): string {
+  let out = ''
+  let i = 0
+
+  while (i < css.length) {
+    const at = css.indexOf('@layer', i)
+    if (at === -1) {
+      out += css.slice(i)
+      break
+    }
+    out += css.slice(i, at)
+
+    // The name list runs to either `;` (an ordering statement, which has
+    // no rules to keep) or `{` (a block to unwrap).
+    let head = at + '@layer'.length
+    while (head < css.length && css[head] !== '{' && css[head] !== ';') head += 1
+    if (css[head] === ';') {
+      i = head + 1
+      continue
+    }
+
+    let depth = 1
+    let end = head + 1
+    let quote = ''
+    while (end < css.length && depth > 0) {
+      const ch = css[end]
+      if (quote) {
+        if (ch === '\\') end += 1
+        else if (ch === quote) quote = ''
+      } else if (ch === '"' || ch === "'") {
+        quote = ch
+      } else if (ch === '{') {
+        depth += 1
+      } else if (ch === '}') {
+        depth -= 1
+      }
+      end += 1
+    }
+    if (depth !== 0) throw new Error('unbalanced @layer block in the Tailwind output')
+
+    out += flattenCssLayers(css.slice(head + 1, end - 1))
+    i = end
+  }
+
+  return out
 }
 
 /**
@@ -97,16 +175,25 @@ async function build(): Promise<void> {
     built.outputs[0].text(),
   ])
 
-  // Order matters: the unlayered skeleton comes FIRST so that a browser
-  // which understands @layer lets the Tailwind layer override it, while one
-  // that does not — and therefore drops the Tailwind block wholesale —
-  // still has a plain, usable stylesheet.
+  // Order matters: the skeleton comes FIRST so that a browser which drops
+  // what it cannot parse still has a plain, usable stylesheet, and every
+  // rule after it overrides it on a browser that can.
+  //
+  // That second half only holds because the Tailwind bundle is flattened
+  // out of its @layer blocks on the way in — unlayered beats layered
+  // whatever the order, so while the layers were intact the forty-line
+  // fallback was quietly the last word on buttons, fields and rows. See
+  // flattenCssLayers.
   //
   // The skeleton and the generated dark block are hand-written and so still
   // carry their comments; Tailwind's output is already minified. Strip them
   // on the way out: the page ships to a device over a setup hotspot, and
   // the rationale belongs in the source, not in every byte served.
-  const style = [stripCssComments(skeleton), tailwind, stripCssComments(dark)].join('\n')
+  const style = [
+    stripCssComments(skeleton),
+    flattenCssLayers(tailwind),
+    stripCssComments(dark),
+  ].join('\n')
 
   for (const page of ['index', 'connecting']) {
     const html = await readFile(join(src, `${page}.html`), 'utf8')
@@ -131,12 +218,28 @@ async function build(): Promise<void> {
  * Loaded last, so it overrides the role tokens. Override ROLES only --
  * never the --c-* primitives and never the markup -- and a rebrand cannot
  * come adrift when the portal's layout changes.
+ *
+ * The block below is the whole job: the portal's own dark arms carry no
+ * more weight than the light defaults, so one :root block brands BOTH
+ * schemes.
  */
 :root {
   --color-accent: #ea4aaa;
   --color-accent-hover: #d43d98;
   --color-on-accent: #ffffff;
   --color-focus-ring: rgb(234 74 170 / 0.45);
+}
+
+/* Only needed to use a DIFFERENT value in dark rather than the same one in
+ * both. It takes two arms for the same reason the portal has two: the media
+ * query carries a webview with no JS or no storage, and the attribute
+ * carries the in-page theme toggle. Either alone leaves a gap.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --color-accent: #f472b6;
+    --color-on-accent: #2a0a1c;
+  }
 }
 
 :root[data-theme='dark'] {
