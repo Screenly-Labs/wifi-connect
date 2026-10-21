@@ -14,7 +14,9 @@ pub mod api;
 pub mod assets;
 pub mod captive;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -100,6 +102,12 @@ struct Limits {
     /// backlog holds new connections until a slot frees, rather than us
     /// spending a descriptor on each.
     max_connections: usize,
+    /// Connections served at once for any one client address. We are the
+    /// DHCP server on this network and nothing NATs in front of us, so an
+    /// address is a device. Without this, one device that opens
+    /// `max_connections` slow requests and renews each as it expires keeps
+    /// every other phone in the kernel backlog for as long as it likes.
+    max_connections_per_client: usize,
     /// How long a connection gets to finish once asked to close, either at
     /// `max_connection_age` or on shutdown. Bounds how long a stalled client
     /// can delay the access point coming down.
@@ -111,10 +119,13 @@ impl Limits {
     /// (page, assets, status polling, OS probes); 64 is plenty for that and
     /// for a second device, and leaves the descriptor limit far away. Ten
     /// seconds for a request head is generous on a link a few metres long.
+    /// A browser opens at most six connections to one host; sixteen per
+    /// device leaves room for the OS's own probes beside it.
     const PORTAL: Self = Self {
         header_read_timeout: Duration::from_secs(10),
         max_connection_age: Duration::from_secs(60),
         max_connections: 64,
+        max_connections_per_client: 16,
         drain_grace: Duration::from_secs(5),
     };
 }
@@ -123,6 +134,52 @@ impl Limits {
 /// axum's default limit is 2 MB, which only helps someone trying to make a
 /// small board buffer things.
 const MAX_REQUEST_BODY: usize = 16 * 1024;
+
+/// hyper's per-connection read buffer, and so the largest request head it
+/// will hold before answering 431. Its default is about 400 KiB, which at
+/// `max_connections` is 26 MB of a small board's memory for heads alone.
+/// A phone's request head is well under 2 KiB.
+const MAX_CONNECTION_BUFFER: usize = 32 * 1024;
+
+/// Open connections per client address. A slot is taken after `accept`,
+/// once the address is known, and given back when the connection's task
+/// ends, however it ends.
+#[derive(Debug, Default)]
+struct PerClient(Mutex<HashMap<IpAddr, usize>>);
+
+/// One client's claim on a connection; dropping it gives the slot back.
+struct ClientSlot {
+    clients: Arc<PerClient>,
+    ip: IpAddr,
+}
+
+impl PerClient {
+    fn take(self: &Arc<Self>, ip: IpAddr, limit: usize) -> Option<ClientSlot> {
+        let mut open = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let n = open.entry(ip).or_insert(0);
+        if *n >= limit {
+            return None;
+        }
+        *n += 1;
+        Some(ClientSlot {
+            clients: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        let mut open = self.clients.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = open.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                // Phones come and go; do not keep an entry per address ever seen.
+                open.remove(&self.ip);
+            }
+        }
+    }
+}
 
 /// Accept and serve connections on `listener` until `cancel` fires, then
 /// stop accepting and give open connections `drain_grace` to finish.
@@ -135,10 +192,12 @@ async fn serve_on(listener: TcpListener, app: Router, limits: Limits, cancel: Ca
     // cap and, on shutdown, the way to wait for every connection: take all
     // the permits back.
     let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let clients = Arc::new(PerClient::default());
 
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new())
-        .header_read_timeout(limits.header_read_timeout);
+        .header_read_timeout(limits.header_read_timeout)
+        .max_buf_size(MAX_CONNECTION_BUFFER);
 
     loop {
         // Take the slot before accepting, so at the cap the connection
@@ -147,10 +206,10 @@ async fn serve_on(listener: TcpListener, app: Router, limits: Limits, cancel: Ca
             _ = cancel.cancelled() => break,
             p = slots.clone().acquire_owned() => p.expect("the semaphore is never closed"),
         };
-        let stream = tokio::select! {
+        let (stream, peer) = tokio::select! {
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
+                Ok(accepted) => accepted,
                 Err(e) => {
                     // EMFILE and friends: the next accept fails the same
                     // way at once, so back off rather than spin the one
@@ -161,12 +220,20 @@ async fn serve_on(listener: TcpListener, app: Router, limits: Limits, cancel: Ca
                 }
             },
         };
+        let Some(client_slot) = clients.take(peer.ip(), limits.max_connections_per_client) else {
+            // Closing at once, rather than leaving it in the backlog, is
+            // what keeps this device's surplus from queueing ahead of
+            // everyone else's. The global permit goes back with it.
+            debug!(client = %peer.ip(), "portal connection refused: client at its limit");
+            continue;
+        };
 
         let conn =
             http.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone()));
         let cancel = cancel.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let _client_slot = client_slot;
             let mut conn = std::pin::pin!(conn);
             let finished = tokio::select! {
                 r = conn.as_mut() => Some(r),
@@ -596,6 +663,67 @@ mod tests {
         let response = read_until_closed(&mut waiting).await;
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    /// One device must not be able to take every slot. Its surplus is
+    /// closed at once, and the slot it held is given back when it hangs up.
+    #[tokio::test]
+    async fn one_client_cannot_take_more_than_its_share_of_slots() {
+        let server = start(Limits {
+            header_read_timeout: NEVER,
+            max_connection_age: NEVER,
+            max_connections_per_client: 1,
+            ..Limits::PORTAL
+        })
+        .await;
+
+        let hog = TcpStream::connect(server.addr).await.unwrap();
+
+        // Refused, not queued: closed well before any limit could fire.
+        let mut surplus = TcpStream::connect(server.addr).await.unwrap();
+        read_until_closed(&mut surplus).await;
+
+        // Once the hog hangs up its slot comes back. The server notices the
+        // hang-up asynchronously, so give it a moment.
+        drop(hog);
+        let started = Instant::now();
+        loop {
+            let mut client = TcpStream::connect(server.addr).await.unwrap();
+            let _ = client.write_all(STATUS_REQUEST).await;
+            let response = read_until_closed(&mut client).await;
+            if response.starts_with(b"HTTP/1.1 200") {
+                break;
+            }
+            assert!(
+                started.elapsed() < PATIENCE,
+                "the client's slot was never given back"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// hyper would otherwise buffer about 400 KiB of request head per
+    /// connection before giving up on it.
+    #[tokio::test]
+    async fn an_oversized_request_head_is_refused() {
+        let server = start(Limits::PORTAL).await;
+
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        let head = format!(
+            "GET / HTTP/1.1\r\nHost: 192.168.42.1\r\nConnection: close\r\nX-Big: {}\r\n\r\n",
+            // hyper checks the limit between reads, and one read can carry
+            // it past by up to the buffer's size; exceed it by more.
+            "a".repeat(4 * MAX_CONNECTION_BUFFER)
+        );
+        // The server may hang up before it has read all of this.
+        let _ = client.write_all(head.as_bytes()).await;
+        let response = read_until_closed(&mut client).await;
+
+        assert!(
+            response.starts_with(b"HTTP/1.1 431"),
             "{}",
             String::from_utf8_lossy(&response)
         );
