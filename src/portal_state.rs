@@ -21,13 +21,19 @@
 //! — those runs are why the QR files, which are written before that check,
 //! could never answer the question on their own.
 //!
-//! A `SIGKILL` leaves the file behind, so a consumer that must not show
-//! stale credentials should corroborate with something the kernel owns:
-//! the gateway address is on the wireless interface for exactly as long
-//! as the access point is up.
+//! A `SIGKILL` leaves the file behind, and on a device whose access
+//! point NetworkManager is still holding there is nothing else to
+//! notice that from — measured on a Pi 5: kill the container and the
+//! radio keeps broadcasting, so "is the gateway address up" still says
+//! yes while nothing is serving the page. So the file carries a
+//! heartbeat: `heartbeat_unix` is refreshed every
+//! `heartbeat_interval_s` for as long as the portal is running, and a
+//! file that has stopped beating is a portal that has stopped running,
+//! whatever `portal_active` says.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -42,6 +48,14 @@ use crate::ssid::Ssid;
 /// field, or a field whose meaning changes. Adding a field does not bump
 /// it, so parse leniently and ignore what you do not know.
 pub const SCHEMA: u32 = 1;
+
+/// How often the heartbeat is refreshed.
+///
+/// Short enough that a consumer polling every few seconds notices a
+/// dead portal within one screen refresh, long enough that an hour-long
+/// session is a few hundred small writes rather than a reason to worry
+/// about an SD card.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How the access point is protected, as a stable string rather than a
 /// shape a consumer has to infer from which fields are null.
@@ -68,7 +82,7 @@ impl fmt::Display for Security {
 /// Field order here is the field order on disk, which is worth keeping
 /// stable: the file is read by people as well as programs, and the first
 /// thing anyone wants is what to type into a phone.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PortalState {
     pub schema: u32,
     /// Always `true` in a file that exists. It is written out rather than
@@ -90,10 +104,23 @@ pub struct PortalState {
     pub portal_url: String,
     pub gateway: String,
     pub port: u16,
-    /// Unix seconds. A consumer can use it to distrust a file left behind
-    /// by a killed process; it is not a heartbeat and is not updated
-    /// while the portal runs.
+    /// Unix seconds, fixed for the run.
     pub started_at_unix: u64,
+    /// Unix seconds, refreshed every [`HEARTBEAT_INTERVAL`] for as long
+    /// as the portal is up. This is the liveness signal that survives a
+    /// process killed too hard to remove its own file.
+    pub heartbeat_unix: u64,
+    /// How often the field above is refreshed, so a consumer can set its
+    /// staleness bound from the contract rather than from a constant it
+    /// copied out of this README and that we later changed.
+    pub heartbeat_interval_s: u64,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 impl PortalState {
@@ -123,10 +150,9 @@ impl PortalState {
             portal_url,
             gateway: gateway.to_string(),
             port,
-            started_at_unix: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default(),
+            started_at_unix: now_unix(),
+            heartbeat_unix: now_unix(),
+            heartbeat_interval_s: HEARTBEAT_INTERVAL.as_secs(),
         }
     }
 
@@ -167,6 +193,7 @@ impl PortalState {
                 info!(path = %path.display(), "wrote the portal state file");
                 Some(StateFile {
                     path: path.to_path_buf(),
+                    state: self,
                 })
             }
             Err(e) => {
@@ -186,6 +213,39 @@ impl PortalState {
 #[derive(Debug)]
 pub struct StateFile {
     path: PathBuf,
+    state: PortalState,
+}
+
+impl StateFile {
+    /// Rewrite the file with a fresh `heartbeat_unix`.
+    ///
+    /// A whole rewrite rather than touching the mtime: it goes through
+    /// the same atomic, 0640, symlink-safe path as the first write, and
+    /// it keeps the liveness signal visible to the other reader of this
+    /// file — a person with `cat`, wondering whether the portal they
+    /// cannot reach is actually running.
+    pub fn beat(&self) {
+        let mut state = self.state.clone();
+        state.heartbeat_unix = now_unix();
+
+        let Ok(mut json) = serde_json::to_vec_pretty(&state) else {
+            return;
+        };
+        json.push(b'\n');
+
+        if let Err(e) = private_file::write(&self.path, &json) {
+            // Debug, not warn: a consumer reading a stale heartbeat
+            // will decide the portal is gone, which is the same
+            // conclusion this failure points at, and a portal that
+            // cannot write for fifteen minutes would otherwise fill the
+            // journal with sixty identical lines.
+            tracing::debug!(
+                error = %e,
+                path = %self.path.display(),
+                "could not refresh the portal state heartbeat"
+            );
+        }
+    }
 }
 
 impl Drop for StateFile {
@@ -271,6 +331,8 @@ mod tests {
         assert_eq!(v["gateway"], "192.168.42.1");
         assert_eq!(v["port"], 8000);
         assert!(v["started_at_unix"].as_u64().unwrap() > 1_700_000_000);
+        assert_eq!(v["heartbeat_unix"], v["started_at_unix"]);
+        assert_eq!(v["heartbeat_interval_s"], HEARTBEAT_INTERVAL.as_secs());
 
         // The payload is the one a phone would scan, not a second
         // rendering of the credentials that could disagree with them.
@@ -394,6 +456,66 @@ mod tests {
             wpa_state().publish(&blocker).is_none(),
             "should have reported failure rather than claiming a live portal"
         );
+    }
+
+    /// The liveness signal that survives a process killed too hard to
+    /// clean up after itself. Measured on a Pi 5: SIGKILL the portal
+    /// and NetworkManager keeps the access point raised, so nothing
+    /// outside the file can tell that the page died.
+    #[test]
+    fn a_beat_moves_the_heartbeat_and_nothing_else() {
+        let dir = Scratch::new("beat");
+        let path = dir.join("state.json");
+
+        let guard = wpa_state().publish(&path).expect("should have written");
+        let before = read_json(&path);
+
+        // The stamp is whole seconds, so a beat in the same second is
+        // indistinguishable by value; set it back and watch it return.
+        let mut stale = guard.state.clone();
+        stale.heartbeat_unix = 1_700_000_000;
+        let mut json = serde_json::to_vec_pretty(&stale).unwrap();
+        json.push(b'\n');
+        private_file::write(&path, &json).unwrap();
+        assert_eq!(read_json(&path)["heartbeat_unix"], 1_700_000_000);
+
+        guard.beat();
+        let after = read_json(&path);
+
+        assert!(
+            after["heartbeat_unix"].as_u64().unwrap() > 1_700_000_000,
+            "the beat did not refresh the stamp"
+        );
+        // Everything a consumer reads must be untouched by a beat.
+        for field in [
+            "schema",
+            "portal_active",
+            "ssid",
+            "security",
+            "passphrase",
+            "qr_payload",
+            "portal_url",
+            "gateway",
+            "port",
+            "started_at_unix",
+        ] {
+            assert_eq!(after[field], before[field], "a beat changed {field}");
+        }
+    }
+
+    /// A beat goes through the same guarded write as the first one: it
+    /// runs every fifteen seconds for the life of a portal, so a
+    /// weaker path here would undo the protection on every run.
+    #[test]
+    fn a_beat_keeps_the_credential_permissions() {
+        let dir = Scratch::new("beat-perms");
+        let path = dir.join("state.json");
+
+        let guard = wpa_state().publish(&path).expect("should have written");
+        guard.beat();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640, "mode was {mode:o}");
     }
 
     /// Read by people as well as programs.

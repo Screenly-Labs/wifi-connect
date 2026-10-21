@@ -360,7 +360,9 @@ wifi-connect --state-file /data/hotspot/state.json
   "portal_url": "http://192.168.42.1:8000/",
   "gateway": "192.168.42.1",
   "port": 8000,
-  "started_at_unix": 1761048000
+  "started_at_unix": 1761048000,
+  "heartbeat_unix": 1761048345,
+  "heartbeat_interval_s": 15
 }
 ```
 
@@ -391,10 +393,17 @@ Notes for consumers:
   `WIFI:` escaping rules.
 - Parse leniently: new fields may appear without `schema` changing. It
   is bumped only when a field is removed or changes meaning.
-- A `SIGKILL` leaves the file behind. If showing a stale passphrase would
-  be worse than showing none, corroborate with something the kernel owns
-  — the gateway address is on the wireless interface for exactly as long
-  as the access point is up.
+- **Check the heartbeat, not just the file.** `heartbeat_unix` is
+  refreshed every `heartbeat_interval_s` while the portal runs. A file
+  whose heartbeat is older than a few intervals is a portal that died
+  too hard to remove it, and `portal_active` will still say `true`.
+  Take the interval from the file rather than hardcoding 15, and allow
+  a couple of missed beats before calling it dead.
+
+  This is the case worth handling: a `SIGKILL`\ ed portal leaves
+  NetworkManager holding the access point, so the radio still looks
+  healthy from outside and the gateway address is still up. Measured on
+  a Pi 5. Nothing but the heartbeat distinguishes it.
 - It holds a WPA passphrase in clear text. It is written `0640`,
   atomically, and never through a symlink at the target — put it
   somewhere the host application can read and the network cannot.
