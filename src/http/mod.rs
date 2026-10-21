@@ -46,14 +46,19 @@ pub fn router(shared: Shared) -> Router {
     app.fallback(api::probe_redirect).with_state(shared)
 }
 
-/// Serve the portal on `addr` until `cancel` fires.
+/// Serve the portal on `addr`, pinned to `interface`, until `cancel` fires.
+///
+/// The pin is what keeps the unauthenticated `POST /connect` off every other
+/// interface on the device; see [`crate::sockets`] for why the address alone
+/// does not.
 pub async fn serve(
+    interface: &str,
     addr: std::net::SocketAddr,
     shared: Shared,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
-    let listener = crate::sockets::bind_tcp_retrying(addr).await?;
-    debug!(%addr, "portal listening");
+    let listener = crate::sockets::bind_tcp_retrying(interface, addr).await?;
+    debug!(%interface, %addr, "portal listening");
 
     let result = axum::serve(listener, router(shared))
         .with_graceful_shutdown(async move { cancel.cancelled().await })

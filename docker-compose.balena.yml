@@ -51,7 +51,7 @@ services:
     # been unprivileged since Linux 5.7 for a not-yet-bound socket.
     #
     # Uncomment only if your kernel denies SO_BINDTODEVICE; the symptom is
-    # the DHCP server failing to start with EPERM.
+    # the DHCP, DNS or portal server failing to start with EPERM.
     # cap_add:
     #   - NET_ADMIN
     #   - NET_RAW
