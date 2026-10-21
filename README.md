@@ -120,6 +120,7 @@ Every flag has an environment variable. Flags win.
 | `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |
 | `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
 | `--brand-css` | | `WIFI_CONNECT_BRAND_CSS` | — |
+| `--brand-logo` | | `WIFI_CONNECT_BRAND_LOGO` | — |
 | `--force` | | `WIFI_CONNECT_FORCE` | `false` |
 | `--connection-timeout` | | `WIFI_CONNECT_CONNECTION_TIMEOUT` | `45` |
 | `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
@@ -180,6 +181,19 @@ That one block covers light and dark both: the portal's dark arms weigh no
 more than the `:root` that sets the light defaults, so a stylesheet loaded
 after them wins in either scheme. Use a `prefers-color-scheme` arm only to
 set a *different* value in dark.
+
+`--brand-logo` points at an image shown in the header in place of the
+product name, served at `/brand-logo`:
+
+```bash
+wifi-connect --brand-name Anthias --brand-logo /etc/wifi-connect/logo.svg
+```
+
+SVG, PNG, JPEG or WebP, up to 256 KB; anything else is refused at startup
+rather than served as a broken image. `--brand-name` is still required and
+becomes the image's alt text, so the heading reads correctly to a screen
+reader and to anyone whose image did not load. The logo *replaces* the
+wordmark rather than sitting above it.
 
 `--default-theme` decides which scheme the page opens in:
 

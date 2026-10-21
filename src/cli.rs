@@ -168,6 +168,14 @@ pub struct Cli {
     #[arg(long, env = "WIFI_CONNECT_BRAND_CSS")]
     pub brand_css: Option<PathBuf>,
 
+    /// Path to an image shown in place of the product name in the page
+    /// header, served at `/brand-logo`.
+    ///
+    /// SVG, PNG, JPEG or WebP. `--brand-name` is still required: it is the
+    /// image's alt text and the window title.
+    #[arg(long, env = "WIFI_CONNECT_BRAND_LOGO")]
+    pub brand_logo: Option<PathBuf>,
+
     /// Default theme when the viewer has expressed no preference.
     #[arg(long, env = "WIFI_CONNECT_DEFAULT_THEME", default_value = "system")]
     pub default_theme: ThemeMode,

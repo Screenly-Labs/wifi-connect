@@ -46,6 +46,28 @@ pub async fn brand_css(State(shared): State<Shared>) -> Response {
     )
 }
 
+/// Serve `--brand-logo`, or 404 when none is configured.
+///
+/// 404 rather than an empty 200: the page only references this when a logo
+/// is set, so a request for it otherwise is a stale cache or a prober, and
+/// an empty image body would render as a broken image in the first case.
+pub async fn brand_logo(State(shared): State<Shared>) -> Response {
+    let Some(logo) = shared.branding.logo.as_ref() else {
+        return no_store(StatusCode::NOT_FOUND.into_response());
+    };
+    no_store(
+        (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(logo.content_type),
+            )],
+            logo.bytes.to_vec(),
+        )
+            .into_response(),
+    )
+}
+
 /// Render the portal page with the current networks and any pending error.
 fn render_portal(shared: &Shared) -> String {
     assets::render_index(&shared.branding, &shared.networks(), &shared.state())
