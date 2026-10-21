@@ -325,6 +325,28 @@ pub fn parse_dhcp_range(spec: &str, gateway: Ipv4Addr) -> Result<DhcpRange, Conf
 }
 
 impl Cli {
+    /// Parse the command line and environment, including the upstream
+    /// variables clap cannot attach to a flag that already has one.
+    pub fn parse_with_legacy_env() -> Self {
+        let mut cli = Self::parse();
+        cli.apply_legacy_env(|name| std::env::var(name).ok());
+        cli
+    }
+
+    /// Fill in from upstream's environment variables what neither a flag
+    /// nor our own variable set.
+    ///
+    /// Upstream reads the interface from `PORTAL_INTERFACE`; ours is
+    /// `WIFI_CONNECT_INTERFACE`, and clap takes one variable per argument.
+    /// Without this, a balena compose file carried over unchanged would
+    /// silently auto-detect the interface instead of using the one it
+    /// names, which on a device with two radios is the wrong one.
+    fn apply_legacy_env(&mut self, var: impl Fn(&str) -> Option<String>) {
+        if self.interface.is_none() {
+            self.interface = var("PORTAL_INTERFACE").filter(|v| !v.is_empty());
+        }
+    }
+
     /// The access point's security mode, as the settings builder wants it.
     ///
     /// `auto` and `wpa2` both map to WPA2-PSK; only an explicit `wpa3`
@@ -458,6 +480,24 @@ mod tests {
             cli(&["--portal-interface", "wlan2"]).interface.as_deref(),
             Some("wlan2")
         );
+    }
+
+    /// Upstream's `PORTAL_INTERFACE`, under our own variable and the flag.
+    #[test]
+    fn the_legacy_interface_variable_is_honoured_last() {
+        let legacy = |name: &str| (name == "PORTAL_INTERFACE").then(|| "wlan3".to_string());
+
+        let mut c = cli(&[]);
+        c.apply_legacy_env(legacy);
+        assert_eq!(c.interface.as_deref(), Some("wlan3"));
+
+        let mut c = cli(&["-i", "wlan1"]);
+        c.apply_legacy_env(legacy);
+        assert_eq!(c.interface.as_deref(), Some("wlan1"), "the flag wins");
+
+        let mut c = cli(&[]);
+        c.apply_legacy_env(|_| Some(String::new()));
+        assert_eq!(c.interface, None, "empty means unset, as for clap");
     }
 
     #[test]

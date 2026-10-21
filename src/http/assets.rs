@@ -395,7 +395,7 @@ fn security_label(security: Security) -> &'static str {
     match security {
         Security::Open => "Open",
         Security::Owe => "Open (encrypted)",
-        Security::Wep => "WEP (insecure)",
+        Security::Wep => "WEP (not supported)",
         Security::WpaPsk => "WPA2",
         Security::Sae => "WPA3",
         Security::SaeTransitional => "WPA2/WPA3",
@@ -410,6 +410,9 @@ fn render_networks(networks: &[WifiNetwork]) -> String {
         );
     }
 
+    // A network we refuse is listed disabled, so it can be found but not
+    // chosen, and is never the pre-selected one.
+    let first = networks.iter().position(|n| n.security.is_supported());
     let mut out = String::new();
     for (i, n) in networks.iter().enumerate() {
         let lit = bars_for(n.strength);
@@ -424,9 +427,14 @@ fn render_networks(networks: &[WifiNetwork]) -> String {
 
         let name = escape(&n.ssid);
         let label = security_label(n.security);
-        // The first network is pre-selected so that the form is submittable
+        // The first joinable network is pre-selected so that the form is submittable
         // without JavaScript and the common case is one tap.
-        let checked = if i == 0 { " checked" } else { "" };
+        let checked = if Some(i) == first { " checked" } else { "" };
+        let disabled = if n.security.is_supported() {
+            ""
+        } else {
+            " disabled"
+        };
 
         // The booleans, not just the slug: what a given security type needs
         // is decided once, in nm::security, and the script reads the answer
@@ -438,7 +446,7 @@ fn render_networks(networks: &[WifiNetwork]) -> String {
         out.push_str(&format!(
             "<label class=\"net\">\
                <input type=\"radio\" name=\"ssid_hex\" value=\"{hex}\" \
-                data-needs-passphrase=\"{needs_pw}\" data-needs-identity=\"{needs_id}\" required{checked}>\
+                data-needs-passphrase=\"{needs_pw}\" data-needs-identity=\"{needs_id}\" required{checked}{disabled}>\
                <span class=\"net__name\">{name}</span>\
                <span class=\"net__meta\">\
                  <span>{label}</span>\
@@ -1037,6 +1045,23 @@ mod tests {
         let html = render_index(&plain("<b>Brand</b>"), &[], &PortalState::Portal);
         assert!(!html.contains("<b>Brand</b>"));
         assert!(html.contains("&lt;b&gt;Brand&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn a_wep_network_is_listed_but_cannot_be_chosen() {
+        let html = render_index(
+            &plain("B"),
+            &[
+                net("Old", 90, Security::Wep),
+                net("New", 70, Security::WpaPsk),
+            ],
+            &PortalState::Portal,
+        );
+        assert!(html.contains("WEP (not supported)"));
+        assert_eq!(html.matches(" disabled>").count(), 1);
+        let new = html.find(r#"value="4e6577""#).expect("New missing");
+        let checked = html.find(" checked").expect("nothing pre-selected");
+        assert!(checked > new, "the WEP row must not be pre-selected");
     }
 
     #[test]

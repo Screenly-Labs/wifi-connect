@@ -41,6 +41,8 @@ pub fn router(shared: Shared) -> Router {
         .route("/connect", post(api::connect))
         .route("/connecting", get(api::connecting))
         .route("/api/networks", get(api::networks))
+        // Upstream's API, for clients written against balena's.
+        .route("/networks", get(api::upstream_networks))
         .route("/api/status", get(api::status))
         .route("/api/captive-portal", get(api::captive_portal_api))
         .route("/brand.css", get(api::brand_css))
@@ -822,6 +824,141 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array());
+    }
+
+    /// A portal with one scanned network, "Home" (WPA-PSK), and the join
+    /// channel kept open so a submission can be seen arriving.
+    fn app_with_home() -> (Router, tokio::sync::mpsc::Receiver<crate::nm::JoinRequest>) {
+        use crate::nm::WifiNetwork;
+        use crate::nm::security::Security;
+        use crate::ssid::Ssid;
+        let (shared, rx) =
+            Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"));
+        shared.set_networks(vec![WifiNetwork::new(
+            Ssid::from("Home"),
+            80,
+            Security::WpaPsk,
+            Some(2437),
+        )]);
+        (router(shared), rx)
+    }
+
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Upstream's `GET /networks`, for clients written against balena's API.
+    #[tokio::test]
+    async fn the_upstream_networks_endpoint_keeps_its_shape() {
+        let (app, _rx) = app_with_home();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/networks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            json_body(resp).await,
+            serde_json::json!([{ "ssid": "Home", "security": "wpa" }])
+        );
+    }
+
+    /// A network the portal refuses to join is not offered to API clients.
+    #[tokio::test]
+    async fn the_upstream_networks_endpoint_leaves_out_wep() {
+        use crate::nm::WifiNetwork;
+        use crate::nm::security::Security;
+        use crate::ssid::Ssid;
+        let (shared, _rx) =
+            Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"));
+        shared.set_networks(vec![
+            WifiNetwork::new(Ssid::from("Old"), 90, Security::Wep, None),
+            WifiNetwork::new(Ssid::from("Home"), 80, Security::WpaPsk, None),
+        ]);
+        let resp = router(shared)
+            .oneshot(
+                Request::builder()
+                    .uri("/networks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json_body(resp).await,
+            serde_json::json!([{ "ssid": "Home", "security": "wpa" }])
+        );
+    }
+
+    fn json_connect(body: &str, origin: Option<&str>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/connect")
+            .header(header::HOST, "192.168.42.1")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(origin) = origin {
+            req = req.header(header::ORIGIN, origin);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    }
+
+    /// Upstream's UI and scripts post `{ssid, identity, passphrase}` as
+    /// JSON. A network the scan listed is joined by its bytes, not as a
+    /// hidden one.
+    #[tokio::test]
+    async fn an_upstream_json_connect_starts_the_join() {
+        let (app, mut rx) = app_with_home();
+        let resp = app
+            .oneshot(json_connect(
+                r#"{"ssid":"Home","identity":"","passphrase":"abcdefgh"}"#,
+                Some("http://192.168.42.1"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(json_body(resp).await, serde_json::json!({ "ssid": "Home" }));
+        let request = rx.try_recv().expect("the join was not submitted");
+        assert_eq!(request.ssid.to_display_string(), "Home");
+        assert!(!request.hidden, "a scanned network is not hidden");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_json_connect_reports_errors_as_json() {
+        let (app, mut rx) = app_with_home();
+        let resp = app
+            .oneshot(json_connect(
+                r#"{"ssid":"Home","passphrase":"short"}"#,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(json_body(resp).await["error"].is_string());
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused join must not be submitted"
+        );
+    }
+
+    /// The provenance check is not bypassed by switching to JSON.
+    #[tokio::test]
+    async fn a_cross_site_json_connect_is_refused() {
+        let (app, mut rx) = app_with_home();
+        let resp = app
+            .oneshot(json_connect(
+                r#"{"ssid":"Home","passphrase":"abcdefgh"}"#,
+                Some("http://evil.example.com"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(json_body(resp).await["error"].is_string());
+        assert!(rx.try_recv().is_err());
     }
 
     /// The form is a few hundred bytes; anything near axum's 2 MB default
