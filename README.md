@@ -120,6 +120,7 @@ Every flag has an environment variable. Flags win.
 | `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |
 | `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
 | `--brand-css` | | `WIFI_CONNECT_BRAND_CSS` | — |
+| `--brand-logo` | | `WIFI_CONNECT_BRAND_LOGO` | — |
 | `--force` | | `WIFI_CONNECT_FORCE` | `false` |
 | `--connection-timeout` | | `WIFI_CONNECT_CONNECTION_TIMEOUT` | `45` |
 | `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
@@ -182,11 +183,56 @@ more than the `:root` that sets the light defaults, so a stylesheet loaded
 after them wins in either scheme. Use a `prefers-color-scheme` arm only to
 set a *different* value in dark.
 
+`--brand-logo` points at an image shown in the header in place of the
+product name, served at `/brand-logo`:
+
+```bash
+wifi-connect --brand-name Anthias --brand-logo /etc/wifi-connect/logo.svg
+```
+
+SVG, PNG, JPEG or WebP, up to 256 KB; anything else is refused at startup
+rather than served as a broken image. `--brand-name` is still required and
+becomes the image's alt text, so the heading reads correctly to a screen
+reader and to anyone whose image did not load. The logo *replaces* the
+wordmark rather than sitting above it.
+
+`--default-theme` decides which scheme the page opens in:
+
+```bash
+wifi-connect --brand-name Anthias --default-theme dark
+```
+
+`system` (the default) follows the phone and leaves an in-page **Switch
+theme** control in the footer. `light` or `dark` pins the page — the
+attribute is rendered on `<html>` server side, so it is right in the first
+paint rather than flashing the other scheme — and **removes that control**.
+Which of two colour schemes a one-minute setup page uses is the
+integrator's decision, and an end user who flips it is only undoing it. A
+preference already in the phone's storage from another portal does not
+override a pinned theme either.
+
 The file is read once at startup, so a path that does not exist stops the
 portal with a clear message rather than quietly serving an unbranded page.
 When the flag is unset the pages link nothing at all and stay a single
 request, which is what makes them work in a captive-portal mini-browser with
 no internet behind it.
+
+## Exit codes
+
+A run ends in one of these. They matter to whoever writes the unit file:
+`0`, `3`, `4` and `6` are endings nobody can act on from a service manager,
+and belong in `SuccessExitStatus=`. The rest are worth surfacing as a
+failed unit.
+
+| code | meaning | actionable? |
+| --- | --- | --- |
+| 0 | joined, already online, or asked to stop | no |
+| 1 | anything not listed below | yes |
+| 3 | no WiFi device on this machine | no — nothing to configure |
+| 4 | adapter cannot do AP mode, is unmanaged, or the radio is blocked | no — a hardware fact |
+| 5 | NetworkManager is unreachable over the bus | yes |
+| 6 | the activity timeout elapsed with no join | no — the ordinary "nobody came" ending |
+| 7 | the portal could not bind its address or port | yes — it will recur until something changes |
 
 ## Requirements and limitations
 
