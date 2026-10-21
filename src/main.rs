@@ -17,6 +17,7 @@ mod dns;
 mod http;
 mod nm;
 mod passphrase;
+mod private_file;
 mod qr;
 mod secret;
 mod sockets;
@@ -80,25 +81,36 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
         }
     };
 
+    let mut wrote_qr_files = false;
     if let Some(dir) = &args.qr_output {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        // Both files carry the passphrase (the .txt in plain text), so they
+        // are written like a credential: not world-readable, and never
+        // through a symlink planted at the target. See private_file.
+        if let Err(e) = private_file::create_dir(dir) {
             error!(error = %e, path = %dir.display(), "could not create the QR output directory");
         } else {
             let svg = dir.join("wifi-connect-qr.svg");
-            match std::fs::write(&svg, code.to_svg(512)) {
-                Ok(()) => info!(path = %svg.display(), "wrote the join QR code"),
+            match private_file::write(&svg, code.to_svg(512).as_bytes()) {
+                Ok(()) => {
+                    info!(path = %svg.display(), "wrote the join QR code");
+                    wrote_qr_files = true;
+                }
                 Err(e) => error!(error = %e, path = %svg.display(), "could not write the QR code"),
             }
             // The raw payload too, so a host application can render the
             // code itself at whatever size its screen wants.
             let txt = dir.join("wifi-connect-qr.txt");
-            if let Err(e) = std::fs::write(&txt, &payload) {
-                error!(error = %e, path = %txt.display(), "could not write the QR payload");
+            match private_file::write(&txt, payload.as_bytes()) {
+                Ok(()) => wrote_qr_files = true,
+                Err(e) => {
+                    error!(error = %e, path = %txt.display(), "could not write the QR payload")
+                }
             }
         }
     }
 
-    if !args.no_qr_stdout {
+    let to_stdout = args.print_qr_to_stdout(std::io::stdout().is_terminal(), wrote_qr_files);
+    if to_stdout {
         // Printed, not logged: a log formatter would mangle the block
         // characters and a journald line-wrap would make it unscannable.
         println!();
@@ -106,16 +118,41 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
         println!();
         print!("{}", code.to_unicode());
         println!();
+    } else if !args.no_qr_stdout {
+        info!(
+            "not printing the join QR to stdout: it is not a terminal, so it is \
+             probably a log, and the --qr-output files already publish it \
+             (pass --qr-stdout to print it anyway)"
+        );
     }
 
-    // The fallback for anyone whose scanner refuses, and for operators
-    // reading the journal. The passphrase is deliberately exposed here and
-    // nowhere else: this is the one place it is meant to be read.
-    info!(
-        ssid = %ssid,
-        passphrase = %passphrase.expose(),
-        "setup access point credentials"
-    );
+    // The passphrase stays out of the logs unless the operator opts in.
+    // Logs travel further than the screen — journald, `docker logs`, a
+    // fleet manager's log shipping — and the passphrase is what gets you
+    // onto the setup network and therefore to the portal. An explicit flag
+    // rather than DEBUG level, because raising the log level is what you do
+    // to troubleshoot a misbehaving radio, and that should not quietly
+    // start shipping a credential.
+    if args.log_passphrase {
+        info!(
+            ssid = %ssid,
+            passphrase = %passphrase.expose(),
+            "setup access point credentials"
+        );
+    } else {
+        info!(
+            ssid = %ssid,
+            qr_output = args.qr_output.as_ref().map(|d| d.display().to_string()),
+            "the setup access point's passphrase is in the join QR \
+             (pass --log-passphrase to also log it)"
+        );
+        if !wrote_qr_files && !to_stdout {
+            warn!(
+                "the setup passphrase is not published anywhere: set --qr-output, \
+                 drop --no-qr-stdout, or pass --log-passphrase"
+            );
+        }
+    }
 }
 
 /// The /24 broadcast address for a gateway.

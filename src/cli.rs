@@ -147,9 +147,36 @@ pub struct Cli {
     #[arg(long, env = "WIFI_CONNECT_QR_OUTPUT")]
     pub qr_output: Option<PathBuf>,
 
-    /// Do not print the QR code to stdout.
+    /// Never print the QR code to stdout. Wins over `--qr-stdout`.
+    ///
+    /// Under systemd or Docker, stdout is captured into the journal or the
+    /// container log, and a scannable QR there is as good as the
+    /// passphrase. By default it is only printed there when `--qr-output`
+    /// is not set; see `--qr-stdout`.
     #[arg(long, env = "WIFI_CONNECT_NO_QR_STDOUT", default_value_t = false)]
     pub no_qr_stdout: bool,
+
+    /// Print the QR code to stdout even when stdout is not a terminal and
+    /// `--qr-output` is set.
+    ///
+    /// By default the QR goes to stdout when stdout is a terminal (a plain
+    /// HDMI or serial console), or when `--qr-output` is not set and stdout
+    /// is therefore the only place the passphrase is published. Otherwise
+    /// stdout is a log — journald, `docker logs`, a fleet dashboard — and
+    /// the QR stays out of it.
+    #[arg(long, env = "WIFI_CONNECT_QR_STDOUT", default_value_t = false)]
+    pub qr_stdout: bool,
+
+    /// Also log the setup access point's passphrase as plain text.
+    ///
+    /// Off by default: logs travel further than the device's screen
+    /// (journald, `docker logs`, a fleet manager's log shipping), and the
+    /// passphrase is what gets you onto the setup network and so to the
+    /// portal. Turn it on only when people who can read the logs are
+    /// trusted to join, for instance on a bench where a scanner refuses
+    /// the QR.
+    #[arg(long, env = "WIFI_CONNECT_LOG_PASSPHRASE", default_value_t = false)]
+    pub log_passphrase: bool,
 
     /// Raise the portal even when the device is already online.
     #[arg(long, env = "WIFI_CONNECT_FORCE", default_value_t = false)]
@@ -247,6 +274,20 @@ impl Cli {
             SecurityMode::Wpa3 => ApSecurity::Wpa3Sae,
             SecurityMode::Auto | SecurityMode::Wpa2 => ApSecurity::Wpa2Psk,
         }
+    }
+
+    /// Whether the join QR goes to stdout, given whether stdout is a
+    /// terminal and whether the `--qr-output` files were written.
+    ///
+    /// A non-terminal stdout is a log, and a QR in a log is as good as the
+    /// passphrase, so it is only printed there when asked for or when it
+    /// is the only way the passphrase reaches anyone — including when
+    /// `--qr-output` is set but writing it failed.
+    pub fn print_qr_to_stdout(&self, stdout_is_terminal: bool, wrote_qr_files: bool) -> bool {
+        if self.no_qr_stdout {
+            return false;
+        }
+        self.qr_stdout || stdout_is_terminal || !wrote_qr_files
     }
 
     pub fn activity_timeout(&self) -> Duration {
@@ -357,6 +398,45 @@ mod tests {
         assert_eq!(c.portal_dhcp_range, "192.168.42.2,192.168.42.254");
         assert_eq!(c.portal_listening_port, 80);
         assert_eq!(c.activity_timeout, 0, "0 means no timeout, as upstream");
+    }
+
+    /// The passphrase must not reach the logs unless asked for.
+    #[test]
+    fn the_passphrase_is_not_logged_by_default() {
+        assert!(!cli(&[]).log_passphrase);
+        assert!(cli(&["--log-passphrase"]).log_passphrase);
+
+        // Setting the variable for real would race the other tests (and
+        // `set_var` is unsafe), so check the wiring instead.
+        let cmd = Cli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "log_passphrase")
+            .unwrap();
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("WIFI_CONNECT_LOG_PASSPHRASE")
+        );
+    }
+
+    /// With `--qr-output` set, stdout under systemd or Docker is a log the
+    /// QR would leak into. Without it, stdout is the only channel left.
+    #[test]
+    fn the_stdout_qr_stays_out_of_logs_when_there_is_another_channel() {
+        // No terminal (journald, docker logs).
+        assert!(
+            cli(&[]).print_qr_to_stdout(false, false),
+            "the only channel"
+        );
+        assert!(!cli(&[]).print_qr_to_stdout(false, true), "QR files exist");
+        assert!(cli(&["--qr-stdout"]).print_qr_to_stdout(false, true));
+
+        // A real console is a screen, not a log.
+        assert!(cli(&[]).print_qr_to_stdout(true, true));
+
+        // --no-qr-stdout always wins, including over --qr-stdout.
+        assert!(!cli(&["--no-qr-stdout"]).print_qr_to_stdout(true, false));
+        assert!(!cli(&["--no-qr-stdout", "--qr-stdout"]).print_qr_to_stdout(true, false));
     }
 
     /// The one deliberate behavioural change from upstream, which the

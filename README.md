@@ -128,6 +128,9 @@ Every flag has an environment variable. Flags win.
 | `--activity-timeout` | `-a` | `ACTIVITY_TIMEOUT` | `0` (never) |
 | `--ui-directory` | `-u` | `UI_DIRECTORY` | embedded |
 | `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |
+| `--qr-stdout` | | `WIFI_CONNECT_QR_STDOUT` | `false` (see below) |
+| `--no-qr-stdout` | | `WIFI_CONNECT_NO_QR_STDOUT` | `false` |
+| `--log-passphrase` | | `WIFI_CONNECT_LOG_PASSPHRASE` | `false` |
 | `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
 | `--brand-css` | | `WIFI_CONNECT_BRAND_CSS` | — |
 | `--brand-logo` | | `WIFI_CONNECT_BRAND_LOGO` | — |
@@ -157,12 +160,33 @@ The access point always has a passphrase, so the user needs it before they
 can join. It is rendered **on the device**, since it is what gets you onto
 the network and therefore cannot be served over it:
 
-- `--qr-output <dir>` writes `wifi-connect-qr.svg` plus the raw payload, for
-  a host application to show full-screen. This is the primary path.
-- A Unicode QR is printed to stdout, which a plain HDMI console or a serial
-  terminal renders directly with no host application at all.
-- The SSID and passphrase are logged as text, for operators and for anyone
-  whose scanner refuses.
+- `--qr-output <dir>` writes `wifi-connect-qr.svg` plus the raw payload
+  (`wifi-connect-qr.txt`), for a host application to show full-screen. This
+  is the primary path. Both files contain the passphrase, so they are
+  written mode `0640` (a directory wifi-connect creates is `0750`),
+  atomically, and never through a symlink at the target. The application
+  displaying them must run as the same user or group as wifi-connect. The
+  files take wifi-connect's group, so give it the reader's group rather
+  than loosening the mode: in Docker, `user: '0:<reader gid>'` (root is
+  still needed for NetworkManager; see `docker-compose.balena.yml`); under
+  systemd, `Group=` in a drop-in.
+- A Unicode QR on stdout, which a plain HDMI console or a serial terminal
+  renders directly with no host application at all. Under systemd or
+  Docker, stdout is captured into the journal or container log, where a QR
+  is as good as the passphrase. So it is printed only when stdout is a
+  terminal, or when there is no other channel: `--qr-output` is not set, or
+  writing its files failed. With the files written and stdout not a
+  terminal (the balena and Anthias setup), the QR stays out of the logs.
+  `--qr-stdout` prints it regardless; `--no-qr-stdout` never prints it and
+  wins over `--qr-stdout`. With neither `--qr-output` nor a fixed
+  `PORTAL_PASSPHRASE`, the journal QR is the only place a generated
+  passphrase appears, so `--no-qr-stdout` there leaves nobody able to join.
+- The passphrase is **not** logged. The log names the SSID and says the
+  passphrase is in the QR. `--log-passphrase` adds it as plain text, for a
+  bench where a scanner refuses the QR; leave it off anywhere logs are
+  shipped off the device or readable beyond the people allowed to join.
+  It is a dedicated flag rather than DEBUG level so that raising the log
+  level to troubleshoot a radio does not start shipping a credential.
 
 ## White-labelling the portal
 
