@@ -150,6 +150,14 @@ Every flag has an environment variable. Flags win.
 | `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
 | `--insecure-eap-skip-server-verification` | | `WIFI_CONNECT_INSECURE_EAP` | `false` |
 
+`--portal-security` takes `auto`, `wpa2` or `wpa3`. `auto` is currently
+WPA2-PSK (CCMP), identical to `wpa2`; the name is reserved for picking the
+best mode the adapter reliably supports, but it does not probe the adapter
+or upgrade to WPA3 today. `wpa3` (SAE) is opt-in because AP-mode SAE on the
+`brcmfmac` radio in every Raspberry Pi with built-in Wi-Fi comes up but
+clients fail to associate, and the access point cannot see that failure to
+fall back.
+
 ### Migrating from balena wifi-connect
 
 All eight of its flags keep working under the same names, short forms and
