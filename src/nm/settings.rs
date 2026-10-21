@@ -178,45 +178,6 @@ pub fn apply_station_ip(settings: &mut Settings<'static>, ip: &IpSettings) {
     settings.insert("ipv6", ipv6);
 }
 
-/// Add WEP security to a station profile built as open.
-///
-/// nmrs has no WEP variant, so the profile is built open and the security
-/// section added here, with the `802-11-wireless.security` cross-reference
-/// a secured profile needs. `key` is a raw key when it has a raw key's
-/// shape (see [`is_raw_wep_key`]), otherwise a passphrase that
-/// NetworkManager hashes into a 104-bit key, as routers do.
-///
-/// `auth-alg` is left at NetworkManager's default (open system), which is
-/// what nearly every WEP network uses; shared-key authentication is the
-/// weaker of the two and leaks keystream to anyone listening.
-pub fn apply_station_wep(settings: &mut Settings<'static>, key: &Secret) {
-    if let Some(wireless) = settings.get_mut("802-11-wireless") {
-        wireless.insert("security", Value::from("802-11-wireless-security"));
-    }
-    let key = key.expose();
-    let mut sec: HashMap<&str, Value<'_>> = HashMap::new();
-    sec.insert("key-mgmt", Value::from("none"));
-    sec.insert("wep-tx-keyidx", Value::from(0u32));
-    sec.insert("wep-key0", Value::from(key.to_string()));
-    // NM_WEP_KEY_TYPE_KEY = 1, NM_WEP_KEY_TYPE_PASSPHRASE = 2. Left unset,
-    // NM guesses, and a 13-character passphrase is a valid key either way.
-    let key_type: u32 = if is_raw_wep_key(key) { 1 } else { 2 };
-    sec.insert("wep-key-type", Value::from(key_type));
-    // Stored in the profile, never asked of an agent; see `ap_settings`.
-    sec.insert("wep-key-flags", Value::from(0u32));
-    settings.insert("802-11-wireless-security", sec);
-}
-
-/// Whether `key` has the shape of a raw WEP key: 5 or 13 ASCII characters
-/// (40- and 104-bit), or 10 or 26 hex digits.
-pub fn is_raw_wep_key(key: &str) -> bool {
-    match key.len() {
-        5 | 13 => key.chars().all(|c| c.is_ascii() && !c.is_ascii_control()),
-        10 | 26 => key.chars().all(|c| c.is_ascii_hexdigit()),
-        _ => false,
-    }
-}
-
 /// One family's section: `manual` with its address and gateway, or
 /// `auto` (DHCP, or SLAAC/DHCPv6) when nothing was configured.
 fn family_section<A: ToString>(
@@ -576,58 +537,5 @@ mod tests {
         assert_eq!(get(&s, "ipv4", "ignore-auto-dns"), &Value::from(true));
         assert_eq!(get(&s, "ipv6", "ignore-auto-dns"), &Value::from(true));
         assert!(s.get("ipv6").unwrap().get("dns").is_none());
-    }
-
-    /// An open station profile, as nmrs's builder leaves it.
-    fn open_station() -> Settings<'static> {
-        let mut s: Settings<'static> = HashMap::new();
-        let mut wireless: HashMap<&str, Value<'_>> = HashMap::new();
-        wireless.insert("ssid", Value::from(b"Legacy".to_vec()));
-        s.insert("802-11-wireless", wireless);
-        s
-    }
-
-    #[test]
-    fn wep_adds_the_section_and_its_cross_reference() {
-        let mut s = open_station();
-        apply_station_wep(&mut s, &Secret::new("abcde"));
-        assert_eq!(
-            get(&s, "802-11-wireless", "security"),
-            &Value::from("802-11-wireless-security"),
-            "without the cross-reference NM ignores the section"
-        );
-        assert_eq!(
-            get(&s, "802-11-wireless-security", "key-mgmt"),
-            &Value::from("none")
-        );
-        assert_eq!(
-            get(&s, "802-11-wireless-security", "wep-key0"),
-            &Value::from("abcde")
-        );
-        assert_eq!(
-            get(&s, "802-11-wireless-security", "wep-key-flags"),
-            &Value::from(0u32)
-        );
-    }
-
-    #[test]
-    fn a_wep_key_type_follows_the_key_shape() {
-        for (key, want) in [
-            ("abcde", 1u32),
-            ("abcdefghijklm", 1),
-            ("0123456789", 1),
-            ("0123456789abcdef0123456789", 1),
-            ("not a raw key", 1), // 13 characters: a raw 104-bit key
-            ("a longer passphrase", 2),
-            ("012345678g", 2), // ten characters, not all hex
-        ] {
-            let mut s = open_station();
-            apply_station_wep(&mut s, &Secret::new(key));
-            assert_eq!(
-                get(&s, "802-11-wireless-security", "wep-key-type"),
-                &Value::from(want),
-                "{key}"
-            );
-        }
     }
 }

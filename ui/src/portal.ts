@@ -85,7 +85,6 @@ function initSecurityAwareness(): void {
     // naive check gets wrong.
     const needsPassphrase = radio.dataset.needsPassphrase !== 'false'
     const needsIdentity = radio.dataset.needsIdentity === 'true'
-    const wep = radio.dataset.wep === 'true'
     // Enterprise (PEAP/TTLS) takes no WPA passphrase but still needs a
     // password alongside the identity, so the field is required whenever
     // either is true. Disabling it for enterprise would leave the password
@@ -101,12 +100,7 @@ function initSecurityAwareness(): void {
     // Likewise the 63-character ceiling: directory passwords behind an
     // 802.1X network are routinely longer, and maxlength silently truncates
     // what a password manager pastes.
-    // WEP is neither: a 40-bit key is 5 characters, and a passphrase the
-    // router hashes into a key may be up to 64.
-    if (wep) {
-      password.removeAttribute('minlength')
-      password.setAttribute('maxlength', '64')
-    } else if (needsPassphrase) {
+    if (needsPassphrase) {
       password.setAttribute('minlength', '8')
       password.setAttribute('maxlength', '63')
     } else {
@@ -115,13 +109,7 @@ function initSecurityAwareness(): void {
     }
     // Telling an enterprise user their directory password must be 8 to 63
     // characters is wrong, and sends them looking for a different one.
-    if (hint) {
-      hint.textContent = needsIdentity
-        ? 'Your enterprise (802.1X) password.'
-        : wep
-          ? 'The WEP key: 5 or 13 characters, 10 or 26 hex digits, or the passphrase.'
-          : pskHint
-    }
+    if (hint) hint.textContent = needsIdentity ? 'Your enterprise (802.1X) password.' : pskHint
     if (identityField instanceof HTMLElement) identityField.hidden = !needsIdentity
     // A hidden input still submits, and a username is what makes the server
     // join over 802.1X. So when the enterprise block hides, clear AND

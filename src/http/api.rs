@@ -329,8 +329,6 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
     }
     .filter(|_| known_security.is_none_or(Security::needs_identity));
     let enterprise = identity.is_some();
-    // Only a scan result can say WEP; a typed network is assumed WPA.
-    let wep = !enterprise && known_security == Some(Security::Wep);
 
     // An identity is what makes this an enterprise (802.1X) join: the NM
     // backend turns identity + password into WPA-EAP and a bare password
@@ -352,10 +350,6 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
             Some(Secret::new(form.passphrase.clone()))
         }
         (false, true) => None,
-        (false, false) if wep => {
-            validate_wep_key(&form.passphrase)?;
-            Some(Secret::new(form.passphrase.clone()))
-        }
         (false, false) => {
             passphrase::validate(&form.passphrase)
                 .map_err(|e| FormError::BadPassphrase(e.to_string()))?;
@@ -384,15 +378,12 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
     })
     .map_err(FormError::BadIp)?;
 
-    // Without a key the join is open, whatever the scan said.
-    let wep = wep && passphrase.is_some();
     Ok(JoinRequest {
         ssid,
         identity,
         passphrase,
         server_domain,
         eap_method,
-        wep,
         hidden,
         ip,
     })
@@ -459,31 +450,6 @@ fn validate_eap_password(value: &str) -> Result<(), FormError> {
              sign-in cannot carry"
                 .into(),
         ));
-    }
-    Ok(())
-}
-
-/// The longest WEP passphrase NetworkManager accepts. Raw keys are shorter
-/// still: 5 or 13 characters, or 10 or 26 hex digits.
-const WEP_PASSPHRASE_MAX_LEN: usize = 64;
-
-/// Refuse a WEP key NetworkManager would reject.
-///
-/// Raw keys and passphrases share one field, as on the router, so anything
-/// printable up to 64 ASCII characters is let through and
-/// [`crate::nm::settings::apply_station_wep`] tells the two apart. WPA's
-/// eight-character minimum must not apply: a 40-bit key is five.
-fn validate_wep_key(value: &str) -> Result<(), FormError> {
-    if !value.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
-        return Err(FormError::BadPassphrase(
-            "WEP keys use only printable ASCII characters".into(),
-        ));
-    }
-    if value.len() > WEP_PASSPHRASE_MAX_LEN {
-        return Err(FormError::BadPassphrase(format!(
-            "WEP key is too long: {} characters, maximum is {WEP_PASSPHRASE_MAX_LEN}",
-            value.len()
-        )));
     }
     Ok(())
 }
@@ -1242,54 +1208,23 @@ mod tests {
     fn an_upstream_ssid_is_matched_against_the_scan() {
         let body = |ssid: &str| UpstreamConnect {
             ssid: ssid.into(),
-            passphrase: "abcde".into(),
-            ..UpstreamConnect::default()
+            identity: "alice".into(),
+            passphrase: "abcdefgh".into(),
         };
         let listed = validate(
-            &body("Home").into_form(&scanned(Security::Wep)),
-            &scanned(Security::Wep),
-        )
-        .unwrap();
-        assert!(!listed.hidden);
-        assert!(listed.wep, "the scanned security must carry through");
-
-        let f = body("Elsewhere").into_form(&scanned(Security::Wep));
-        assert!(f.ssid_hex.is_empty());
-        assert_eq!(f.ssid, "Elsewhere");
-    }
-
-    /// A 40-bit WEP key is five characters, below WPA's minimum of eight,
-    /// so a scanned WEP network must not be held to WPA's rules.
-    #[test]
-    fn a_scanned_wep_network_takes_a_wep_key() {
-        for key in ["abcde", "0123456789abcdef0123456789", "a long passphrase"] {
-            let r = validate(&form("486f6d65", "", key), &scanned(Security::Wep)).unwrap();
-            assert!(r.wep, "{key}");
-            assert_eq!(r.passphrase.as_ref().unwrap().expose(), key);
-        }
-        let too_long = "x".repeat(65);
-        assert!(matches!(
-            validate(&form("486f6d65", "", &too_long), &scanned(Security::Wep)),
-            Err(FormError::BadPassphrase(_))
-        ));
-        assert!(matches!(
-            validate(&form("486f6d65", "", "caf\u{e9}s"), &scanned(Security::Wep)),
-            Err(FormError::BadPassphrase(_))
-        ));
-    }
-
-    /// WEP is only known from a scan; everywhere else a short key is still
-    /// refused as a WPA passphrase, and a join is never marked WEP.
-    #[test]
-    fn only_a_scanned_wep_network_is_joined_as_wep() {
-        assert!(validate(&form("486f6d65", "", "abcde"), &scanned(Security::WpaPsk)).is_err());
-        assert!(validate(&form("", "Home", "abcde"), &scanned(Security::Wep)).is_err());
-        let r = validate(
-            &form("486f6d65", "", "abcdefgh"),
+            &body("Home").into_form(&scanned(Security::WpaPsk)),
             &scanned(Security::WpaPsk),
         )
         .unwrap();
-        assert!(!r.wep);
+        assert!(!listed.hidden);
+        assert!(
+            listed.identity.is_none(),
+            "the scanned security must carry through: PSK drops the username"
+        );
+
+        let f = body("Elsewhere").into_form(&scanned(Security::WpaPsk));
+        assert!(f.ssid_hex.is_empty());
+        assert_eq!(f.ssid, "Elsewhere");
     }
 
     /// The portal hides the username block for a PSK network but a hidden

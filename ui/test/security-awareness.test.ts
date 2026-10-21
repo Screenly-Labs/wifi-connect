@@ -15,9 +15,9 @@ import { fileURLToPath } from 'node:url'
 
 const src = join(dirname(fileURLToPath(import.meta.url)), '..', 'src')
 
-const radio = (hex: string, pw: boolean, id: boolean, wep = false): string =>
+const radio = (hex: string, pw: boolean, id: boolean): string =>
   `<input type="radio" name="ssid_hex" value="${hex}" ` +
-  `data-needs-passphrase="${pw}" data-needs-identity="${id}" data-wep="${wep}">`
+  `data-needs-passphrase="${pw}" data-needs-identity="${id}">`
 
 beforeAll(async () => {
   GlobalRegistrator.register()
@@ -25,9 +25,7 @@ beforeAll(async () => {
   const body = page.match(/<body>([\s\S]*)<\/body>/)?.[1] ?? ''
   document.body.innerHTML = body.replace(
     '{{NETWORKS}}',
-    radio('436f7270', false, true) +
-      radio('486f6d65', true, false) +
-      radio('4f6c64', true, false, true),
+    radio('436f7270', false, true) + radio('486f6d65', true, false),
   )
   await import('../src/portal.ts')
 })
@@ -101,23 +99,5 @@ describe('switching between enterprise and PSK networks', () => {
     pick('436f7270')
     input('identity').value = 'alice'
     expect(submitted().identity).toBe('alice')
-  })
-})
-
-describe('WEP networks', () => {
-  test('a five-character WEP key is not held to the WPA minimum', () => {
-    pick('4f6c64')
-    expect(input('pw').disabled).toBe(false)
-    expect(input('pw').hasAttribute('minlength')).toBe(false)
-    expect(input('pw').getAttribute('maxlength')).toBe('64')
-    expect(document.getElementById('pw-hint')?.textContent).toMatch(/WEP/)
-  })
-
-  test('switching to a PSK network restores the WPA limits', () => {
-    pick('4f6c64')
-    pick('486f6d65')
-    expect(input('pw').getAttribute('minlength')).toBe('8')
-    expect(input('pw').getAttribute('maxlength')).toBe('63')
-    expect(document.getElementById('pw-hint')?.textContent).toMatch(/8 to 63/)
   })
 })

@@ -244,7 +244,6 @@ mod tests {
             passphrase: Some(crate::secret::Secret::new("abcdefgh")),
             server_domain: None,
             eap_method: Default::default(),
-            wep: false,
             hidden: false,
             ip: Default::default(),
         }

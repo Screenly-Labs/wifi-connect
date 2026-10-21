@@ -101,10 +101,6 @@ pub struct JoinRequest {
     /// For enterprise networks: how the password is proved. Ignored
     /// otherwise.
     pub eap_method: EapMethod,
-    /// The network was scanned as WEP, so the passphrase is a WEP key, not
-    /// a WPA pre-shared key. Never set for a typed (hidden) network: there
-    /// is no scan result to say so.
-    pub wep: bool,
     pub hidden: bool,
     /// How the joined network addresses this device. The default is
     /// automatic on both families, which is what every join did before
