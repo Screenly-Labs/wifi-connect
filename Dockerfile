@@ -1,4 +1,9 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+#
+# The syntax line names an image that BuildKit pulls and runs to parse this
+# file, in the release job that pushes to GHCR, so it is pinned by digest
+# like every other build image. 1.27.1 is what `docker/dockerfile:1`
+# resolved to when pinned; bump tag and digest together.
 #
 # Assembles the release image from binaries already cross-compiled by CI.
 # There is deliberately no compiler in here.
