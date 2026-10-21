@@ -86,6 +86,9 @@ pub struct Cli {
     pub insecure_open_portal: bool,
 
     /// Gateway address of the setup network.
+    ///
+    /// The access point is always a /24 on this address, so it must be a
+    /// host address of that /24 (not .0 or .255).
     #[arg(
         short = 'g',
         long,
@@ -95,6 +98,9 @@ pub struct Cli {
     pub portal_gateway: Ipv4Addr,
 
     /// DHCP range of the setup network, as `first,last`.
+    ///
+    /// Must lie inside the gateway's /24, excluding its .0 and .255 and the
+    /// gateway itself; anything else is refused at startup.
     #[arg(
         short = 'd',
         long,
