@@ -118,6 +118,7 @@ Every flag has an environment variable. Flags win.
 | `--activity-timeout` | `-a` | `ACTIVITY_TIMEOUT` | `0` (never) |
 | `--ui-directory` | `-u` | `UI_DIRECTORY` | embedded |
 | `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |
+| `--qr-stdout` | | `WIFI_CONNECT_QR_STDOUT` | `false` (see below) |
 | `--no-qr-stdout` | | `WIFI_CONNECT_NO_QR_STDOUT` | `false` |
 | `--log-passphrase` | | `WIFI_CONNECT_LOG_PASSPHRASE` | `false` |
 | `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
@@ -157,13 +158,17 @@ the network and therefore cannot be served over it:
   than loosening the mode: in Docker, `user: '0:<reader gid>'` (root is
   still needed for NetworkManager; see `docker-compose.balena.yml`); under
   systemd, `Group=` in a drop-in.
-- A Unicode QR is printed to stdout, which a plain HDMI console or a serial
-  terminal renders directly with no host application at all. Under systemd
-  or Docker, stdout is captured into the journal or container log, where a
-  QR is as good as the passphrase; `--no-qr-stdout` turns it off if those
-  logs are readable by people who should not join. Set `--qr-output` (or a
-  fixed `PORTAL_PASSPHRASE`) first: without it, the journal QR is the only
-  place a generated passphrase appears.
+- A Unicode QR on stdout, which a plain HDMI console or a serial terminal
+  renders directly with no host application at all. Under systemd or
+  Docker, stdout is captured into the journal or container log, where a QR
+  is as good as the passphrase. So it is printed only when stdout is a
+  terminal, or when there is no other channel: `--qr-output` is not set, or
+  writing its files failed. With the files written and stdout not a
+  terminal (the balena and Anthias setup), the QR stays out of the logs.
+  `--qr-stdout` prints it regardless; `--no-qr-stdout` never prints it and
+  wins over `--qr-stdout`. With neither `--qr-output` nor a fixed
+  `PORTAL_PASSPHRASE`, the journal QR is the only place a generated
+  passphrase appears, so `--no-qr-stdout` there leaves nobody able to join.
 - The passphrase is **not** logged. The log names the SSID and says the
   passphrase is in the QR. `--log-passphrase` adds it as plain text, for a
   bench where a scanner refuses the QR; leave it off anywhere logs are

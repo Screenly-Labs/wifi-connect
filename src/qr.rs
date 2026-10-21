@@ -10,7 +10,9 @@
 //! * SVG and PNG-ish files on disk (`--qr-output`), for the host app to show
 //!   full-screen. This is the path the Anthias integration will consume.
 //! * A Unicode half-block rendering on stdout, which a plain HDMI TTY or a
-//!   serial console displays directly with no host app at all.
+//!   serial console displays directly with no host app at all. Only when
+//!   stdout is a terminal or the disk files are missing (or `--qr-stdout`):
+//!   otherwise stdout is a log, and a QR there is the passphrase.
 //! * Only with `--log-passphrase`: the SSID and passphrase as plain text in
 //!   the log, for anyone whose scanner refuses. Off by default, because logs
 //!   are shipped and kept far beyond the device's screen.
