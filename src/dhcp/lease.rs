@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::ops::RangeInclusive;
 use std::time::{Duration, Instant};
 
 /// Short, because the AP's whole life is measured in minutes and we would
@@ -29,7 +30,13 @@ struct Lease {
 /// A pool of addresses and who currently holds them.
 #[derive(Debug)]
 pub struct Leases {
-    pool: Vec<Ipv4Addr>,
+    /// The pool as a range of address bits rather than a materialised list,
+    /// so memory does not scale with its width. `parse_dhcp_range` already
+    /// confines it to the gateway's /24, but a startup-time `Vec` sized by
+    /// operator input is one typo (`1.0.0.0,192.168.41.255`) away from
+    /// allocating billions of entries; keeping this O(1) means that
+    /// invariant does not have to hold at a distance.
+    pool: RangeInclusive<u32>,
     by_mac: HashMap<MacAddr, Ipv4Addr>,
     by_ip: HashMap<Ipv4Addr, Lease>,
     /// Addresses a client told us were already in use (DHCPDECLINE). We do
@@ -44,15 +51,10 @@ impl Leases {
         Self::with_lease_time(first, last, LEASE_TIME)
     }
 
+    /// An inverted range (`first > last`) is an empty pool.
     pub fn with_lease_time(first: Ipv4Addr, last: Ipv4Addr, lease_time: Duration) -> Self {
-        let (lo, hi) = (first.to_bits(), last.to_bits());
-        let pool = if lo > hi {
-            Vec::new()
-        } else {
-            (lo..=hi).map(Ipv4Addr::from_bits).collect()
-        };
         Self {
-            pool,
+            pool: first.to_bits()..=last.to_bits(),
             by_mac: HashMap::new(),
             by_ip: HashMap::new(),
             declined: HashSet::new(),
@@ -65,7 +67,7 @@ impl Leases {
     }
 
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        self.pool.contains(&ip)
+        self.pool.contains(&ip.to_bits())
     }
 
     fn is_free(&self, ip: Ipv4Addr, now: Instant, for_mac: MacAddr) -> bool {
@@ -102,8 +104,8 @@ impl Leases {
         }
 
         self.pool
-            .iter()
-            .copied()
+            .clone()
+            .map(Ipv4Addr::from_bits)
             .find(|ip| self.is_free(*ip, now, mac))
     }
 
@@ -298,6 +300,21 @@ mod tests {
             Ipv4Addr::new(192, 168, 42, 10),
         );
         assert_eq!(l.offer(A, None, Instant::now()), None);
+    }
+
+    /// The pool must not be materialised: a range as wide as the whole
+    /// address space is constructed instantly and in constant memory, rather
+    /// than allocating sixteen gigabytes and taking the device down at
+    /// startup. Config validation keeps such a range from ever getting here;
+    /// this pins that `Leases` does not depend on it to stay alive.
+    #[test]
+    fn a_huge_range_does_not_allocate_the_pool() {
+        let mut l = Leases::new(Ipv4Addr::new(0, 0, 0, 0), Ipv4Addr::new(255, 255, 255, 255));
+        assert!(l.contains(Ipv4Addr::new(203, 0, 113, 7)));
+        assert_eq!(
+            l.offer(A, None, Instant::now()),
+            Some(Ipv4Addr::new(0, 0, 0, 0))
+        );
     }
 
     #[test]

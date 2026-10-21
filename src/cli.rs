@@ -203,19 +203,64 @@ pub enum ConfigError {
     DhcpRangeInverted { first: Ipv4Addr, last: Ipv4Addr },
     #[error("the gateway {0} must not be inside the DHCP range, or it will be handed to a client")]
     GatewayInRange(Ipv4Addr),
+    #[error(
+        "--portal-gateway {0} is the network or broadcast address of its /24; use a host address such as x.y.z.1"
+    )]
+    GatewayNotHost(Ipv4Addr),
+    #[error(
+        "--portal-dhcp-range address {addr} is outside the gateway's subnet {network}/24; clients given it could not reach the portal"
+    )]
+    DhcpRangeOutsideSubnet { addr: Ipv4Addr, network: Ipv4Addr },
+    #[error(
+        "--portal-dhcp-range must not include {0}, the network or broadcast address of the gateway's /24"
+    )]
+    DhcpRangeIncludesReserved(Ipv4Addr),
     #[error("--portal-ssid must be 1 to 32 bytes, got {0}")]
     SsidLength(usize),
     #[error("--portal-passphrase: {0}")]
     Passphrase(String),
 }
 
+/// The access point is always configured as a /24 on the gateway (the NM
+/// `prefix`, the DHCP netmask and the advertised broadcast address all assume
+/// it), so the pool has to live inside that /24 too.
+const AP_PREFIX_MASK: u32 = 0xffff_ff00;
+
 pub fn parse_dhcp_range(spec: &str, gateway: Ipv4Addr) -> Result<DhcpRange, ConfigError> {
     let (a, b) = spec.split_once(',').ok_or(ConfigError::DhcpRangeShape)?;
     let first: Ipv4Addr = a.trim().parse().map_err(|_| ConfigError::DhcpRangeShape)?;
     let last: Ipv4Addr = b.trim().parse().map_err(|_| ConfigError::DhcpRangeShape)?;
 
+    let network = gateway.to_bits() & AP_PREFIX_MASK;
+    let broadcast = network | !AP_PREFIX_MASK;
+    let is_reserved = |ip: Ipv4Addr| ip.to_bits() == network || ip.to_bits() == broadcast;
+
+    // A gateway on .0 or .255 gives the AP an address no client can use as a
+    // router; NetworkManager would accept it and the portal would silently
+    // never load.
+    if is_reserved(gateway) {
+        return Err(ConfigError::GatewayNotHost(gateway));
+    }
     if first > last {
         return Err(ConfigError::DhcpRangeInverted { first, last });
+    }
+    // Outside the gateway's /24, a lease is unusable: the client is told
+    // its netmask is 255.255.255.0 and the gateway is not on its link. This
+    // check also bounds the pool at 254 addresses, so a typo such as
+    // `1.0.0.0,192.168.41.255` is a startup error rather than a pool of
+    // billions.
+    for addr in [first, last] {
+        if addr.to_bits() & AP_PREFIX_MASK != network {
+            return Err(ConfigError::DhcpRangeOutsideSubnet {
+                addr,
+                network: Ipv4Addr::from_bits(network),
+            });
+        }
+    }
+    // Both ends are in the /24 and ordered, so only an end can be .0 or
+    // .255. Handing either to a client gives it an address it cannot use.
+    if let Some(addr) = [first, last].into_iter().find(|ip| is_reserved(*ip)) {
+        return Err(ConfigError::DhcpRangeIncludesReserved(addr));
     }
     // Handing the gateway's own address to a client breaks the portal in a
     // way that is very hard to diagnose from the client side.
@@ -326,6 +371,14 @@ mod tests {
             c.ui_directory.as_deref(),
             Some(std::path::Path::new("/srv/ui"))
         );
+        assert_eq!(
+            c.validate().unwrap(),
+            DhcpRange {
+                first: Ipv4Addr::new(10, 0, 0, 10),
+                last: Ipv4Addr::new(10, 0, 0, 20),
+            },
+            "a custom gateway with a pool in its /24 must stay valid"
+        );
     }
 
     /// `--portal-interface` was upstream's name; it must keep working.
@@ -407,6 +460,97 @@ mod tests {
             err,
             ConfigError::GatewayInRange(Ipv4Addr::new(192, 168, 42, 1))
         );
+    }
+
+    /// A pool outside the gateway's /24 hands out addresses from which the
+    /// gateway (and so the portal) is unreachable, given the /24 netmask we
+    /// advertise.
+    #[test]
+    fn a_dhcp_range_outside_the_gateway_subnet_is_rejected() {
+        let gw = Ipv4Addr::new(192, 168, 42, 1);
+        for (spec, bad) in [
+            (
+                "192.168.43.2,192.168.43.254",
+                Ipv4Addr::new(192, 168, 43, 2),
+            ),
+            (
+                "192.168.42.2,192.168.43.10",
+                Ipv4Addr::new(192, 168, 43, 10),
+            ),
+            ("10.0.0.2,10.0.0.9", Ipv4Addr::new(10, 0, 0, 2)),
+        ] {
+            assert_eq!(
+                parse_dhcp_range(spec, gw).unwrap_err(),
+                ConfigError::DhcpRangeOutsideSubnet {
+                    addr: bad,
+                    network: Ipv4Addr::new(192, 168, 42, 0),
+                },
+                "accepted {spec:?}"
+            );
+        }
+    }
+
+    /// The typo the /24 rule exists to catch: before it, this range was
+    /// accepted and the lease table tried to materialise every address in
+    /// it, exhausting memory at startup.
+    #[test]
+    fn a_dhcp_range_spanning_most_of_the_address_space_is_rejected() {
+        assert_eq!(
+            parse_dhcp_range("1.0.0.0,192.168.41.255", Ipv4Addr::new(192, 168, 42, 1)).unwrap_err(),
+            ConfigError::DhcpRangeOutsideSubnet {
+                addr: Ipv4Addr::new(1, 0, 0, 0),
+                network: Ipv4Addr::new(192, 168, 42, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn a_dhcp_range_including_the_network_or_broadcast_address_is_rejected() {
+        let gw = Ipv4Addr::new(192, 168, 42, 1);
+        assert_eq!(
+            parse_dhcp_range(
+                "192.168.42.0,192.168.42.0",
+                Ipv4Addr::new(192, 168, 42, 200)
+            )
+            .unwrap_err(),
+            ConfigError::DhcpRangeIncludesReserved(Ipv4Addr::new(192, 168, 42, 0))
+        );
+        assert_eq!(
+            parse_dhcp_range("192.168.42.2,192.168.42.255", gw).unwrap_err(),
+            ConfigError::DhcpRangeIncludesReserved(Ipv4Addr::new(192, 168, 42, 255))
+        );
+        // The network address with the gateway placed above the pool.
+        assert_eq!(
+            parse_dhcp_range(
+                "192.168.42.0,192.168.42.100",
+                Ipv4Addr::new(192, 168, 42, 254)
+            )
+            .unwrap_err(),
+            ConfigError::DhcpRangeIncludesReserved(Ipv4Addr::new(192, 168, 42, 0))
+        );
+    }
+
+    #[test]
+    fn a_gateway_on_the_network_or_broadcast_address_is_rejected() {
+        for gw in [
+            Ipv4Addr::new(192, 168, 42, 0),
+            Ipv4Addr::new(192, 168, 42, 255),
+        ] {
+            assert_eq!(
+                parse_dhcp_range("192.168.42.2,192.168.42.254", gw).unwrap_err(),
+                ConfigError::GatewayNotHost(gw),
+                "accepted gateway {gw}"
+            );
+        }
+    }
+
+    /// The widest legal pool: every host address but the gateway's.
+    #[test]
+    fn the_default_range_and_a_full_host_range_still_parse() {
+        assert!(cli(&[]).validate().is_ok(), "the default must be valid");
+        let r = parse_dhcp_range("10.0.0.1,10.0.0.253", Ipv4Addr::new(10, 0, 0, 254)).unwrap();
+        assert_eq!(r.first, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(r.last, Ipv4Addr::new(10, 0, 0, 253));
     }
 
     #[test]
