@@ -71,6 +71,13 @@ pub struct Branding {
     /// message instead of silently serving an unbranded portal to every
     /// client. `Arc<str>` because `Shared` is cloned into every handler.
     pub css: Option<Arc<str>>,
+    /// The integrator's logo, served at `/brand-logo`.
+    ///
+    /// A route rather than a data: URI inlined into the page: it keeps the
+    /// HTML small whether or not a logo is set, and a logo that fails to
+    /// load degrades to its alt text, where a stylesheet that fails to
+    /// load would leave the page unstyled.
+    pub logo: Option<BrandLogo>,
     /// Which theme the page starts in.
     ///
     /// `System` follows the phone and leaves the in-page toggle on;
@@ -81,12 +88,24 @@ pub struct Branding {
     pub theme: ThemeMode,
 }
 
+/// An image and the content type to serve it as.
+///
+/// Read at startup like the stylesheet, so a mistyped path stops the
+/// portal with the path in the message instead of serving a broken image
+/// to every client.
+#[derive(Clone)]
+pub struct BrandLogo {
+    pub bytes: Arc<[u8]>,
+    pub content_type: &'static str,
+}
+
 impl Branding {
-    /// Defaults: no stylesheet, and follow the phone's own setting.
+    /// Defaults: no stylesheet, no logo, and follow the phone's setting.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             css: None,
+            logo: None,
             theme: ThemeMode::System,
         }
     }
