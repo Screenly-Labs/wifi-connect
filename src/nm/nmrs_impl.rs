@@ -25,13 +25,13 @@ use nmrs::{ConnectionError, NetworkManager, WifiSecurity};
 use tracing::{debug, info, warn};
 
 use super::proxies::{
-    DEVICE_STATE_ACTIVATED, DeviceProxy, DeviceWirelessProxy, ManagerProxy, WIFI_MODE_AP,
-    WIFI_MODE_INFRA, is_device_busy,
+    DEVICE_STATE_ACTIVATED, DeviceProxy, DeviceWirelessProxy, WIFI_MODE_AP, WIFI_MODE_INFRA,
+    is_device_busy,
 };
 use super::security;
 use super::settings::{ApProfile, ap_settings};
 use super::{
-    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinFailure, JoinOutcome, JoinRequest, LinkState,
+    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinFailure, JoinOutcome, JoinRequest,
     NetworkControl, NetworkError, WifiNetwork,
 };
 use crate::secret::Secret;
@@ -405,8 +405,8 @@ impl NetworkControl for NmrsControl {
             // Connectivity checking is disabled — NM's behaviour wherever no
             // check URI is configured, which includes Debian, Raspberry Pi
             // OS and Ubuntu Server/Core. "Unknown" is the honest answer;
-            // `is_online` then decides from the link state, so this must
-            // not be read as "offline".
+            // `is_online` then asks whether the radio is a connected
+            // station, so this must not be read as "offline".
             Err(ConnectionError::ConnectivityCheckDisabled) => {
                 debug!("NetworkManager connectivity checking is disabled");
                 Ok(Connectivity::Unknown)
@@ -415,54 +415,45 @@ impl NetworkControl for NmrsControl {
         }
     }
 
-    async fn link_state(&self, device: &DeviceInfo) -> Result<LinkState, NetworkError> {
-        // Every read here is best-effort and fails towards "not online",
-        // which is the behaviour before this fallback existed: the portal
+    async fn station_activated(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
+        // Best-effort: every failed read answers "not a station", which is
+        // the behaviour from before this fallback existed — the portal
         // comes up.
-        let nm_state = match ManagerProxy::new(self.bus()).await {
-            Ok(p) => p.state().await.unwrap_or_else(|e| {
-                debug!(error = %e, "could not read NetworkManager's State");
-                0
-            }),
+        let dev = match self.nm.wifi_device_by_interface(&device.interface).await {
+            Ok(dev) => dev,
             Err(e) => {
-                debug!(error = %e, "could not reach NetworkManager's root object");
-                0
+                debug!(error = %e, "could not look up the WiFi device");
+                return Ok(false);
             }
         };
-
-        let station_activated = match self.nm.wifi_device_by_interface(&device.interface).await {
-            Ok(dev) => {
-                let state = match DeviceProxy::builder(self.bus()).path(dev.path.clone()) {
-                    Ok(b) => match b.build().await {
-                        Ok(p) => p.state().await.unwrap_or(0),
-                        Err(_) => 0,
-                    },
-                    Err(_) => 0,
-                };
-                let mode = match DeviceWirelessProxy::builder(self.bus()).path(dev.path) {
-                    Ok(b) => match b.build().await {
-                        Ok(p) => p.mode().await.unwrap_or(0),
-                        Err(_) => 0,
-                    },
-                    Err(_) => 0,
-                };
-                is_activated_station(state, mode)
-            }
-            Err(e) => {
-                debug!(error = %e, "could not read the WiFi device's state");
-                false
-            }
+        let state = match DeviceProxy::builder(self.bus()).path(dev.path.clone()) {
+            Ok(b) => match b.build().await {
+                Ok(p) => p.state().await.unwrap_or_else(|e| {
+                    debug!(error = %e, "could not read the WiFi device's State");
+                    0
+                }),
+                Err(_) => 0,
+            },
+            Err(_) => 0,
         };
-
-        let link = LinkState {
-            nm_state,
-            station_activated,
+        let mode = match DeviceWirelessProxy::builder(self.bus()).path(dev.path) {
+            Ok(b) => match b.build().await {
+                Ok(p) => p.mode().await.unwrap_or_else(|e| {
+                    debug!(error = %e, "could not read the WiFi device's Mode");
+                    0
+                }),
+                Err(_) => 0,
+            },
+            Err(_) => 0,
         };
+        let activated = is_activated_station(state, mode);
         debug!(
-            ?link,
-            "connectivity unknown; falling back to the link state"
+            state,
+            mode,
+            activated,
+            "connectivity unknown; checking whether the radio is a connected station"
         );
-        Ok(link)
+        Ok(activated)
     }
 
     async fn saved_wifi_profile_count(&self) -> Result<usize, NetworkError> {
@@ -487,8 +478,8 @@ impl NetworkControl for NmrsControl {
         // state ourselves: "associated" is not the same as "usable", and
         // the whole point of the wait is to find out whether the device can
         // actually reach the internet. Through `is_online`, so that with
-        // checking disabled — where the verdict is always Unknown — a link
-        // that comes up still ends the wait, instead of the wait running
+        // checking disabled — where the verdict is always Unknown — a WiFi
+        // station that comes up still ends the wait, instead of the wait running
         // out and the access point being raised over that link.
         let deadline = tokio::time::Instant::now() + budget;
         let mut interval = tokio::time::interval(Duration::from_secs(2));

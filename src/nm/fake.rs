@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::{
-    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinOutcome, JoinRequest, LinkState,
-    NetworkControl, NetworkError, WIFI_DEVICE_CAP_AP, WifiNetwork,
+    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinOutcome, JoinRequest, NetworkControl,
+    NetworkError, WIFI_DEVICE_CAP_AP, WifiNetwork,
 };
 use crate::ssid::Ssid;
 
@@ -23,7 +23,7 @@ use crate::ssid::Ssid;
 pub enum Call {
     FindDevice,
     CheckConnectivity,
-    LinkState,
+    StationActivated,
     SavedProfileCount,
     AwaitAutoconnect,
     Scan,
@@ -48,7 +48,7 @@ pub struct FakeNm {
     state: Arc<Mutex<State>>,
     pub device: DeviceInfo,
     pub connectivity: Connectivity,
-    pub link: LinkState,
+    pub station_activated: bool,
     pub saved_profiles: usize,
     pub autoconnect_succeeds: bool,
     pub networks: Vec<WifiNetwork>,
@@ -70,11 +70,7 @@ impl FakeNm {
                 managed: true,
             },
             connectivity: Connectivity::None,
-            // Nothing connected: NM_STATE_DISCONNECTED, radio idle.
-            link: LinkState {
-                nm_state: 20,
-                station_activated: false,
-            },
+            station_activated: false,
             saved_profiles: 0,
             autoconnect_succeeds: false,
             networks: Vec::new(),
@@ -93,8 +89,8 @@ impl FakeNm {
         self
     }
 
-    pub fn with_link_state(mut self, link: LinkState) -> Self {
-        self.link = link;
+    pub fn with_station_activated(mut self, activated: bool) -> Self {
+        self.station_activated = activated;
         self
     }
 
@@ -153,9 +149,9 @@ impl NetworkControl for FakeNm {
         Ok(self.connectivity)
     }
 
-    async fn link_state(&self, _device: &DeviceInfo) -> Result<LinkState, NetworkError> {
-        self.record(Call::LinkState);
-        Ok(self.link)
+    async fn station_activated(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {
+        self.record(Call::StationActivated);
+        Ok(self.station_activated)
     }
 
     async fn saved_wifi_profile_count(&self) -> Result<usize, NetworkError> {
