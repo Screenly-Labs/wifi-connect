@@ -5,7 +5,8 @@ use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 
-use crate::nm::JoinRequest;
+use crate::nm::security::Security;
+use crate::nm::{JoinRequest, WifiNetwork};
 use crate::passphrase;
 use crate::secret::Secret;
 use crate::ssid::Ssid;
@@ -159,7 +160,16 @@ impl FormError {
 /// instead of surfacing an opaque `InvalidProperty`. It also avoids a
 /// thirty-second access-point bounce that teaches the user nothing: on a
 /// validation failure the AP never goes down at all.
-pub fn validate(form: &ConnectForm) -> Result<JoinRequest, FormError> {
+///
+/// `scanned` is the network list the portal offered. A username is what
+/// turns a join into an 802.1X one (see `classify_credentials`), so when
+/// the user picked a scanned network that is *not* enterprise, a username
+/// that came along is dropped: a stale value from the hidden enterprise
+/// block, a browser's autofill, or a hand-crafted POST must neither turn a
+/// WPA-PSK join into a doomed EAP one nor make an open network demand a
+/// password. A typed (hidden) network, or one that has since left the
+/// list, has no recorded security, so there the username alone decides.
+pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinRequest, FormError> {
     let typed = form.ssid.trim();
     let (ssid, hidden) = if !form.ssid_hex.is_empty() {
         (
@@ -176,10 +186,21 @@ pub fn validate(form: &ConnectForm) -> Result<JoinRequest, FormError> {
         return Err(FormError::NoNetwork);
     }
 
+    let known_security = if hidden {
+        None
+    } else {
+        let hex = ssid.to_hex();
+        scanned
+            .iter()
+            .find(|n| n.ssid_hex == hex)
+            .map(|n| n.security)
+    };
+
     let identity = {
         let t = form.identity.trim();
         (!t.is_empty()).then(|| t.to_string())
-    };
+    }
+    .filter(|_| known_security.is_none_or(Security::needs_identity));
 
     // An identity is what makes this an enterprise (802.1X) join: the NM
     // backend turns identity + password into WPA-EAP and a bare password
@@ -233,6 +254,13 @@ const EAP_PASSWORD_MAX_LEN: usize = 256;
 /// characters: NUL cannot cross D-Bus inside a string at all, and a newline
 /// or similar has no business in a value that ends up in NetworkManager's and
 /// wpa_supplicant's line-oriented configuration. No real password needs one.
+///
+/// Characters outside the Basic Multilingual Plane (emoji, for instance) are
+/// refused too. MSCHAPv2 hashes the password as UTF-16, but wpa_supplicant's
+/// UTF-8 to UCS-2 conversion (`utf8_to_ucs2` in `ms_funcs.c`) only decodes
+/// sequences of up to three bytes: a four-byte one is silently mangled, so
+/// the hash can never match and the join is certain to fail, after an
+/// access-point bounce, as a wrong password.
 fn validate_eap_password(value: &str) -> Result<(), FormError> {
     let len = value.chars().count();
     if len > EAP_PASSWORD_MAX_LEN {
@@ -245,11 +273,18 @@ fn validate_eap_password(value: &str) -> Result<(), FormError> {
             "Password must not contain control characters".into(),
         ));
     }
+    if value.chars().any(|c| u32::from(c) > 0xFFFF) {
+        return Err(FormError::BadPassphrase(
+            "Password must not contain emoji or other characters this network's \
+             sign-in cannot carry"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
 pub async fn connect(State(shared): State<Shared>, Form(form): Form<ConnectForm>) -> Response {
-    let request = match validate(&form) {
+    let request = match validate(&form, &shared.networks()) {
         Ok(r) => r,
         Err(e) => {
             // No teardown: the user stays on the portal and fixes the typo.
@@ -305,14 +340,14 @@ mod tests {
 
     #[test]
     fn a_selected_network_is_identified_by_its_exact_bytes() {
-        let r = validate(&form("4d79ff", "", "abcdefgh")).unwrap();
+        let r = validate(&form("4d79ff", "", "abcdefgh"), &[]).unwrap();
         assert_eq!(r.ssid.as_bytes(), &[0x4d, 0x79, 0xff]);
         assert!(!r.hidden, "a scanned network is not hidden");
     }
 
     #[test]
     fn a_typed_network_is_treated_as_hidden() {
-        let r = validate(&form("", "  My Hidden Net  ", "abcdefgh")).unwrap();
+        let r = validate(&form("", "  My Hidden Net  ", "abcdefgh"), &[]).unwrap();
         assert_eq!(
             r.ssid,
             Ssid::from("My Hidden Net"),
@@ -323,7 +358,7 @@ mod tests {
 
     #[test]
     fn the_selected_network_wins_over_a_typed_one() {
-        let r = validate(&form("486f6d65", "Typed", "abcdefgh")).unwrap();
+        let r = validate(&form("486f6d65", "Typed", "abcdefgh"), &[]).unwrap();
         assert_eq!(r.ssid, Ssid::from("Home"));
     }
 
@@ -334,7 +369,7 @@ mod tests {
             form("", "   ", "abcdefgh"),
             form("zzz", "", "abcdefgh"),
         ] {
-            assert_eq!(validate(&f).unwrap_err(), FormError::NoNetwork);
+            assert_eq!(validate(&f, &[]).unwrap_err(), FormError::NoNetwork);
         }
     }
 
@@ -343,7 +378,7 @@ mod tests {
     /// would teach the user nothing.
     #[test]
     fn a_short_passphrase_is_rejected_before_the_radio_is_touched() {
-        let err = validate(&form("486f6d65", "", "short")).unwrap_err();
+        let err = validate(&form("486f6d65", "", "short"), &[]).unwrap_err();
         match err {
             FormError::BadPassphrase(m) => assert!(m.contains('8'), "unhelpful: {m}"),
             other => panic!("expected a passphrase error, got {other:?}"),
@@ -352,13 +387,13 @@ mod tests {
 
     #[test]
     fn an_over_long_passphrase_is_rejected() {
-        let err = validate(&form("486f6d65", "", &"a".repeat(64))).unwrap_err();
+        let err = validate(&form("486f6d65", "", &"a".repeat(64)), &[]).unwrap_err();
         assert!(matches!(err, FormError::BadPassphrase(_)));
     }
 
     #[test]
     fn an_empty_passphrase_means_an_open_network() {
-        let r = validate(&form("486f6d65", "", "")).unwrap();
+        let r = validate(&form("486f6d65", "", ""), &[]).unwrap();
         assert!(r.passphrase.is_none());
     }
 
@@ -366,7 +401,7 @@ mod tests {
     fn an_identity_is_carried_for_enterprise_networks() {
         let mut f = form("486f6d65", "", "abcdefgh");
         f.identity = "  alice  ".into();
-        let r = validate(&f).unwrap();
+        let r = validate(&f, &[]).unwrap();
         assert_eq!(r.identity.as_deref(), Some("alice"));
     }
 
@@ -374,7 +409,7 @@ mod tests {
     fn a_blank_identity_is_dropped_rather_than_sent_as_empty() {
         let mut f = form("486f6d65", "", "abcdefgh");
         f.identity = "   ".into();
-        assert!(validate(&f).unwrap().identity.is_none());
+        assert!(validate(&f, &[]).unwrap().identity.is_none());
     }
 
     fn enterprise(passphrase: &str) -> ConnectForm {
@@ -387,23 +422,39 @@ mod tests {
     /// password is perfectly valid on an 802.1X network.
     #[test]
     fn a_short_enterprise_password_is_accepted() {
-        let r = validate(&enterprise("abc123")).unwrap();
+        let r = validate(&enterprise("abc123"), &[]).unwrap();
         assert_eq!(r.passphrase.unwrap().expose(), "abc123");
         assert_eq!(r.identity.as_deref(), Some("alice"));
     }
 
     #[test]
     fn a_non_ascii_enterprise_password_is_accepted() {
-        let r = validate(&enterprise("pässwörd\u{1F600}")).unwrap();
-        assert_eq!(r.passphrase.unwrap().expose(), "pässwörd\u{1F600}");
+        let r = validate(&enterprise("pässwörd€漢字"), &[]).unwrap();
+        assert_eq!(r.passphrase.unwrap().expose(), "pässwörd€漢字");
+    }
+
+    /// wpa_supplicant's MSCHAPv2 cannot hash a character beyond U+FFFF, so
+    /// such a password can only fail, and only after the AP has bounced.
+    #[test]
+    fn an_enterprise_password_outside_the_bmp_is_rejected() {
+        for p in ["pass\u{1F600}word", "\u{10000}", "\u{10FFFF}"] {
+            assert!(
+                matches!(
+                    validate(&enterprise(p), &[]),
+                    Err(FormError::BadPassphrase(_))
+                ),
+                "accepted {p:?}"
+            );
+        }
+        assert!(validate(&enterprise("\u{FFFD}"), &[]).is_ok());
     }
 
     /// PSK's 63-character ceiling does not apply, but some ceiling does.
     #[test]
     fn an_enterprise_password_is_bounded_by_mschapv2_not_by_psk() {
-        assert!(validate(&enterprise(&"a".repeat(64))).is_ok());
-        assert!(validate(&enterprise(&"a".repeat(EAP_PASSWORD_MAX_LEN))).is_ok());
-        let err = validate(&enterprise(&"a".repeat(EAP_PASSWORD_MAX_LEN + 1))).unwrap_err();
+        assert!(validate(&enterprise(&"a".repeat(64)), &[]).is_ok());
+        assert!(validate(&enterprise(&"a".repeat(EAP_PASSWORD_MAX_LEN)), &[]).is_ok());
+        let err = validate(&enterprise(&"a".repeat(EAP_PASSWORD_MAX_LEN + 1)), &[]).unwrap_err();
         match err {
             FormError::BadPassphrase(m) => assert!(m.contains("256"), "unhelpful: {m}"),
             other => panic!("expected a passphrase error, got {other:?}"),
@@ -420,7 +471,10 @@ mod tests {
             "pass\u{85}word",
         ] {
             assert!(
-                matches!(validate(&enterprise(p)), Err(FormError::BadPassphrase(_))),
+                matches!(
+                    validate(&enterprise(p), &[]),
+                    Err(FormError::BadPassphrase(_))
+                ),
                 "accepted {p:?}"
             );
         }
@@ -433,7 +487,7 @@ mod tests {
         for p in ["abc123", "pässwörd", &"a".repeat(64)] {
             assert!(
                 matches!(
-                    validate(&form("486f6d65", "", p)),
+                    validate(&form("486f6d65", "", p), &[]),
                     Err(FormError::BadPassphrase(_))
                 ),
                 "accepted {p:?} as a PSK"
@@ -445,16 +499,59 @@ mod tests {
     /// silently discards the identity and can only fail.
     #[test]
     fn an_identity_without_a_password_is_rejected() {
-        let err = validate(&enterprise("")).unwrap_err();
+        let err = validate(&enterprise(""), &[]).unwrap_err();
         match err {
             FormError::BadPassphrase(m) => assert!(m.contains("password"), "unhelpful: {m}"),
             other => panic!("expected a passphrase error, got {other:?}"),
         }
     }
 
+    /// "Home" (486f6d65) as the portal listed it.
+    fn scanned(security: Security) -> Vec<WifiNetwork> {
+        vec![WifiNetwork::new(
+            Ssid::from("Home"),
+            80,
+            security,
+            Some(2437),
+        )]
+    }
+
+    /// The portal only hides the username block when the user switches
+    /// networks, and a hidden input still submits. On a scanned open
+    /// network that leftover username must not demand a password the user
+    /// cannot enter: the password field is disabled there.
+    #[test]
+    fn a_stale_username_does_not_block_an_open_network() {
+        let r = validate(&enterprise(""), &scanned(Security::Open)).unwrap();
+        assert!(r.identity.is_none());
+        assert!(r.passphrase.is_none());
+    }
+
+    /// Likewise on a scanned PSK network: the username is dropped, so the
+    /// password is held to, and joined with, the WPA-PSK rules.
+    #[test]
+    fn a_stale_username_on_a_psk_network_is_dropped() {
+        let r = validate(&enterprise("abcdefgh"), &scanned(Security::WpaPsk)).unwrap();
+        assert!(r.identity.is_none(), "would have been joined as EAP");
+        assert!(matches!(
+            validate(&enterprise("abc123"), &scanned(Security::WpaPsk)).unwrap_err(),
+            FormError::BadPassphrase(_)
+        ));
+    }
+
+    #[test]
+    fn a_scanned_enterprise_network_keeps_the_username_and_its_rules() {
+        let r = validate(&enterprise("abc123"), &scanned(Security::Enterprise)).unwrap();
+        assert_eq!(r.identity.as_deref(), Some("alice"));
+        assert!(matches!(
+            validate(&enterprise(""), &scanned(Security::Enterprise)).unwrap_err(),
+            FormError::BadPassphrase(_)
+        ));
+    }
+
     #[test]
     fn the_passphrase_does_not_leak_through_the_request_debug() {
-        let r = validate(&form("486f6d65", "", "sup3rsecret")).unwrap();
+        let r = validate(&form("486f6d65", "", "sup3rsecret"), &[]).unwrap();
         assert!(!format!("{r:?}").contains("sup3rsecret"));
     }
 }
