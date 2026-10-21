@@ -40,6 +40,9 @@ const TTL: u32 = 0;
 /// well under it; the check in [`finish`] is a backstop, not a code path.
 const MAX_REPLY: usize = 512;
 
+/// The OPCODE field in the third header byte (RFC 1035 §4.1.1).
+const OPCODE_BITS: u8 = 0b0111_1000;
+
 /// Build the reply for one received datagram.
 ///
 /// Returns `None` when the query should be dropped without a response.
@@ -62,6 +65,11 @@ pub fn respond(query: &[u8], gateway: Ipv4Addr) -> Option<Vec<u8>> {
     }
 
     let opcode = packet.opcode();
+    // The opcode exactly as sent. simple-dns folds every unassigned opcode
+    // into one `Reserved` variant and writes that back as 6, so a NOTIMP for
+    // opcode 3 would go out labelled opcode 6 — a reply that does not match
+    // its query. The parse above succeeded, so the header is all there.
+    let opcode_bits = query[2] & OPCODE_BITS;
     let recursion_desired = packet.has_flags(PacketFlag::RECURSION_DESIRED);
     let questions: Vec<_> = packet.questions.clone();
     let id = packet.id();
@@ -99,13 +107,13 @@ pub fn respond(query: &[u8], gateway: Ipv4Addr) -> Option<Vec<u8>> {
     if questions.len() != 1 {
         reply.questions.clear();
         *reply.rcode_mut() = RCODE::FormatError;
-        return finish(&reply);
+        return finish(&reply, opcode_bits);
     }
 
     // We only speak standard queries. UPDATE/NOTIFY get an honest NOTIMP.
     if opcode != OPCODE::StandardQuery {
         *reply.rcode_mut() = RCODE::NotImplemented;
-        return finish(&reply);
+        return finish(&reply, opcode_bits);
     }
 
     for q in &questions {
@@ -127,18 +135,20 @@ pub fn respond(query: &[u8], gateway: Ipv4Addr) -> Option<Vec<u8>> {
         // whole point.
     }
 
-    finish(&reply)
+    finish(&reply, opcode_bits)
 }
 
 /// Serialise a reply, refusing to send anything over [`MAX_REPLY`]. We do
 /// not implement truncation (TC), so an oversized reply would be malformed
 /// to a non-EDNS client; dropping is the honest failure. Unreachable with
 /// one question and one A record, but cheap to guarantee.
-fn finish(reply: &Packet<'_>) -> Option<Vec<u8>> {
-    reply
-        .build_bytes_vec_compressed()
-        .ok()
-        .filter(|bytes| bytes.len() <= MAX_REPLY)
+///
+/// `opcode_bits` is the query's own OPCODE field, written back over
+/// whatever simple-dns serialised, since RFC 1035 has the reply copy it.
+fn finish(reply: &Packet<'_>, opcode_bits: u8) -> Option<Vec<u8>> {
+    let mut bytes = reply.build_bytes_vec_compressed().ok()?;
+    bytes[2] = (bytes[2] & !OPCODE_BITS) | opcode_bits;
+    (bytes.len() <= MAX_REPLY).then_some(bytes)
 }
 
 #[cfg(test)]
@@ -387,6 +397,20 @@ mod tests {
         let reply = parse(&out);
         assert_eq!(reply.rcode(), RCODE::FormatError);
         assert!(reply.questions.is_empty());
+    }
+
+    /// RFC 1035 has the reply copy the query's opcode. simple-dns cannot
+    /// represent an unassigned one and would write it back as 6.
+    #[test]
+    fn notimp_echoes_an_unassigned_opcode_exactly() {
+        for opcode in [3u8, 7, 15] {
+            let mut q = vec![0x00, 0x01, opcode << 3, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+            q.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]);
+            let out = respond(&q, GW).expect("an unknown opcode gets NOTIMP");
+            assert_eq!(out[2] & OPCODE_BITS, opcode << 3, "opcode {opcode}");
+            assert_eq!(parse(&out).rcode(), RCODE::NotImplemented);
+            assert!(parse(&out).has_flags(PacketFlag::RESPONSE));
+        }
     }
 
     /// Stub resolvers routinely attach an EDNS OPT record. It must not stop
