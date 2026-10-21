@@ -408,29 +408,49 @@ mod tests {
         assert!(l.may_use(B, ip, later));
     }
 
-    /// A's lease expires and the address goes to B. A's old `by_mac` entry
-    /// must not survive that, or A's next RELEASE would delete B's lease.
-    #[test]
-    fn reassigning_an_expired_address_forgets_the_previous_holder() {
+    /// `A` held `ip`, let it expire, and `ip` went to `B`. Returns the table
+    /// at that point and a time after the hand-over.
+    fn handed_over_from_a_to_b(ip: Ipv4Addr) -> (Leases, Instant) {
         let mut l = pool();
         let t0 = Instant::now();
-        let ip = Ipv4Addr::new(192, 168, 42, 10);
         l.commit(A, ip, t0);
 
         let later = t0 + LEASE_TIME + Duration::from_secs(1);
         assert!(l.may_use(B, ip, later));
         l.commit(B, ip, later);
+        (l, later)
+    }
+
+    /// A's old `by_mac` entry must not survive the hand-over, or A's next
+    /// RELEASE would delete B's lease.
+    #[test]
+    fn a_previous_holders_release_does_not_evict_the_new_holder() {
+        let ip = Ipv4Addr::new(192, 168, 42, 10);
+        let (mut l, later) = handed_over_from_a_to_b(ip);
 
         l.release(A);
+
+        // "B may use it" would hold whether or not B's lease survived (a
+        // free address is usable too), so check that it is still B's: no
+        // one else may take it.
         assert!(
-            l.may_use(B, ip, later),
+            !l.may_use(A, ip, later),
             "B's lease must survive A's RELEASE"
         );
-        assert!(!l.may_use(A, ip, later), "and A may not take it back");
+        assert_ne!(l.offer(A, None, later), Some(ip));
+    }
 
-        // A moving to another address must not drop B's lease either.
-        l.commit(A, Ipv4Addr::new(192, 168, 42, 11), later);
-        assert!(!l.may_use(A, ip, later));
+    /// Same, for A coming back and committing a different address.
+    #[test]
+    fn a_previous_holder_moving_address_does_not_evict_the_new_holder() {
+        let ip = Ipv4Addr::new(192, 168, 42, 10);
+        let other = Ipv4Addr::new(192, 168, 42, 11);
+        let (mut l, later) = handed_over_from_a_to_b(ip);
+
+        assert!(l.may_use(A, other, later));
+        l.commit(A, other, later);
+
+        assert!(!l.may_use(A, ip, later), "B's lease must survive A's move");
         assert_eq!(l.offer(B, None, later), Some(ip));
     }
 
