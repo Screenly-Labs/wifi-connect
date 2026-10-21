@@ -216,6 +216,23 @@ When the flag is unset the pages link nothing at all and stay a single
 request, which is what makes them work in a captive-portal mini-browser with
 no internet behind it.
 
+## Exit codes
+
+A run ends in one of these. They matter to whoever writes the unit file:
+`0`, `3`, `4` and `6` are endings nobody can act on from a service manager,
+and belong in `SuccessExitStatus=`. The rest are worth surfacing as a
+failed unit.
+
+| code | meaning | actionable? |
+| --- | --- | --- |
+| 0 | joined, already online, or asked to stop | no |
+| 1 | anything not listed below | yes |
+| 3 | no WiFi device on this machine | no — nothing to configure |
+| 4 | adapter cannot do AP mode, is unmanaged, or the radio is blocked | no — a hardware fact |
+| 5 | NetworkManager is unreachable over the bus | yes |
+| 6 | the activity timeout elapsed with no join | no — the ordinary "nobody came" ending |
+| 7 | the portal could not bind its address or port | yes — it will recur until something changes |
+
 ## Requirements and limitations
 
 - **NetworkManager is required.** This tool drives it; it does not replace it.
