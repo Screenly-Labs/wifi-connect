@@ -20,11 +20,14 @@ use rand::{RngExt, rng};
 use crate::secret::Secret;
 
 /// Unambiguous alphanumerics: no `0`/`O`, `1`/`l`/`I`, `5`/`S`, `8`/`B`, and
-/// nothing that needs QR escaping. 49 symbols => log2(49) ≈ 5.61 bits each.
+/// nothing that needs QR escaping. 51 symbols (25 lowercase without `l`, 22
+/// uppercase without `B`/`I`/`O`/`S`, digits `3 4 6 7`) => log2(51) ≈ 5.67
+/// bits each. The count, uniqueness and exclusions are pinned by tests.
 const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzACDEFGHJKLMNPQRTUVWXYZ3467";
 
-/// 14 symbols ≈ 78 bits. Comfortably inside WPA-PSK's 8..=63 character limit
-/// with room for the operator to not think about it.
+/// 14 symbols × log2(51) ≈ 79.4 bits (a test pins it at ≥ 78). Comfortably
+/// inside WPA-PSK's 8..=63 character limit with room for the operator to not
+/// think about it.
 const DEFAULT_LEN: usize = 14;
 
 /// WPA-PSK passphrases are 8..=63 ASCII characters (a 64-character value is
@@ -123,6 +126,44 @@ mod tests {
                 *c as char
             );
         }
+    }
+
+    /// The generator draws only from `ALPHABET`, so this is the structural
+    /// guarantee behind the sampled QR-escaping test above.
+    #[test]
+    fn alphabet_excludes_qr_structural_characters() {
+        for c in br#"\;,:""# {
+            assert!(
+                !ALPHABET.contains(c),
+                "QR-structural character {:?} is in the alphabet",
+                *c as char
+            );
+        }
+    }
+
+    /// The doc comment on `ALPHABET` states a symbol count and derives the
+    /// entropy figure from it. Adding or dropping a symbol must update both,
+    /// rather than let the comment drift from the code again.
+    #[test]
+    fn alphabet_size_matches_documented_count() {
+        assert_eq!(ALPHABET.len(), 51);
+    }
+
+    /// A duplicated symbol would skew the distribution (that symbol drawn
+    /// twice as often) and make `ALPHABET.len()` overstate the entropy.
+    #[test]
+    fn alphabet_symbols_are_unique() {
+        let set: HashSet<u8> = ALPHABET.iter().copied().collect();
+        assert_eq!(set.len(), ALPHABET.len(), "alphabet has a duplicate");
+    }
+
+    /// Uniform, independent draws give `len * log2(|alphabet|)` bits. Pin the
+    /// documented floor so shrinking the alphabet or the default length cannot
+    /// quietly weaken the generated passphrase.
+    #[test]
+    fn default_passphrase_has_at_least_78_bits_of_entropy() {
+        let bits = DEFAULT_LEN as f64 * (ALPHABET.len() as f64).log2();
+        assert!(bits >= 78.0, "only {bits:.2} bits of entropy");
     }
 
     #[test]
