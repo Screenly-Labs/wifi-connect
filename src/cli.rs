@@ -21,7 +21,9 @@ use crate::nm::ApSecurity;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum SecurityMode {
-    /// WPA2-PSK (CCMP) — the interoperable default. Same as `wpa2`.
+    /// Currently identical to `wpa2`: WPA2-PSK (CCMP). The name reserves the
+    /// right to pick the strongest mode the adapter *reliably* supports once
+    /// there is a trustworthy way to tell; nothing does that today.
     Auto,
     Wpa2,
     Wpa3,
@@ -63,8 +65,10 @@ pub struct Cli {
 
     /// Security for the setup access point.
     ///
-    /// `auto` (the default) and `wpa2` both raise a WPA2-PSK/CCMP access
-    /// point — the mode every client and every target chipset handle.
+    /// `auto` (the default) currently raises a WPA2-PSK/CCMP access point,
+    /// exactly like `wpa2` — the mode every client and every target chipset
+    /// handle. It is reserved for picking the best mode the adapter reliably
+    /// supports; it does not probe the adapter or upgrade to WPA3 today.
     /// `wpa3` raises a WPA3-SAE access point; it is opt-in because AP-mode
     /// SAE on the brcmfmac radios in every Raspberry Pi is unreliable in
     /// practice (the AP comes up but clients fail to associate), so it is
@@ -229,7 +233,9 @@ impl Cli {
     /// The access point's security mode, as the settings builder wants it.
     ///
     /// `auto` and `wpa2` both map to WPA2-PSK; only an explicit `wpa3`
-    /// selects SAE. See [`SecurityMode`] for why `auto` is not SAE.
+    /// selects SAE. See [`SecurityMode`] for why `auto` is not SAE. Nothing
+    /// revisits this choice later: the value returned here is the one the
+    /// access point is raised with.
     pub fn ap_security(&self) -> ApSecurity {
         match self.portal_security {
             SecurityMode::Wpa3 => ApSecurity::Wpa3Sae,
@@ -457,7 +463,12 @@ mod tests {
             cli(&["--portal-security", "wpa2"]).ap_security(),
             ApSecurity::Wpa2Psk
         );
-        // auto starts at WPA2 and is upgraded once the adapter is known.
+        // auto is WPA2-PSK, full stop. Nothing upgrades it once the adapter
+        // is known: AP-mode SAE on brcmfmac (every Raspberry Pi) comes up
+        // but clients fail to associate, and the AP cannot observe that
+        // failure, so there is no safe signal to upgrade on. If auto ever
+        // learns to pick SAE, this assertion is the one that must change,
+        // deliberately.
         assert_eq!(
             cli(&["--portal-security", "auto"]).ap_security(),
             ApSecurity::Wpa2Psk
