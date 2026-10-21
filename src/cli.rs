@@ -22,7 +22,7 @@ use crate::nm::ApSecurity;
 #[value(rename_all = "lowercase")]
 pub enum SecurityMode {
     /// Currently identical to `wpa2`: WPA2-PSK (CCMP). The name reserves the
-    /// right to pick the strongest mode the adapter *reliably* supports once
+    /// right to pick the strongest mode the adapter reliably supports once
     /// there is a trustworthy way to tell; nothing does that today.
     Auto,
     Wpa2,
@@ -233,9 +233,9 @@ impl Cli {
     /// The access point's security mode, as the settings builder wants it.
     ///
     /// `auto` and `wpa2` both map to WPA2-PSK; only an explicit `wpa3`
-    /// selects SAE. See [`SecurityMode`] for why `auto` is not SAE. Nothing
-    /// revisits this choice later: the value returned here is the one the
-    /// access point is raised with.
+    /// selects SAE. See [`Cli::portal_security`] for why `auto` is not SAE.
+    /// Nothing revisits this choice later: the value returned here is the
+    /// one the access point is raised with.
     pub fn ap_security(&self) -> ApSecurity {
         match self.portal_security {
             SecurityMode::Wpa3 => ApSecurity::Wpa3Sae,
@@ -464,11 +464,11 @@ mod tests {
             ApSecurity::Wpa2Psk
         );
         // auto is WPA2-PSK, full stop. Nothing upgrades it once the adapter
-        // is known: AP-mode SAE on brcmfmac (every Raspberry Pi) comes up
-        // but clients fail to associate, and the AP cannot observe that
-        // failure, so there is no safe signal to upgrade on. If auto ever
-        // learns to pick SAE, this assertion is the one that must change,
-        // deliberately.
+        // is known: AP-mode SAE on brcmfmac (every Raspberry Pi with
+        // built-in Wi-Fi) comes up but clients fail to associate, and the AP
+        // cannot observe that failure, so there is no safe signal to upgrade
+        // on. If auto ever learns to pick SAE, this assertion is the one
+        // that must change, deliberately.
         assert_eq!(
             cli(&["--portal-security", "auto"]).ap_security(),
             ApSecurity::Wpa2Psk

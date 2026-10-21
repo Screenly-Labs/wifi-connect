@@ -129,8 +129,9 @@ Every flag has an environment variable. Flags win.
 WPA2-PSK (CCMP), identical to `wpa2`; the name is reserved for picking the
 best mode the adapter reliably supports, but it does not probe the adapter
 or upgrade to WPA3 today. `wpa3` (SAE) is opt-in because AP-mode SAE on the
-`brcmfmac` radio in every Raspberry Pi comes up but clients fail to
-associate, and the access point cannot see that failure to fall back.
+`brcmfmac` radio in every Raspberry Pi with built-in Wi-Fi comes up but
+clients fail to associate, and the access point cannot see that failure to
+fall back.
 
 ### Migrating from balena wifi-connect
 
