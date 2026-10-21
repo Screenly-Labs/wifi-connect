@@ -122,8 +122,7 @@ impl NmrsControl {
     ) -> Result<JoinOutcome, NetworkError> {
         use nmrs::builders::{WifiConnectionBuilder, WifiMode};
 
-        let ssid = request.ssid.to_display_string();
-        let mut builder = WifiConnectionBuilder::new(ssid.clone())
+        let mut builder = WifiConnectionBuilder::new(request.ssid.to_display_string())
             .mode(WifiMode::Infrastructure)
             .hidden(request.hidden)
             .autoconnect(true)
@@ -152,6 +151,13 @@ impl NmrsControl {
         // nmrs waits for activation here under its own 30 s timeout, which
         // knows nothing of our budget; cap it, so a fallback attempt given
         // the remainder of one cannot overrun it.
+        //
+        // `Ok` means the active connection reached ACTIVATED (nmrs's
+        // `wait_for_connection_activation` succeeds on nothing else), so it
+        // is the whole answer. No follow-up `is_connected` poll: that reads
+        // the SSID of the *first* WiFi device with an access point, which on
+        // a second radio is some other network, and the poll would then run
+        // a second full budget and delete the profile that just came up.
         let activated = tokio::time::timeout(
             budget,
             self.nm
@@ -159,36 +165,19 @@ impl NmrsControl {
         )
         .await;
         let failure = match activated {
-            Ok(Ok(_)) => None,
+            Ok(Ok(_)) => return Ok(JoinOutcome::Joined),
             Ok(Err(e)) => {
                 debug!(error = %e, "activating our own station profile failed");
-                Some(classify_failure(&e))
+                classify_failure(&e)
             }
-            Err(_) => Some(JoinFailure::Timeout),
+            Err(_) => JoinFailure::Timeout,
         };
-        if let Some(failure) = failure {
-            // `add_and_activate_connection` persists the profile before it
-            // reports the failure, so delete it rather than leaving an
-            // autoconnect-enabled bad profile behind.
-            self.delete_profile_quietly(&uuid).await;
-            return Ok(JoinOutcome::Failed(failure));
-        }
-
-        let deadline = tokio::time::Instant::now() + budget;
-        loop {
-            if self.nm.is_connected(&ssid).await.unwrap_or(false) {
-                return Ok(JoinOutcome::Joined);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                // The profile was created with autoconnect on; left behind,
-                // NetworkManager would keep retrying a known-bad network on
-                // every scan. Clean up on the way out so this path does not
-                // rely on the caller to do it.
-                self.delete_profile_quietly(&uuid).await;
-                return Ok(JoinOutcome::Failed(JoinFailure::Timeout));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        // The profile is persisted before activation can fail, with
+        // autoconnect on; left behind, NetworkManager would keep retrying a
+        // known-bad network on every scan. Delete it here so this path does
+        // not rely on the caller to do it.
+        self.delete_profile_quietly(&uuid).await;
+        Ok(JoinOutcome::Failed(failure))
     }
 
     /// Delete a saved connection by UUID, swallowing "nothing to delete".
