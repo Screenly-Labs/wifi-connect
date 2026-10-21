@@ -317,6 +317,24 @@ mod tests {
         );
     }
 
+    /// A pool ending at 255.255.255.255 must be searched to its end and then
+    /// stop: the lazy range must neither overflow past `u32::MAX` nor skip
+    /// the last address.
+    #[test]
+    fn a_pool_ending_at_the_top_of_the_address_space_is_exhausted_cleanly() {
+        let mut l = Leases::new(
+            Ipv4Addr::new(255, 255, 255, 254),
+            Ipv4Addr::new(255, 255, 255, 255),
+        );
+        let now = Instant::now();
+        let first = l.offer(A, None, now).unwrap();
+        l.commit(A, first, now);
+        assert_eq!(first, Ipv4Addr::new(255, 255, 255, 254));
+        assert_eq!(l.offer(B, None, now), Some(Ipv4Addr::BROADCAST));
+        l.commit(B, Ipv4Addr::BROADCAST, now);
+        assert_eq!(l.offer([0x02, 0, 0, 0, 0, 0x03], None, now), None);
+    }
+
     #[test]
     fn committing_a_new_address_releases_the_old_one() {
         let mut l = pool();
