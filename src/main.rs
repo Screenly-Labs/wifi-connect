@@ -17,6 +17,7 @@ mod dns;
 mod http;
 mod nm;
 mod passphrase;
+mod private_file;
 mod qr;
 mod secret;
 mod sockets;
@@ -33,7 +34,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, LogFormat};
-use nm::nmrs_impl::NmrsControl;
+use nm::nmrs_impl::{EapServerCheck, NmrsControl};
 use secret::Secret;
 use ssid::Ssid;
 
@@ -80,25 +81,36 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
         }
     };
 
+    let mut wrote_qr_files = false;
     if let Some(dir) = &args.qr_output {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        // Both files carry the passphrase (the .txt in plain text), so they
+        // are written like a credential: not world-readable, and never
+        // through a symlink planted at the target. See private_file.
+        if let Err(e) = private_file::create_dir(dir) {
             error!(error = %e, path = %dir.display(), "could not create the QR output directory");
         } else {
             let svg = dir.join("wifi-connect-qr.svg");
-            match std::fs::write(&svg, code.to_svg(512)) {
-                Ok(()) => info!(path = %svg.display(), "wrote the join QR code"),
+            match private_file::write(&svg, code.to_svg(512).as_bytes()) {
+                Ok(()) => {
+                    info!(path = %svg.display(), "wrote the join QR code");
+                    wrote_qr_files = true;
+                }
                 Err(e) => error!(error = %e, path = %svg.display(), "could not write the QR code"),
             }
             // The raw payload too, so a host application can render the
             // code itself at whatever size its screen wants.
             let txt = dir.join("wifi-connect-qr.txt");
-            if let Err(e) = std::fs::write(&txt, &payload) {
-                error!(error = %e, path = %txt.display(), "could not write the QR payload");
+            match private_file::write(&txt, payload.as_bytes()) {
+                Ok(()) => wrote_qr_files = true,
+                Err(e) => {
+                    error!(error = %e, path = %txt.display(), "could not write the QR payload")
+                }
             }
         }
     }
 
-    if !args.no_qr_stdout {
+    let to_stdout = args.print_qr_to_stdout(std::io::stdout().is_terminal(), wrote_qr_files);
+    if to_stdout {
         // Printed, not logged: a log formatter would mangle the block
         // characters and a journald line-wrap would make it unscannable.
         println!();
@@ -106,16 +118,41 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
         println!();
         print!("{}", code.to_unicode());
         println!();
+    } else if !args.no_qr_stdout {
+        info!(
+            "not printing the join QR to stdout: it is not a terminal, so it is \
+             probably a log, and the --qr-output files already publish it \
+             (pass --qr-stdout to print it anyway)"
+        );
     }
 
-    // The fallback for anyone whose scanner refuses, and for operators
-    // reading the journal. The passphrase is deliberately exposed here and
-    // nowhere else: this is the one place it is meant to be read.
-    info!(
-        ssid = %ssid,
-        passphrase = %passphrase.expose(),
-        "setup access point credentials"
-    );
+    // The passphrase stays out of the logs unless the operator opts in.
+    // Logs travel further than the screen — journald, `docker logs`, a
+    // fleet manager's log shipping — and the passphrase is what gets you
+    // onto the setup network and therefore to the portal. An explicit flag
+    // rather than DEBUG level, because raising the log level is what you do
+    // to troubleshoot a misbehaving radio, and that should not quietly
+    // start shipping a credential.
+    if args.log_passphrase {
+        info!(
+            ssid = %ssid,
+            passphrase = %passphrase.expose(),
+            "setup access point credentials"
+        );
+    } else {
+        info!(
+            ssid = %ssid,
+            qr_output = args.qr_output.as_ref().map(|d| d.display().to_string()),
+            "the setup access point's passphrase is in the join QR \
+             (pass --log-passphrase to also log it)"
+        );
+        if !wrote_qr_files && !to_stdout {
+            warn!(
+                "the setup passphrase is not published anywhere: set --qr-output, \
+                 drop --no-qr-stdout, or pass --log-passphrase"
+            );
+        }
+    }
 }
 
 /// The /24 broadcast address for a gateway.
@@ -154,7 +191,17 @@ async fn run() -> ExitCode {
     let ssid = Ssid::from(args.portal_ssid.as_str());
     publish_qr(&args, &ssid, passphrase.as_ref());
 
-    let nm = match NmrsControl::connect().await {
+    let eap_server_check = if args.insecure_eap_skip_server_verification {
+        warn!(
+            "enterprise WiFi server verification is OFF: any access point \
+             copying the network's name can capture the user's credentials"
+        );
+        EapServerCheck::Insecure
+    } else {
+        EapServerCheck::SystemCa
+    };
+
+    let nm = match NmrsControl::connect(eap_server_check).await {
         Ok(nm) => nm,
         Err(e) => {
             error!("{e}");
@@ -205,13 +252,34 @@ async fn run() -> ExitCode {
         },
     };
 
-    let (shared, joins) = state::Shared::new(args.portal_url(), args.brand_name.clone(), brand_css);
+    let brand_logo = match &args.brand_logo {
+        None => None,
+        Some(path) => match read_brand_logo(path) {
+            Ok(logo) => Some(logo),
+            Err(e) => {
+                error!(error = %e, path = %path.display(), "could not read --brand-logo");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    let branding = state::Branding {
+        css: brand_css,
+        logo: brand_logo,
+        theme: args.default_theme,
+        ..state::Branding::new(args.brand_name.clone())
+    };
+    let (shared, joins) = state::Shared::new(args.portal_url(), branding);
     let cancel = CancellationToken::new();
 
-    // DHCP, DNS and HTTP. DHCP is pinned to the access-point interface;
-    // DNS and HTTP bind the gateway address specifically. None of the three
-    // can touch another interface on this device, which matters when the
-    // box also has a live ethernet link to a customer LAN.
+    // DHCP, DNS and HTTP. All three are pinned to the access-point interface
+    // with SO_BINDTODEVICE; DNS and HTTP additionally bind the gateway
+    // address. The pin is what keeps them off every other interface on this
+    // device, which matters when the box also has a live ethernet link to a
+    // customer LAN: the gateway address alone would not, because Linux
+    // accepts a packet for any local address on any interface, so a LAN host
+    // with a static route via our ethernet address could otherwise reach the
+    // portal (and its unauthenticated POST /connect).
     let servers = {
         let cancel = cancel.clone();
         let gateway = args.portal_gateway;
@@ -221,6 +289,17 @@ async fn run() -> ExitCode {
         let shared = shared.clone();
 
         tokio::spawn(async move {
+            // Not before the access point is up. DNS and HTTP bind the
+            // gateway address, which only exists once NetworkManager has
+            // activated the AP — after the scan and the activation, which
+            // on a slow radio together outlast the bind retry budget.
+            // Starting the clock here instead failed the portal with
+            // EADDRNOTAVAIL and crash-looped the daemon.
+            tokio::select! {
+                () = cancel.cancelled() => return None,
+                () = shared.ap_raised() => {}
+            }
+
             let leases = dhcp::lease::Leases::new(dhcp_range.first, dhcp_range.last);
             let dhcp_cfg = dhcp::reply::ServerConfig {
                 gateway,
@@ -230,8 +309,13 @@ async fn run() -> ExitCode {
             };
 
             let dhcp = dhcp::serve(&interface, 67, dhcp_cfg, leases, cancel.clone());
-            let dns = dns::serve(gateway, 53, cancel.clone());
-            let portal = http::serve(SocketAddr::from((gateway, port)), shared, cancel.clone());
+            let dns = dns::serve(&interface, gateway, 53, cancel.clone());
+            let portal = http::serve(
+                &interface,
+                SocketAddr::from((gateway, port)),
+                shared,
+                cancel.clone(),
+            );
 
             // Any one of the three failing makes the portal useless. Cancel
             // the run so the access point comes back down and the exit code
@@ -288,6 +372,58 @@ async fn run() -> ExitCode {
     };
 
     ExitCode::from(app::report(&result) as u8)
+}
+
+/// The largest logo worth serving over a setup hotspot.
+///
+/// Generous for an SVG or a sensibly exported PNG, and small enough that
+/// a wrong path — someone's 4 MB press-kit render — is caught at boot
+/// rather than making the one page a stranded device can show slow to
+/// load on a phone that has just joined an access point.
+const BRAND_LOGO_MAX_BYTES: u64 = 256 * 1024;
+
+/// Read `--brand-logo` and decide what to serve it as.
+///
+/// The content type comes from the extension rather than sniffing the
+/// bytes: the file is operator-supplied, the set we accept is four
+/// formats, and a wrong extension is a mistake worth reporting at boot
+/// instead of quietly serving a PNG labelled as an SVG.
+fn read_brand_logo(path: &std::path::Path) -> std::io::Result<state::BrandLogo> {
+    use std::io::{Error, ErrorKind};
+
+    let content_type = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        other => {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "unsupported logo format {:?}; use svg, png, jpeg or webp",
+                    other.unwrap_or("(none)")
+                ),
+            ));
+        }
+    };
+
+    let size = std::fs::metadata(path)?.len();
+    if size > BRAND_LOGO_MAX_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("logo is {size} bytes; the limit is {BRAND_LOGO_MAX_BYTES}"),
+        ));
+    }
+
+    Ok(state::BrandLogo {
+        bytes: std::fs::read(path)?.into(),
+        content_type,
+    })
 }
 
 // current_thread: there is no CPU work in this program, and one thread

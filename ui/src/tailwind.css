@@ -133,6 +133,16 @@
     box-shadow: 0 1px 2px var(--a-ink-04);
   }
 
+  /* Bounded by height, not width: an integrator's logo can be any aspect
+   * ratio, and the header has to stay the same height whichever they
+   * bring. max-width keeps a very wide wordmark inside the card on a
+   * narrow phone. */
+  .brand-logo {
+    height: 1.75rem;
+    width: auto;
+    max-width: 100%;
+  }
+
   .hdr {
     display: flex;
     flex-direction: column;
@@ -161,7 +171,11 @@
   }
 
   .nets > legend {
-    padding: 0 0 0.5rem;
+    /* Matches .field's 1rem. Without the top and side padding the legend
+     * sits hard against the card's top border while every other block in
+     * the card is inset, which reads as a rendering fault rather than a
+     * heading. */
+    padding: 1rem 1rem 0.5rem;
     font-weight: 600;
   }
 
@@ -278,8 +292,42 @@
     min-height: 2.75rem;
     display: flex;
     align-items: center;
+    gap: 0.5rem;
     color: var(--color-fg-muted);
     cursor: pointer;
+  }
+
+  /* display:flex on a <summary> suppresses the native disclosure marker,
+   * so without this the row is a line of grey text with nothing to say it
+   * opens — and the one network you cannot see in the list is the one it
+   * is for. Drawn rather than a glyph: no emoji font to depend on, and it
+   * rotates to show state. */
+  .hidden-net > summary::after {
+    content: "";
+    width: 0.5rem;
+    height: 0.5rem;
+    margin-left: auto;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: rotate(-45deg);
+    transition: transform 120ms ease;
+  }
+
+  .hidden-net[open] > summary::after {
+    transform: rotate(45deg);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .hidden-net > summary::after {
+      transition: none;
+    }
+  }
+
+  /* The native control, tinted. Left alone it paints the browser's own
+   * blue, which survives every role token an integrator sets and is the
+   * one spot of stock colour left on a rebranded page. */
+  .net input[type="radio"] {
+    accent-color: var(--color-accent);
   }
 
   /* Signal bars. Four spans; the lit ones carry .on. Strength is ALSO

@@ -14,8 +14,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+use crate::cli::ThemeMode;
 use crate::nm::{JoinFailure, JoinRequest, WifiNetwork};
 
 /// What the portal is doing, as the browser sees it.
@@ -47,10 +48,24 @@ pub struct Shared {
     /// a second submission while one is in flight is rejected rather than
     /// queued, so a double-tapped button cannot queue two joins.
     join_tx: mpsc::Sender<JoinRequest>,
+    /// Latched to `true` the first time the access point is up, which is
+    /// the first moment the gateway address exists to be bound.
+    ap_raised: Arc<watch::Sender<bool>>,
     /// The URL a client should be redirected to.
     pub portal_url: String,
-    /// The product name shown in the page, for white-labelling.
-    pub brand_name: String,
+    /// Everything an integrator can change about how the portal looks.
+    pub branding: Branding,
+}
+
+/// The white-labelling surface, resolved at startup.
+///
+/// One struct rather than four parameters because it keeps growing, and
+/// because every field is settled before the first request and never
+/// changes afterwards.
+#[derive(Clone)]
+pub struct Branding {
+    /// The product name shown in the page.
+    pub name: String,
     /// The integrator's stylesheet, served at `/brand.css`.
     ///
     /// Read once at startup rather than per request: it is a handful of
@@ -58,15 +73,49 @@ pub struct Shared {
     /// eagerly means a typo in `--brand-css` fails at boot with a clear
     /// message instead of silently serving an unbranded portal to every
     /// client. `Arc<str>` because `Shared` is cloned into every handler.
-    pub brand_css: Option<Arc<str>>,
+    pub css: Option<Arc<str>>,
+    /// The integrator's logo, served at `/brand-logo`.
+    ///
+    /// A route rather than a data: URI inlined into the page: it keeps the
+    /// HTML small whether or not a logo is set, and a logo that fails to
+    /// load degrades to its alt text, where a stylesheet that fails to
+    /// load would leave the page unstyled.
+    pub logo: Option<BrandLogo>,
+    /// Which theme the page starts in.
+    ///
+    /// `System` follows the phone and leaves the in-page toggle on;
+    /// anything else pins the page and takes the toggle away. A captive
+    /// portal is open for a minute to get a device onto WiFi, and which
+    /// of two colour schemes it uses is the integrator's decision, not
+    /// something to ask the person holding the phone.
+    pub theme: ThemeMode,
+}
+
+/// An image and the content type to serve it as.
+///
+/// Read at startup like the stylesheet, so a mistyped path stops the
+/// portal with the path in the message instead of serving a broken image
+/// to every client.
+#[derive(Clone)]
+pub struct BrandLogo {
+    pub bytes: Arc<[u8]>,
+    pub content_type: &'static str,
+}
+
+impl Branding {
+    /// Defaults: no stylesheet, no logo, and follow the phone's setting.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            css: None,
+            logo: None,
+            theme: ThemeMode::System,
+        }
+    }
 }
 
 impl Shared {
-    pub fn new(
-        portal_url: String,
-        brand_name: String,
-        brand_css: Option<Arc<str>>,
-    ) -> (Self, mpsc::Receiver<JoinRequest>) {
+    pub fn new(portal_url: String, branding: Branding) -> (Self, mpsc::Receiver<JoinRequest>) {
         let (join_tx, join_rx) = mpsc::channel(1);
         (
             Self {
@@ -76,9 +125,9 @@ impl Shared {
                     attempts: 0,
                 })),
                 join_tx,
+                ap_raised: Arc::new(watch::Sender::new(false)),
                 portal_url,
-                brand_name,
-                brand_css,
+                branding,
             },
             join_rx,
         )
@@ -122,6 +171,25 @@ impl Shared {
         };
     }
 
+    /// Record that the access point is up. Idempotent: only the first call
+    /// after startup changes anything.
+    pub fn mark_ap_raised(&self) {
+        self.ap_raised.send_replace(true);
+    }
+
+    /// Resolve once the access point has been up at least once.
+    ///
+    /// DNS and HTTP bind the gateway address, which does not exist until
+    /// NetworkManager has activated the AP. Before that comes the scan and
+    /// the activation itself, together easily longer than any fixed bind
+    /// retry budget on a slow radio, so the servers wait for this instead
+    /// of guessing.
+    pub async fn ap_raised(&self) {
+        let mut rx = self.ap_raised.subscribe();
+        // Only fails if the sender is dropped, and `self` holds it.
+        let _ = rx.wait_for(|up| *up).await;
+    }
+
     /// Is a join already running? Used to answer 409 rather than start a
     /// second one.
     pub fn is_joining(&self) -> bool {
@@ -153,7 +221,7 @@ mod tests {
     use crate::ssid::Ssid;
 
     fn shared() -> (Shared, mpsc::Receiver<JoinRequest>) {
-        Shared::new("http://192.168.42.1/".into(), "WiFi Connect".into(), None)
+        Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"))
     }
 
     fn request(ssid: &str) -> JoinRequest {
@@ -161,6 +229,7 @@ mod tests {
             ssid: Ssid::from(ssid),
             identity: None,
             passphrase: Some(crate::secret::Secret::new("abcdefgh")),
+            server_domain: None,
             hidden: false,
         }
     }
@@ -171,6 +240,21 @@ mod tests {
         assert_eq!(s.state(), PortalState::Portal);
         assert_eq!(s.attempts(), 0);
         assert!(s.networks().is_empty());
+    }
+
+    /// The servers bind the gateway address only after this resolves, so
+    /// it must not resolve early — and once raised, a later wait (a server
+    /// task scheduled after the AP came up) must not block.
+    #[tokio::test(start_paused = true)]
+    async fn ap_raised_waits_for_the_first_raise_and_then_stays_raised() {
+        let (s, _rx) = shared();
+        let early = tokio::time::timeout(std::time::Duration::from_secs(60), s.ap_raised()).await;
+        assert!(early.is_err(), "resolved before the AP was raised");
+
+        s.mark_ap_raised();
+        s.ap_raised().await;
+        s.mark_ap_raised();
+        s.ap_raised().await;
     }
 
     #[tokio::test]

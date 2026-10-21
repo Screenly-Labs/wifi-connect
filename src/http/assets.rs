@@ -8,16 +8,17 @@
 //! the committed output has drifted.
 //!
 //! Rendering is literal token substitution, not a template engine. There are
-//! four tokens and the page is a fixed shape; a dependency that could render
-//! arbitrary templates would be more machinery than the problem has.
+//! a handful of tokens and the page is a fixed shape; a dependency that could
+//! render arbitrary templates would be more machinery than the problem has.
 
 use axum::extract::Path;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use crate::cli::ThemeMode;
 use crate::nm::WifiNetwork;
 use crate::nm::security::Security;
-use crate::state::PortalState;
+use crate::state::{Branding, PortalState};
 
 #[derive(rust_embed::Embed)]
 #[folder = "ui/dist/"]
@@ -153,46 +154,268 @@ fn render_brand_css(branded: bool) -> &'static str {
     }
 }
 
+/// The `data-theme` attribute for `<html>`, or nothing.
+///
+/// `System` emits nothing and lets the boot script and
+/// `prefers-color-scheme` decide. Anything else pins the page here, server
+/// side, so it is right in the very first paint — a class added later would
+/// flash the wrong scheme on a page the user sees for ten seconds.
+fn render_theme_attr(theme: ThemeMode) -> &'static str {
+    match theme {
+        ThemeMode::System => "",
+        ThemeMode::Light => " data-theme=\"light\"",
+        ThemeMode::Dark => " data-theme=\"dark\"",
+    }
+}
+
+/// The in-page theme switcher, or nothing.
+///
+/// Emitted ONLY when the theme is `System`. When an integrator has pinned
+/// one, the control would offer to undo a decision that is theirs to make,
+/// on a page whose whole job is to get a device onto WiFi and go away.
+fn render_theme_toggle(theme: ThemeMode) -> &'static str {
+    match theme {
+        ThemeMode::System => {
+            "<button class=\"link-btn\" type=\"button\" id=\"theme-toggle\" hidden>Switch theme</button>"
+        }
+        _ => "",
+    }
+}
+
+/// The page heading: the logo if there is one, else the product name.
+///
+/// The logo replaces the name rather than sitting above it — a wordmark
+/// under a wordmark is what the Anthias splash screen deliberately does
+/// not do — and carries the name as alt text, so the heading still reads
+/// correctly to a screen reader and to anyone whose image did not load.
+fn render_brand_heading(branding: &Branding) -> String {
+    match branding.logo {
+        None => escape(&branding.name),
+        Some(_) => format!(
+            r#"<img class="brand-logo" src="/brand-logo" alt="{}" />"#,
+            escape(&branding.name)
+        ),
+    }
+}
+
+/// Fill a template's `{{NAME}}` tokens in a single left-to-right pass.
+///
+/// One pass, not a chain of `str::replace`: each `replace` scans the output
+/// of the one before it, so a value substituted early was re-read as
+/// template by every later pass. A neighbouring network broadcasting the
+/// SSID `{{BANNER}}` got the banner spliced into the network list; a brand
+/// name containing `{{NETWORKS}}` got the whole network list. Escaping does
+/// not help — braces are not HTML-special — so the fix is structural: a
+/// value, once emitted, is never looked at again.
+///
+/// An unknown token is kept literally rather than asserted on. The page
+/// inlines its stylesheet and script, which are not ours to parse and may
+/// one day contain a `{{` of their own; mangling those, or panicking a
+/// request over them, would be worse than leaving them alone. A token the
+/// template uses but no render supplies is caught instead by the
+/// `every_render_substitutes_every_token` test.
+fn render(template: &str, tokens: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let known = after.find("}}").and_then(|close| {
+            let name = &after[..close];
+            tokens
+                .iter()
+                .find(|(token, _)| *token == name)
+                .map(|(_, value)| (*value, close))
+        });
+        match known {
+            Some((value, close)) => {
+                out.push_str(value);
+                rest = &after[close + 2..];
+            }
+            None => {
+                // Not a token we know: emit ONE brace and resume at the
+                // second, so a stray `{{` cannot swallow a real token after
+                // it. Skipping both would miss the token in `{{{SSID}}}`,
+                // whose first `{{` is a brace short of `{{SSID}}`.
+                out.push('{');
+                rest = &rest[open + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Render one embedded page: the tokens every page shares, plus its own.
+fn render_page(name: &str, branding: &Branding, page_tokens: &[(&str, &str)]) -> String {
+    let heading = render_brand_heading(branding);
+    let brand_name = escape(&branding.name);
+    let mut tokens = vec![
+        ("BRAND_HEADING", heading.as_str()),
+        ("BRAND_NAME", brand_name.as_str()),
+        ("BRAND_CSS", render_brand_css(branding.css.is_some())),
+        ("THEME_ATTR", render_theme_attr(branding.theme)),
+        ("THEME_TOGGLE", render_theme_toggle(branding.theme)),
+    ];
+    tokens.extend_from_slice(page_tokens);
+    render(&template(name), &tokens)
+}
+
 /// Render the portal page.
-pub fn render_index(
-    brand: &str,
-    networks: &[WifiNetwork],
-    state: &PortalState,
-    branded: bool,
-) -> String {
-    template("index.html")
-        .replace("{{BRAND_NAME}}", &escape(brand))
-        .replace("{{BRAND_CSS}}", render_brand_css(branded))
-        .replace("{{NETWORKS}}", &render_networks(networks))
-        .replace("{{BANNER}}", &render_banner(state))
+pub fn render_index(branding: &Branding, networks: &[WifiNetwork], state: &PortalState) -> String {
+    render_page(
+        "index.html",
+        branding,
+        &[
+            ("NETWORKS", &render_networks(networks)),
+            ("BANNER", &render_banner(state)),
+        ],
+    )
 }
 
 /// Render the portal page carrying a validation error.
 pub fn render_index_with_error(
-    brand: &str,
+    branding: &Branding,
     networks: &[WifiNetwork],
     error: &str,
-    branded: bool,
 ) -> String {
-    template("index.html")
-        .replace("{{BRAND_NAME}}", &escape(brand))
-        .replace("{{BRAND_CSS}}", render_brand_css(branded))
-        .replace("{{NETWORKS}}", &render_networks(networks))
-        .replace(
-            "{{BANNER}}",
-            &format!(
-                "<div class=\"banner\" role=\"alert\">{}</div>",
-                escape(error)
-            ),
-        )
+    let banner = format!(
+        "<div class=\"banner\" role=\"alert\">{}</div>",
+        escape(error)
+    );
+    render_page(
+        "index.html",
+        branding,
+        &[
+            ("NETWORKS", &render_networks(networks)),
+            ("BANNER", &banner),
+        ],
+    )
 }
 
 /// Render the "connecting…" page.
-pub fn render_connecting(brand: &str, ssid: &str, branded: bool) -> String {
-    template("connecting.html")
-        .replace("{{BRAND_NAME}}", &escape(brand))
-        .replace("{{BRAND_CSS}}", render_brand_css(branded))
-        .replace("{{SSID}}", &escape(ssid))
+pub fn render_connecting(branding: &Branding, ssid: &str) -> String {
+    render_page("connecting.html", branding, &[("SSID", &escape(ssid))])
+}
+
+/// The hashes of the inline `<script>` and `<style>` blocks, as written by
+/// ui/build.ts into `ui/dist/csp.json`.
+#[derive(Debug, Default, serde::Deserialize)]
+struct InlineHashes {
+    script: Vec<String>,
+    style: Vec<String>,
+}
+
+/// Is `source` a CSP hash source we are willing to put in a header?
+///
+/// The file is ours and committed, but a header value built from it must
+/// not be able to smuggle a `;` and a new directive in, so anything that is
+/// not exactly `'sha256-<base64>'` is dropped rather than trusted.
+fn is_sha256_source(source: &str) -> bool {
+    source
+        .strip_prefix("'sha256-")
+        .and_then(|s| s.strip_suffix('\''))
+        .is_some_and(|b64| {
+            !b64.is_empty()
+                && b64
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='))
+        })
+}
+
+/// Build the policy from the embedded hashes.
+///
+/// Inline script and style are allowed by hash (the `'unsafe-inline'` next
+/// to them is a CSP 1.0 fallback that any hash switches off), so the only
+/// script that runs is the script we built. That is the backstop for
+/// the token substitution above: if an SSID ever did slip through
+/// unescaped, the `<script>` it injected would not match a hash.
+///
+/// Directive by directive:
+///
+/// - `style-src 'self'`: the optional `/brand.css` link.
+/// - `img-src 'self' data:`: `/brand-logo`, and any `data:` image a brand
+///   stylesheet uses (there is no internet to fetch anything else from).
+/// - `font-src 'self' data:`: likewise for a brand stylesheet's fonts.
+/// - `connect-src 'self'`: the connecting page polls `/api/status`.
+/// - `form-action 'self'`: the form posts to `/connect` on whatever host the
+///   page was loaded as — the portal IP, or a probe hostname such as
+///   captive.apple.com that our DNS answered with it. Both are 'self'.
+/// - `frame-ancestors 'none'`: nobody may frame the password form.
+/// - `base-uri 'none'`: an injected `<base>` cannot re-point `/connect`.
+///
+/// If the hashes are missing the policy still goes out, just with no script
+/// or style allowed: the only page that can be served in that state is the
+/// "assets missing" notice, which needs neither.
+fn build_content_security_policy() -> String {
+    let hashes: InlineHashes = Assets::get("csp.json")
+        .and_then(|f| serde_json::from_slice(f.data.as_ref()).ok())
+        .unwrap_or_default();
+
+    let sources = |list: &[String]| -> String {
+        list.iter()
+            .filter(|s| is_sha256_source(s))
+            .map(|s| format!(" {s}"))
+            .collect()
+    };
+    // `'unsafe-inline'` rides along with the hashes, never without them.
+    // CSP Level 2 and later ignore it whenever a hash is present, so every
+    // current browser enforces the hashes alone. A CSP 1.0 engine (iOS 9
+    // and older, the Chromium 30-33 WebView of Android 4.4) does not know
+    // hash sources: without the fallback it would see a directive with no
+    // source it understands, block the stylesheet and both scripts, and
+    // show an unstyled portal. With no hashes nothing would neutralise it,
+    // so then it is left out.
+    let with_fallback = |list: &[String]| -> String {
+        match sources(list) {
+            s if s.is_empty() => s,
+            s => format!(" 'unsafe-inline'{s}"),
+        }
+    };
+    let script = match with_fallback(&hashes.script) {
+        s if s.is_empty() => String::from(" 'none'"),
+        s => s,
+    };
+
+    format!(
+        "default-src 'none'; \
+         script-src{script}; \
+         style-src 'self'{style}; \
+         img-src 'self' data:; \
+         font-src 'self' data:; \
+         connect-src 'self'; \
+         form-action 'self'; \
+         frame-ancestors 'none'; \
+         base-uri 'none'",
+        style = with_fallback(&hashes.style),
+    )
+}
+
+/// The `Content-Security-Policy` for an SVG response (`/brand-logo`).
+///
+/// An SVG is a document, so it gets a policy of its own: no script, no
+/// network, no framing, but its own inline styling allowed. Exported logos
+/// colour themselves with `style="…"` attributes and `<style>` blocks; the
+/// page policy, which allows exactly one stylesheet by hash, would strip
+/// those and render the mark unstyled wherever it is applied to the SVG —
+/// opened directly, or by an engine that honours an image response's
+/// policy.
+pub const SVG_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; \
+     style-src 'unsafe-inline'; \
+     img-src data:; \
+     font-src data:; \
+     frame-ancestors 'none'; \
+     base-uri 'none'";
+
+/// The `Content-Security-Policy` header value for every portal response.
+///
+/// Built once: the hashes are compiled into the binary and cannot change.
+pub fn content_security_policy() -> HeaderValue {
+    static CSP: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
+        HeaderValue::from_str(&build_content_security_policy())
+            .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'"))
+    });
+    CSP.clone()
 }
 
 /// Serve a file from `ui/dist` under `/assets/`.
@@ -223,6 +446,37 @@ pub async fn serve(Path(path): Path<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    /// An unbranded portal: stock theme, no stylesheet.
+    fn plain(name: &str) -> Branding {
+        Branding::new(name)
+    }
+
+    /// As an integrator gets it: a stylesheet is configured.
+    fn branded(name: &str) -> Branding {
+        Branding {
+            css: Some(std::sync::Arc::from(":root{--color-accent:#ffe11a}")),
+            ..Branding::new(name)
+        }
+    }
+
+    /// With a logo configured.
+    fn with_logo(name: &str) -> Branding {
+        Branding {
+            logo: Some(crate::state::BrandLogo {
+                bytes: std::sync::Arc::from(&b"<svg/>"[..]),
+                content_type: "image/svg+xml",
+            }),
+            ..Branding::new(name)
+        }
+    }
+
+    /// With the theme pinned, which is what takes the toggle away.
+    fn pinned(name: &str, theme: ThemeMode) -> Branding {
+        Branding {
+            theme,
+            ..Branding::new(name)
+        }
+    }
     use super::*;
     use crate::nm::JoinFailure;
     use crate::ssid::Ssid;
@@ -245,10 +499,9 @@ mod tests {
     #[test]
     fn every_build_token_is_substituted() {
         let html = render_index(
-            "Anthias",
+            &plain("Anthias"),
             &[net("Home", 80, Security::WpaPsk)],
             &PortalState::Portal,
-            false,
         );
         for token in [
             "{{BRAND_NAME}}",
@@ -268,10 +521,9 @@ mod tests {
     fn a_hostile_ssid_cannot_inject_markup() {
         let evil = "<script>alert('pwned')</script>";
         let html = render_index(
-            "Brand",
+            &plain("Brand"),
             &[net(evil, 50, Security::WpaPsk)],
             &PortalState::Portal,
-            false,
         );
 
         assert!(!html.contains("<script>alert"), "SSID was not escaped");
@@ -282,10 +534,9 @@ mod tests {
     fn a_hostile_ssid_cannot_escape_an_attribute() {
         let evil = r#"x" onfocus="alert(1)"#;
         let html = render_index(
-            "Brand",
+            &plain("Brand"),
             &[net(evil, 50, Security::WpaPsk)],
             &PortalState::Portal,
-            false,
         );
         assert!(
             !html.contains(r#"onfocus="alert"#),
@@ -296,7 +547,7 @@ mod tests {
 
     #[test]
     fn the_brand_name_is_escaped_too() {
-        let html = render_index("<b>Brand</b>", &[], &PortalState::Portal, false);
+        let html = render_index(&plain("<b>Brand</b>"), &[], &PortalState::Portal);
         assert!(!html.contains("<b>Brand</b>"));
         assert!(html.contains("&lt;b&gt;Brand&lt;/b&gt;"));
     }
@@ -304,10 +555,9 @@ mod tests {
     #[test]
     fn networks_carry_their_exact_bytes_and_security() {
         let html = render_index(
-            "B",
+            &plain("B"),
             &[net("Home", 80, Security::Enterprise)],
             &PortalState::Portal,
-            false,
         );
         assert!(html.contains(r#"value="486f6d65""#), "ssid_hex missing");
         // Enterprise needs an identity and (for PEAP/TTLS) a password; the
@@ -320,10 +570,9 @@ mod tests {
     #[test]
     fn the_first_network_is_preselected_so_the_form_works_without_js() {
         let html = render_index(
-            "B",
+            &plain("B"),
             &[net("A", 90, Security::WpaPsk), net("B", 40, Security::Open)],
             &PortalState::Portal,
-            false,
         );
         // Match the rendered radio markup specifically. A looser search
         // also hits the `:has(input:checked)` CSS rule and the inlined
@@ -343,7 +592,7 @@ mod tests {
 
     #[test]
     fn an_empty_scan_still_offers_manual_entry() {
-        let html = render_index("B", &[], &PortalState::Portal, false);
+        let html = render_index(&plain("B"), &[], &PortalState::Portal);
         assert!(html.contains("No networks were found"));
         // The hidden-network field is in the static template.
         assert!(html.contains("hidden-ssid"));
@@ -357,7 +606,7 @@ mod tests {
             ssid: "Office".into(),
             error: JoinFailure::BadPassword.message("Office"),
         };
-        let html = render_index("B", &[], &state, false);
+        let html = render_index(&plain("B"), &[], &state);
 
         assert!(html.contains(r#"role="alert""#));
         assert!(html.contains("password was not accepted"));
@@ -365,7 +614,7 @@ mod tests {
 
     #[test]
     fn the_portal_state_renders_no_banner() {
-        let html = render_index("B", &[], &PortalState::Portal, false);
+        let html = render_index(&plain("B"), &[], &PortalState::Portal);
         assert!(!html.contains(r#"class="banner""#));
     }
 
@@ -378,8 +627,8 @@ mod tests {
     #[test]
     fn an_unbranded_portal_links_no_stylesheet() {
         for html in [
-            render_index("B", &[], &PortalState::Portal, false),
-            render_connecting("B", "Home", false),
+            render_index(&plain("B"), &[], &PortalState::Portal),
+            render_connecting(&plain("B"), "Home"),
         ] {
             assert!(!html.contains("<link"), "unbranded page links something");
             assert!(
@@ -392,8 +641,8 @@ mod tests {
     #[test]
     fn a_branded_portal_links_the_stylesheet_once() {
         for html in [
-            render_index("B", &[], &PortalState::Portal, true),
-            render_connecting("B", "Home", true),
+            render_index(&branded("B"), &[], &PortalState::Portal),
+            render_connecting(&branded("B"), "Home"),
         ] {
             assert_eq!(html.matches(r#"href="/brand.css""#).count(), 1);
             assert!(!html.contains("{{BRAND_CSS}}"));
@@ -404,7 +653,7 @@ mod tests {
     /// likely to be forgotten.
     #[test]
     fn the_error_page_is_branded_too() {
-        let html = render_index_with_error("B", &[], "nope", true);
+        let html = render_index_with_error(&branded("B"), &[], "nope");
         assert!(html.contains(r#"href="/brand.css""#));
         assert!(!html.contains("{{BRAND_CSS}}"));
     }
@@ -413,7 +662,7 @@ mod tests {
     /// defined in the inline <style> above it.
     #[test]
     fn the_brand_stylesheet_comes_after_the_inline_styles() {
-        let html = render_index("B", &[], &PortalState::Portal, true);
+        let html = render_index(&branded("B"), &[], &PortalState::Portal);
         let style = html.find("<style").expect("no inline style");
         let link = html.find(r#"href="/brand.css""#).expect("no brand link");
         assert!(link > style);
@@ -431,17 +680,16 @@ mod tests {
     #[test]
     fn signal_strength_is_also_announced_as_text() {
         let html = render_index(
-            "B",
+            &plain("B"),
             &[net("Home", 80, Security::WpaPsk)],
             &PortalState::Portal,
-            false,
         );
         assert!(html.contains(r#"aria-label="Signal 4 of 4""#));
     }
 
     #[test]
     fn the_connecting_page_names_the_network_and_explains_both_outcomes() {
-        let html = render_connecting("Anthias", "Office WiFi", false);
+        let html = render_connecting(&plain("Anthias"), "Office WiFi");
         assert!(html.contains("Office WiFi"));
         // Saying so is what stops a user power-cycling a device that just
         // worked.
@@ -452,12 +700,408 @@ mod tests {
     #[test]
     fn a_validation_error_keeps_the_network_list() {
         let html = render_index_with_error(
-            "B",
+            &plain("B"),
             &[net("Home", 80, Security::WpaPsk)],
             "Choose a network, or enter its name.",
-            false,
         );
         assert!(html.contains("Choose a network"));
         assert!(html.contains("486f6d65"), "the list must survive the error");
+    }
+
+    #[test]
+    fn the_theme_toggle_is_only_offered_when_the_theme_is_not_pinned() {
+        // Which of two colour schemes a setup page uses is the
+        // integrator's call. Offering to undo it on a page that exists for
+        // one minute is noise, so a pinned theme removes the control
+        // rather than pre-setting it.
+        // The button's markup, not the string: portal.ts looks the element
+        // up by id, so "theme-toggle" appears in the inlined script either
+        // way and asserting on it would pass for both arms.
+        let system = render_index(&plain("B"), &[], &PortalState::Portal);
+        assert!(
+            system.contains(r#"<button class="link-btn" type="button" id="theme-toggle" hidden>"#)
+        );
+
+        for theme in [ThemeMode::Light, ThemeMode::Dark] {
+            let html = render_index(&pinned("B", theme), &[], &PortalState::Portal);
+            assert!(
+                !html.contains(r#"id="theme-toggle""#),
+                "a pinned theme must not ship the switcher: {theme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_theme_reaches_the_first_paint() {
+        // On <html>, server side. A class added by script after load would
+        // flash the other scheme first on a page the user sees for seconds.
+        let dark = render_index(&pinned("B", ThemeMode::Dark), &[], &PortalState::Portal);
+        assert!(dark.contains(r#"<html lang="en" class="no-js" data-theme="dark">"#));
+
+        let light = render_index(&pinned("B", ThemeMode::Light), &[], &PortalState::Portal);
+        assert!(light.contains(r#"data-theme="light""#));
+
+        // Again the tag itself: the stylesheet's dark arms and the boot
+        // script both name data-theme on every page.
+        let system = render_index(&plain("B"), &[], &PortalState::Portal);
+        assert!(
+            system.contains(r#"<html lang="en" class="no-js">"#),
+            "system must leave the attribute off and let the media query decide"
+        );
+    }
+
+    #[test]
+    fn every_render_substitutes_every_token() {
+        // One missing arm and a user reads {{THEME_ATTR}} off the page.
+        let pages = [
+            render_index(&branded("B"), &[], &PortalState::Portal),
+            render_index_with_error(&branded("B"), &[], "nope"),
+            render_connecting(&pinned("B", ThemeMode::Dark), "Home"),
+        ];
+        for page in pages {
+            assert!(!page.contains("{{"), "unsubstituted token: {page:.0}");
+        }
+    }
+
+    #[test]
+    fn the_heading_is_the_name_until_a_logo_replaces_it() {
+        let plain_html = render_index(&plain("Anthias"), &[], &PortalState::Portal);
+        assert!(plain_html.contains("<h1>Anthias</h1>"));
+        // The <img>, not the class: the .brand-logo rule is in the inlined
+        // stylesheet on every page whether or not a logo is configured.
+        assert!(!plain_html.contains("<img"));
+
+        let logo_html = render_index(&with_logo("Anthias"), &[], &PortalState::Portal);
+        assert!(
+            logo_html.contains(r#"<img class="brand-logo" src="/brand-logo" alt="Anthias" />"#)
+        );
+        assert!(
+            !logo_html.contains("<h1>Anthias</h1>"),
+            "the logo replaces the wordmark rather than stacking under it"
+        );
+    }
+
+    #[test]
+    fn a_hostile_brand_name_cannot_escape_the_alt_attribute() {
+        // --brand-name is operator-supplied, but it lands in an attribute
+        // now as well as in text, and the two escape differently.
+        let html = render_index(
+            &with_logo(r#"x" onerror="alert(1)"#),
+            &[],
+            &PortalState::Portal,
+        );
+        assert!(
+            !html.contains(r#"onerror="alert"#),
+            "attribute escape: {html:.0}"
+        );
+        assert!(html.contains("&quot;"));
+    }
+
+    /// The `<tag>` bodies in `html`, exactly as the browser hashes them.
+    fn inline_blocks<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+        let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+        let mut out = Vec::new();
+        let mut rest = html;
+        while let Some(start) = rest.find(&open) {
+            let body = &rest[start + open.len()..];
+            let end = body.find(&close).expect("unterminated inline block");
+            out.push(&body[..end]);
+            rest = &body[end + close.len()..];
+        }
+        out
+    }
+
+    /// The sources listed for one directive of `csp`.
+    fn directive<'a>(csp: &'a str, name: &str) -> Vec<&'a str> {
+        csp.split(';')
+            .map(str::trim)
+            .find_map(|d| d.strip_prefix(name).and_then(|r| r.strip_prefix(' ')))
+            .unwrap_or_else(|| panic!("no {name} in {csp}"))
+            .split(' ')
+            .collect()
+    }
+
+    fn csp_source(body: &str) -> String {
+        use base64::Engine;
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(body.as_bytes());
+        format!(
+            "'sha256-{}'",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        )
+    }
+
+    /// The guard against a UI rebuild silently breaking the portal.
+    ///
+    /// The hashes are recomputed here from the pages as the SERVER renders
+    /// them — every render path, with every token filled in, including
+    /// hostile input — so this also proves the token substitution never
+    /// reaches into a script or style body. If either half drifts, the
+    /// browser would refuse to run the script and nothing would say why.
+    #[test]
+    fn every_inline_block_in_every_rendered_page_is_allowed_by_the_csp() {
+        let csp = content_security_policy().to_str().unwrap().to_owned();
+        let failed = PortalState::Failed {
+            ssid: "Office".into(),
+            error: "</script><script>alert(1)</script>".into(),
+        };
+        let hostile = [net(
+            "</style><script>alert(1)</script>",
+            50,
+            Security::WpaPsk,
+        )];
+        let pages = [
+            render_index(&plain("B"), &[], &PortalState::Portal),
+            render_index(&branded("</script>"), &hostile, &failed),
+            render_index(&with_logo("B"), &hostile, &PortalState::Portal),
+            render_index(&pinned("B", ThemeMode::Dark), &[], &PortalState::Portal),
+            render_index_with_error(&branded("B"), &hostile, "<script>x</script>"),
+            render_connecting(&plain("B"), "</script><script>alert(1)</script>"),
+            render_connecting(&pinned("B", ThemeMode::Light), "Home"),
+        ];
+
+        for page in &pages {
+            let scripts = inline_blocks(page, "script");
+            let styles = inline_blocks(page, "style");
+            // The boot script and the bundle; the one stylesheet. Fewer
+            // means the scan missed something, more means input got in.
+            assert_eq!(scripts.len(), 2, "script blocks: {page:.0}");
+            assert_eq!(styles.len(), 1, "style blocks");
+
+            for (tag, bodies) in [("script-src", scripts), ("style-src", styles)] {
+                let allowed = directive(&csp, tag);
+                for body in bodies {
+                    let source = csp_source(body);
+                    assert!(
+                        allowed.contains(&source.as_str()),
+                        "{tag} lacks {source}; rebuild ui/dist with `bun run build`"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_csp_is_built_from_the_embedded_hashes() {
+        let csp = content_security_policy().to_str().unwrap().to_owned();
+        let script = directive(&csp, "script-src");
+        assert!(
+            script
+                .iter()
+                .all(|s| is_sha256_source(s) || *s == "'unsafe-inline'"),
+            "script-src must be hashes (plus the CSP 1.0 fallback): {script:?}"
+        );
+        // 'unsafe-inline' is inert only because hashes sit beside it.
+        for name in ["script-src", "style-src"] {
+            let sources = directive(&csp, name);
+            assert!(
+                sources.iter().any(|s| is_sha256_source(s)),
+                "{name} has no hashes, so 'unsafe-inline' would be live: {sources:?}"
+            );
+        }
+        assert!(
+            !csp.contains("unsafe-eval") && !csp.contains("unsafe-hashes"),
+            "{csp}"
+        );
+    }
+
+    /// The hash file is ours, but it is still spliced into a header.
+    #[test]
+    fn only_well_formed_hash_sources_reach_the_policy() {
+        assert!(is_sha256_source(
+            "'sha256-HAtT/QX7BlG2zmsd0ubYmFutrDorJ4HxeDduJ7h6LwM='"
+        ));
+        for bad in [
+            "'unsafe-inline'",
+            "'sha256-'",
+            "sha256-abc=",
+            "'sha256-abc'; script-src *",
+            "'sha256-abc' 'unsafe-eval'",
+        ] {
+            assert!(!is_sha256_source(bad), "{bad} was accepted");
+        }
+    }
+
+    /// Every token any render substitutes. Kept by hand so that a new token
+    /// is a deliberate addition to the re-scan tests below.
+    const TOKENS: [&str; 8] = [
+        "BRAND_HEADING",
+        "BRAND_NAME",
+        "BRAND_CSS",
+        "THEME_ATTR",
+        "THEME_TOGGLE",
+        "NETWORKS",
+        "BANNER",
+        "SSID",
+    ];
+
+    /// A neighbour chooses its SSID, and braces are not HTML-special, so
+    /// escaping alone let `{{BANNER}}` through to be read as template by a
+    /// later substitution pass. Substituted text must never be re-scanned.
+    #[test]
+    fn an_ssid_spelling_a_token_renders_literally() {
+        let failed = PortalState::Failed {
+            ssid: "Office".into(),
+            error: "join failed".into(),
+        };
+        for name in TOKENS {
+            let ssid = format!("{{{{{name}}}}}");
+            let networks = [net(&ssid, 80, Security::WpaPsk)];
+            let pages = [
+                render_index(&branded("B"), &networks, &failed),
+                render_index_with_error(&branded("B"), &networks, "join failed"),
+            ];
+            for html in pages {
+                assert!(
+                    html.contains(&format!(r#"<span class="net__name">{ssid}</span>"#)),
+                    "{ssid} must be listed as itself"
+                );
+                assert_eq!(
+                    html.matches(r#"role="alert""#).count(),
+                    1,
+                    "the banner belongs in its slot, once, with {ssid} in the list"
+                );
+                assert_eq!(html.matches(r#"class="net""#).count(), 1);
+                assert_eq!(html.matches(r#"href="/brand.css""#).count(), 1);
+            }
+
+            // The connecting page puts the SSID in the heading and the copy.
+            let html = render_connecting(&branded("B"), &ssid);
+            assert!(html.contains(&format!("<h1>Connecting to {ssid}")));
+            assert_eq!(html.matches(&ssid).count(), 2, "{ssid}");
+            assert_eq!(html.matches(r#"href="/brand.css""#).count(), 1);
+        }
+    }
+
+    /// --brand-name is operator-supplied, and substituted first, so it was
+    /// re-scanned by every later pass: a name containing `{{NETWORKS}}`
+    /// pulled the network list into the heading and the <title>.
+    #[test]
+    fn a_brand_name_spelling_a_token_renders_literally() {
+        let name: String = TOKENS.iter().map(|t| format!("{{{{{t}}}}}")).collect();
+        let networks = [net("Home", 80, Security::WpaPsk)];
+        let failed = PortalState::Failed {
+            ssid: "Office".into(),
+            error: "join failed".into(),
+        };
+
+        let html = render_index(&plain(&name), &networks, &failed);
+        assert!(html.contains(&format!("<h1>{name}</h1>")));
+        assert_eq!(html.matches(r#"class="net""#).count(), 1);
+        assert_eq!(html.matches(r#"role="alert""#).count(), 1);
+
+        let html = render_index(&with_logo(&name), &networks, &PortalState::Portal);
+        assert!(html.contains(&format!(r#"alt="{name}""#)));
+        assert_eq!(html.matches(r#"class="net""#).count(), 1);
+
+        let html = render_connecting(&plain(&name), "Home");
+        assert!(html.contains(&name));
+        assert!(html.contains("<h1>Connecting to Home"));
+    }
+
+    #[test]
+    fn an_unknown_token_is_left_alone() {
+        // The pages inline a stylesheet and a script we do not parse; a
+        // `{{` in either is theirs, not ours to rewrite or panic over.
+        let tokens = [("A", "x")];
+        assert_eq!(render("{{B}} {{A}}", &tokens), "{{B}} x");
+        assert_eq!(render("{{A", &tokens), "{{A");
+        assert_eq!(render("}}{{", &tokens), "}}{{");
+        // A stray `{{` does not swallow the real token that follows it.
+        assert_eq!(render("{{{{A}}", &tokens), "{{x");
+        assert_eq!(render("{{ {{A}} }}", &tokens), "{{ x }}");
+        // Nor does a single brace in front of one, as in CSS or in a
+        // mustache-style `{{{A}}}`: the token is the last two of the three.
+        assert_eq!(render("{{{A}}}", &tokens), "{x}");
+        assert_eq!(render("a{{{{{A}}}}}", &tokens), "a{{{x}}}");
+    }
+
+    #[test]
+    fn a_substituted_value_is_never_rescanned() {
+        let tokens = [("A", "{{B}}"), ("B", "{{A}}")];
+        assert_eq!(render("{{A}}|{{B}}", &tokens), "{{B}}|{{A}}");
+    }
+
+    /// Positions found by searching for ASCII braces are always char
+    /// boundaries, so multibyte text either side of, or inside, a brace
+    /// pair must neither panic nor be mangled.
+    #[test]
+    fn multibyte_text_around_braces_is_sliced_safely() {
+        let tokens = [("A", "ö")];
+        assert_eq!(render("é{{A}}ü", &tokens), "éöü");
+        assert_eq!(render("{{é}}{{A}}", &tokens), "{{é}}ö");
+        assert_eq!(render("{{🦀", &tokens), "{{🦀");
+        assert_eq!(render("{🦀{{A}}🦀}", &tokens), "{🦀ö🦀}");
+    }
+
+    /// The old renderer, verbatim: a chain of `str::replace`. Kept only to
+    /// pin the new one to its output wherever no value spells a token.
+    fn chained_replace(name: &str, branding: &Branding, page: &[(&str, &str)]) -> String {
+        let mut html = template(name)
+            .replace("{{BRAND_HEADING}}", &render_brand_heading(branding))
+            .replace("{{BRAND_NAME}}", &escape(&branding.name))
+            .replace("{{BRAND_CSS}}", render_brand_css(branding.css.is_some()))
+            .replace("{{THEME_ATTR}}", render_theme_attr(branding.theme))
+            .replace("{{THEME_TOGGLE}}", render_theme_toggle(branding.theme));
+        for (token, value) in page {
+            html = html.replace(&format!("{{{{{token}}}}}"), value);
+        }
+        html
+    }
+
+    /// For every ordinary input the page must be byte-for-byte what the
+    /// chain of `replace` calls produced, so the inlined script and
+    /// stylesheet (whose bytes a CSP hash may pin) pass through untouched.
+    #[test]
+    fn ordinary_values_render_exactly_as_the_chained_replace_did() {
+        let brandings = [
+            plain("Anthias"),
+            plain("Café <&> \"Ünïcødé\" 🦀 {single} }} {"),
+            branded("B"),
+            with_logo("Logo & Co"),
+            pinned("B", ThemeMode::Dark),
+            pinned("B", ThemeMode::Light),
+        ];
+        let networks = [
+            net("Home", 80, Security::WpaPsk),
+            net("Café 🦀 <b>", 10, Security::Open),
+            net("{x} }}{", 55, Security::Sae),
+        ];
+        let failed = PortalState::Failed {
+            ssid: "Office".into(),
+            error: "wrong \"password\" é".into(),
+        };
+        for branding in &brandings {
+            for nets in [&networks[..], &[]] {
+                for state in [&PortalState::Portal, &failed] {
+                    let list = render_networks(nets);
+                    let banner = render_banner(state);
+                    assert_eq!(
+                        render_index(branding, nets, state),
+                        chained_replace(
+                            "index.html",
+                            branding,
+                            &[("NETWORKS", &list), ("BANNER", &banner)]
+                        ),
+                    );
+                }
+                let list = render_networks(nets);
+                let banner = r#"<div class="banner" role="alert">bad &amp; é</div>"#;
+                assert_eq!(
+                    render_index_with_error(branding, nets, "bad & é"),
+                    chained_replace(
+                        "index.html",
+                        branding,
+                        &[("NETWORKS", &list), ("BANNER", banner)]
+                    ),
+                );
+            }
+            for ssid in ["Home", "Café 🦀 <b>", "{x} }}{"] {
+                assert_eq!(
+                    render_connecting(branding, ssid),
+                    chained_replace("connecting.html", branding, &[("SSID", &escape(ssid))]),
+                );
+            }
+        }
     }
 }

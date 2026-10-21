@@ -72,7 +72,11 @@ function initPasswordToggle(): void {
 function initSecurityAwareness(): void {
   const password = document.getElementById('pw')
   const identityField = document.getElementById('identity-field')
+  const hint = document.getElementById('pw-hint')
   if (!(password instanceof HTMLInputElement)) return
+  // The markup's hint states the WPA-PSK rule, which is right without
+  // JavaScript (no enterprise sign-in is possible then). Keep it to restore.
+  const pskHint = hint?.textContent ?? ''
 
   const apply = (radio: HTMLInputElement): void => {
     // Server-rendered booleans, decided once in nm::security. Re-deriving
@@ -93,12 +97,31 @@ function initSecurityAwareness(): void {
     // The 8-character floor is a WPA-PSK rule; EAP passwords have no such
     // minimum, and on a disabled/empty field it would block submission of an
     // open network. Apply it only to PSK networks.
+    // Likewise the 63-character ceiling: directory passwords behind an
+    // 802.1X network are routinely longer, and maxlength silently truncates
+    // what a password manager pastes.
     if (needsPassphrase) {
       password.setAttribute('minlength', '8')
+      password.setAttribute('maxlength', '63')
     } else {
       password.removeAttribute('minlength')
+      password.removeAttribute('maxlength')
     }
+    // Telling an enterprise user their directory password must be 8 to 63
+    // characters is wrong, and sends them looking for a different one.
+    if (hint) hint.textContent = needsIdentity ? 'Your enterprise (802.1X) password.' : pskHint
     if (identityField instanceof HTMLElement) identityField.hidden = !needsIdentity
+    // A hidden input still submits, and a username is what makes the server
+    // join over 802.1X. So when the enterprise block hides, clear AND
+    // disable its inputs (disabled inputs are not submitted): a username
+    // typed for one network must not turn a PSK join into an EAP one. The
+    // server drops it for a scanned non-enterprise network too.
+    for (const id of ['identity', 'server-domain']) {
+      const input = document.getElementById(id)
+      if (!(input instanceof HTMLInputElement)) continue
+      input.disabled = !needsIdentity
+      if (!needsIdentity) input.value = ''
+    }
   }
 
   for (const el of document.querySelectorAll('input[name="ssid_hex"]')) {
