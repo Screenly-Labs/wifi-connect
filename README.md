@@ -136,7 +136,7 @@ Every flag has an environment variable. Flags win.
 | `--portal-gateway` | `-g` | `PORTAL_GATEWAY` | `192.168.42.1` |
 | `--portal-dhcp-range` | `-d` | `PORTAL_DHCP_RANGE` | `192.168.42.2,192.168.42.254` |
 | `--portal-listening-port` | `-o` | `PORTAL_LISTENING_PORT` | `80` |
-| `--interface` | `-i` | `WIFI_CONNECT_INTERFACE` | auto-detect |
+| `--interface` | `-i` | `WIFI_CONNECT_INTERFACE`, or upstream's `PORTAL_INTERFACE` | auto-detect |
 | `--activity-timeout` | `-a` | `ACTIVITY_TIMEOUT` | `0` (never) |
 | `--ui-directory` | `-u` | `UI_DIRECTORY` | embedded |
 | `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |

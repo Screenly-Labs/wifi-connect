@@ -29,7 +29,6 @@ use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 
-use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -163,7 +162,7 @@ fn broadcast_for(gateway: Ipv4Addr) -> Ipv4Addr {
 }
 
 async fn run() -> ExitCode {
-    let args = Cli::parse();
+    let args = Cli::parse_with_legacy_env();
     init_logging(&args);
 
     let dhcp_range = match args.validate() {
