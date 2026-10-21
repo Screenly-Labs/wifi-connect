@@ -1,0 +1,93 @@
+#!/bin/sh
+# Validate `snap set wifi-connect ...` before snapd stores it.
+#
+# A non-zero exit makes `snap set` fail with this hook's stderr and keeps
+# the previous value. That is the point: a bad value caught here is an
+# error at the prompt, while the same value caught by the binary is a
+# daemon that crash-loops on the next boot, on a device whose only network
+# it was supposed to set up.
+#
+# Settings take effect the next time the daemon starts. This hook does not
+# restart it: the hook also runs on install and refresh, and restarting
+# then would defeat `refresh-mode: endure`. `snap restart wifi-connect`
+# applies a change immediately.
+set -eu
+
+fail() {
+	echo "wifi-connect: $*" >&2
+	exit 1
+}
+
+get() {
+	snapctl get "$1"
+}
+
+one_of() {
+	key="$1"
+	shift
+	value="$(get "${key}")"
+	[ -z "${value}" ] && return 0
+	for allowed in "$@"; do
+		[ "${value}" = "${allowed}" ] && return 0
+	done
+	fail "${key} must be one of: $* (got '${value}')"
+}
+
+whole_number() {
+	value="$(get "$1")"
+	[ -z "${value}" ] && return 0
+	case "${value}" in
+		*[!0-9]*) fail "$1 must be a whole number of seconds (got '${value}')" ;;
+	esac
+}
+
+# Strict confinement can read the snap itself and its own data directories,
+# and nothing else. A path anywhere else would pass here and then be denied
+# by AppArmor at runtime, so it is refused now with the reason.
+confined_path() {
+	value="$(get "$1")"
+	[ -z "${value}" ] && return 0
+	case "${value}" in
+		"/var/snap/${SNAP_INSTANCE_NAME}/"*) ;;
+		*) fail "$1 must be under /var/snap/${SNAP_INSTANCE_NAME}/common/, which is where this confined snap can read it (got '${value}')" ;;
+	esac
+}
+
+passphrase="$(get portal-passphrase)"
+if [ -n "${passphrase}" ]; then
+	length="$(printf '%s' "${passphrase}" | wc -c)"
+	if [ "${length}" -lt 8 ] || [ "${length}" -gt 63 ]; then
+		fail "portal-passphrase must be 8 to 63 characters long (got ${length})"
+	fi
+fi
+
+ssid="$(get portal-ssid)"
+if [ -n "${ssid}" ] && [ "$(printf '%s' "${ssid}" | wc -c)" -gt 32 ]; then
+	fail "portal-ssid must be at most 32 bytes long"
+fi
+
+one_of portal-security auto wpa2 wpa3
+one_of default-theme system light dark
+one_of log-format text json
+one_of insecure-open-portal true false
+one_of no-qr-stdout true false
+one_of force true false
+
+whole_number activity-timeout
+whole_number wait-for-connection
+whole_number connection-timeout
+
+port="$(get portal-listening-port)"
+if [ -n "${port}" ]; then
+	case "${port}" in
+		*[!0-9]*) fail "portal-listening-port must be a port number (got '${port}')" ;;
+	esac
+	if [ "${port}" -lt 1 ] || [ "${port}" -gt 65535 ]; then
+		fail "portal-listening-port must be between 1 and 65535 (got '${port}')"
+	fi
+fi
+
+confined_path ui-directory
+confined_path qr-output
+confined_path brand-css
+confined_path brand-logo

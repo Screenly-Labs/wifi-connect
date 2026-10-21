@@ -8,8 +8,8 @@
 //! the committed output has drifted.
 //!
 //! Rendering is literal token substitution, not a template engine. There are
-//! four tokens and the page is a fixed shape; a dependency that could render
-//! arbitrary templates would be more machinery than the problem has.
+//! a handful of tokens and the page is a fixed shape; a dependency that could
+//! render arbitrary templates would be more machinery than the problem has.
 
 use axum::extract::Path;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -198,20 +198,79 @@ fn render_brand_heading(branding: &Branding) -> String {
     }
 }
 
-/// Render the portal page.
-pub fn render_index(branding: &Branding, networks: &[WifiNetwork], state: &PortalState) -> String {
-    chrome(template("index.html"), branding)
-        .replace("{{NETWORKS}}", &render_networks(networks))
-        .replace("{{BANNER}}", &render_banner(state))
+/// Fill a template's `{{NAME}}` tokens in a single left-to-right pass.
+///
+/// One pass, not a chain of `str::replace`: each `replace` scans the output
+/// of the one before it, so a value substituted early was re-read as
+/// template by every later pass. A neighbouring network broadcasting the
+/// SSID `{{BANNER}}` got the banner spliced into the network list; a brand
+/// name containing `{{NETWORKS}}` got the whole network list. Escaping does
+/// not help — braces are not HTML-special — so the fix is structural: a
+/// value, once emitted, is never looked at again.
+///
+/// An unknown token is kept literally rather than asserted on. The page
+/// inlines its stylesheet and script, which are not ours to parse and may
+/// one day contain a `{{` of their own; mangling those, or panicking a
+/// request over them, would be worse than leaving them alone. A token the
+/// template uses but no render supplies is caught instead by the
+/// `every_render_substitutes_every_token` test.
+fn render(template: &str, tokens: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let known = after.find("}}").and_then(|close| {
+            let name = &after[..close];
+            tokens
+                .iter()
+                .find(|(token, _)| *token == name)
+                .map(|(_, value)| (*value, close))
+        });
+        match known {
+            Some((value, close)) => {
+                out.push_str(value);
+                rest = &after[close + 2..];
+            }
+            None => {
+                // Not a token we know: emit ONE brace and resume at the
+                // second, so a stray `{{` cannot swallow a real token after
+                // it. Skipping both would miss the token in `{{{SSID}}}`,
+                // whose first `{{` is a brace short of `{{SSID}}`.
+                out.push('{');
+                rest = &rest[open + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
-/// Substitute everything that is the same on every page.
-fn chrome(html: String, branding: &Branding) -> String {
-    html.replace("{{BRAND_HEADING}}", &render_brand_heading(branding))
-        .replace("{{BRAND_NAME}}", &escape(&branding.name))
-        .replace("{{BRAND_CSS}}", render_brand_css(branding.css.is_some()))
-        .replace("{{THEME_ATTR}}", render_theme_attr(branding.theme))
-        .replace("{{THEME_TOGGLE}}", render_theme_toggle(branding.theme))
+/// Render one embedded page: the tokens every page shares, plus its own.
+fn render_page(name: &str, branding: &Branding, page_tokens: &[(&str, &str)]) -> String {
+    let heading = render_brand_heading(branding);
+    let brand_name = escape(&branding.name);
+    let mut tokens = vec![
+        ("BRAND_HEADING", heading.as_str()),
+        ("BRAND_NAME", brand_name.as_str()),
+        ("BRAND_CSS", render_brand_css(branding.css.is_some())),
+        ("THEME_ATTR", render_theme_attr(branding.theme)),
+        ("THEME_TOGGLE", render_theme_toggle(branding.theme)),
+    ];
+    tokens.extend_from_slice(page_tokens);
+    render(&template(name), &tokens)
+}
+
+/// Render the portal page.
+pub fn render_index(branding: &Branding, networks: &[WifiNetwork], state: &PortalState) -> String {
+    render_page(
+        "index.html",
+        branding,
+        &[
+            ("NETWORKS", &render_networks(networks)),
+            ("BANNER", &render_banner(state)),
+        ],
+    )
 }
 
 /// Render the portal page carrying a validation error.
@@ -220,20 +279,23 @@ pub fn render_index_with_error(
     networks: &[WifiNetwork],
     error: &str,
 ) -> String {
-    chrome(template("index.html"), branding)
-        .replace("{{NETWORKS}}", &render_networks(networks))
-        .replace(
-            "{{BANNER}}",
-            &format!(
-                "<div class=\"banner\" role=\"alert\">{}</div>",
-                escape(error)
-            ),
-        )
+    let banner = format!(
+        "<div class=\"banner\" role=\"alert\">{}</div>",
+        escape(error)
+    );
+    render_page(
+        "index.html",
+        branding,
+        &[
+            ("NETWORKS", &render_networks(networks)),
+            ("BANNER", &banner),
+        ],
+    )
 }
 
 /// Render the "connecting…" page.
 pub fn render_connecting(branding: &Branding, ssid: &str) -> String {
-    chrome(template("connecting.html"), branding).replace("{{SSID}}", &escape(ssid))
+    render_page("connecting.html", branding, &[("SSID", &escape(ssid))])
 }
 
 /// The hashes of the inline `<script>` and `<style>` blocks, as written by
@@ -857,6 +919,189 @@ mod tests {
             "'sha256-abc' 'unsafe-eval'",
         ] {
             assert!(!is_sha256_source(bad), "{bad} was accepted");
+        }
+    }
+
+    /// Every token any render substitutes. Kept by hand so that a new token
+    /// is a deliberate addition to the re-scan tests below.
+    const TOKENS: [&str; 8] = [
+        "BRAND_HEADING",
+        "BRAND_NAME",
+        "BRAND_CSS",
+        "THEME_ATTR",
+        "THEME_TOGGLE",
+        "NETWORKS",
+        "BANNER",
+        "SSID",
+    ];
+
+    /// A neighbour chooses its SSID, and braces are not HTML-special, so
+    /// escaping alone let `{{BANNER}}` through to be read as template by a
+    /// later substitution pass. Substituted text must never be re-scanned.
+    #[test]
+    fn an_ssid_spelling_a_token_renders_literally() {
+        let failed = PortalState::Failed {
+            ssid: "Office".into(),
+            error: "join failed".into(),
+        };
+        for name in TOKENS {
+            let ssid = format!("{{{{{name}}}}}");
+            let networks = [net(&ssid, 80, Security::WpaPsk)];
+            let pages = [
+                render_index(&branded("B"), &networks, &failed),
+                render_index_with_error(&branded("B"), &networks, "join failed"),
+            ];
+            for html in pages {
+                assert!(
+                    html.contains(&format!(r#"<span class="net__name">{ssid}</span>"#)),
+                    "{ssid} must be listed as itself"
+                );
+                assert_eq!(
+                    html.matches(r#"role="alert""#).count(),
+                    1,
+                    "the banner belongs in its slot, once, with {ssid} in the list"
+                );
+                assert_eq!(html.matches(r#"class="net""#).count(), 1);
+                assert_eq!(html.matches(r#"href="/brand.css""#).count(), 1);
+            }
+
+            // The connecting page puts the SSID in the heading and the copy.
+            let html = render_connecting(&branded("B"), &ssid);
+            assert!(html.contains(&format!("<h1>Connecting to {ssid}")));
+            assert_eq!(html.matches(&ssid).count(), 2, "{ssid}");
+            assert_eq!(html.matches(r#"href="/brand.css""#).count(), 1);
+        }
+    }
+
+    /// --brand-name is operator-supplied, and substituted first, so it was
+    /// re-scanned by every later pass: a name containing `{{NETWORKS}}`
+    /// pulled the network list into the heading and the <title>.
+    #[test]
+    fn a_brand_name_spelling_a_token_renders_literally() {
+        let name: String = TOKENS.iter().map(|t| format!("{{{{{t}}}}}")).collect();
+        let networks = [net("Home", 80, Security::WpaPsk)];
+        let failed = PortalState::Failed {
+            ssid: "Office".into(),
+            error: "join failed".into(),
+        };
+
+        let html = render_index(&plain(&name), &networks, &failed);
+        assert!(html.contains(&format!("<h1>{name}</h1>")));
+        assert_eq!(html.matches(r#"class="net""#).count(), 1);
+        assert_eq!(html.matches(r#"role="alert""#).count(), 1);
+
+        let html = render_index(&with_logo(&name), &networks, &PortalState::Portal);
+        assert!(html.contains(&format!(r#"alt="{name}""#)));
+        assert_eq!(html.matches(r#"class="net""#).count(), 1);
+
+        let html = render_connecting(&plain(&name), "Home");
+        assert!(html.contains(&name));
+        assert!(html.contains("<h1>Connecting to Home"));
+    }
+
+    #[test]
+    fn an_unknown_token_is_left_alone() {
+        // The pages inline a stylesheet and a script we do not parse; a
+        // `{{` in either is theirs, not ours to rewrite or panic over.
+        let tokens = [("A", "x")];
+        assert_eq!(render("{{B}} {{A}}", &tokens), "{{B}} x");
+        assert_eq!(render("{{A", &tokens), "{{A");
+        assert_eq!(render("}}{{", &tokens), "}}{{");
+        // A stray `{{` does not swallow the real token that follows it.
+        assert_eq!(render("{{{{A}}", &tokens), "{{x");
+        assert_eq!(render("{{ {{A}} }}", &tokens), "{{ x }}");
+        // Nor does a single brace in front of one, as in CSS or in a
+        // mustache-style `{{{A}}}`: the token is the last two of the three.
+        assert_eq!(render("{{{A}}}", &tokens), "{x}");
+        assert_eq!(render("a{{{{{A}}}}}", &tokens), "a{{{x}}}");
+    }
+
+    #[test]
+    fn a_substituted_value_is_never_rescanned() {
+        let tokens = [("A", "{{B}}"), ("B", "{{A}}")];
+        assert_eq!(render("{{A}}|{{B}}", &tokens), "{{B}}|{{A}}");
+    }
+
+    /// Positions found by searching for ASCII braces are always char
+    /// boundaries, so multibyte text either side of, or inside, a brace
+    /// pair must neither panic nor be mangled.
+    #[test]
+    fn multibyte_text_around_braces_is_sliced_safely() {
+        let tokens = [("A", "ö")];
+        assert_eq!(render("é{{A}}ü", &tokens), "éöü");
+        assert_eq!(render("{{é}}{{A}}", &tokens), "{{é}}ö");
+        assert_eq!(render("{{🦀", &tokens), "{{🦀");
+        assert_eq!(render("{🦀{{A}}🦀}", &tokens), "{🦀ö🦀}");
+    }
+
+    /// The old renderer, verbatim: a chain of `str::replace`. Kept only to
+    /// pin the new one to its output wherever no value spells a token.
+    fn chained_replace(name: &str, branding: &Branding, page: &[(&str, &str)]) -> String {
+        let mut html = template(name)
+            .replace("{{BRAND_HEADING}}", &render_brand_heading(branding))
+            .replace("{{BRAND_NAME}}", &escape(&branding.name))
+            .replace("{{BRAND_CSS}}", render_brand_css(branding.css.is_some()))
+            .replace("{{THEME_ATTR}}", render_theme_attr(branding.theme))
+            .replace("{{THEME_TOGGLE}}", render_theme_toggle(branding.theme));
+        for (token, value) in page {
+            html = html.replace(&format!("{{{{{token}}}}}"), value);
+        }
+        html
+    }
+
+    /// For every ordinary input the page must be byte-for-byte what the
+    /// chain of `replace` calls produced, so the inlined script and
+    /// stylesheet (whose bytes a CSP hash may pin) pass through untouched.
+    #[test]
+    fn ordinary_values_render_exactly_as_the_chained_replace_did() {
+        let brandings = [
+            plain("Anthias"),
+            plain("Café <&> \"Ünïcødé\" 🦀 {single} }} {"),
+            branded("B"),
+            with_logo("Logo & Co"),
+            pinned("B", ThemeMode::Dark),
+            pinned("B", ThemeMode::Light),
+        ];
+        let networks = [
+            net("Home", 80, Security::WpaPsk),
+            net("Café 🦀 <b>", 10, Security::Open),
+            net("{x} }}{", 55, Security::Sae),
+        ];
+        let failed = PortalState::Failed {
+            ssid: "Office".into(),
+            error: "wrong \"password\" é".into(),
+        };
+        for branding in &brandings {
+            for nets in [&networks[..], &[]] {
+                for state in [&PortalState::Portal, &failed] {
+                    let list = render_networks(nets);
+                    let banner = render_banner(state);
+                    assert_eq!(
+                        render_index(branding, nets, state),
+                        chained_replace(
+                            "index.html",
+                            branding,
+                            &[("NETWORKS", &list), ("BANNER", &banner)]
+                        ),
+                    );
+                }
+                let list = render_networks(nets);
+                let banner = r#"<div class="banner" role="alert">bad &amp; é</div>"#;
+                assert_eq!(
+                    render_index_with_error(branding, nets, "bad & é"),
+                    chained_replace(
+                        "index.html",
+                        branding,
+                        &[("NETWORKS", &list), ("BANNER", banner)]
+                    ),
+                );
+            }
+            for ssid in ["Home", "Café 🦀 <b>", "{x} }}{"] {
+                assert_eq!(
+                    render_connecting(branding, ssid),
+                    chained_replace("connecting.html", branding, &[("SSID", &escape(ssid))]),
+                );
+            }
         }
     }
 }

@@ -171,6 +171,16 @@ describe('works without JavaScript', () => {
     expect(connecting).toMatch(/http-equiv=["']refresh["']/i)
   })
 
+  test('the server domain is posted from inside the enterprise block', () => {
+    // It only means something next to an 802.1X username, so it shows and
+    // hides with that block, and the field name is what /connect reads.
+    const block = indexEff.match(/<div[^>]+id="identity-field"[^>]*>([\s\S]*?)<\/div>/)
+    expect(block, 'the enterprise block').not.toBeNull()
+    expect(block?.[0]).toMatch(/id="identity-field"[^>]*hidden/)
+    expect(block?.[1]).toMatch(/<input[^>]+name="server_domain"/)
+    expect(block?.[1]).toMatch(/<label[^>]+for="server-domain"/)
+  })
+
   test('enhancement-only controls start hidden', () => {
     // Show/hide does nothing without JS, so it must not be visible to a
     // user who has none. The theme toggle is the same, but it is emitted

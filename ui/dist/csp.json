@@ -1,8 +1,8 @@
 {
   "script": [
-    "'sha256-61OBBwKPHDBVdANFJGRzIXopfKPGExmaXcFQMFPqaIg='",
     "'sha256-AdlkHkNkCDLuhnRvpN5+QCCNnVfO/gkmOws4unhPthA='",
-    "'sha256-S8rW9TECC+LRTcw0TROErqaObfKR1GQFrQL71iP2Eaw='"
+    "'sha256-S8rW9TECC+LRTcw0TROErqaObfKR1GQFrQL71iP2Eaw='",
+    "'sha256-uSiGKYHSI371Nw7+5aQqQnVCxTRUr12n3v4LNWQCVYs='"
   ],
   "style": [
     "'sha256-HAtT/QX7BlG2zmsd0ubYmFutrDorJ4HxeDduJ7h6LwM='"

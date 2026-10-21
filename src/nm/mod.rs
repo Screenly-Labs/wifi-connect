@@ -95,6 +95,9 @@ pub struct JoinRequest {
     pub ssid: Ssid,
     pub identity: Option<String>,
     pub passphrase: Option<Secret>,
+    /// For enterprise networks: the domain the RADIUS server's certificate
+    /// must belong to (`802-1x.domain-suffix-match`). Ignored otherwise.
+    pub server_domain: Option<String>,
     pub hidden: bool,
 }
 
@@ -161,6 +164,11 @@ pub enum Connectivity {
     /// Associated but behind someone else's captive portal, or no route out.
     Limited,
     None,
+    /// NetworkManager did not probe. Usually because connectivity checking
+    /// is disabled — the default on Debian, Raspberry Pi OS and Ubuntu
+    /// Server/Core, which ship no check URI. This is "we cannot tell", not
+    /// "offline": [`NetworkControl::is_online`] then asks whether the WiFi
+    /// radio is already a connected station before anything acts on it.
     Unknown,
 }
 
@@ -222,6 +230,36 @@ pub trait NetworkControl: Send + Sync + 'static {
     /// property, which can be arbitrarily stale.
     async fn check_connectivity(&self) -> Result<Connectivity, NetworkError>;
 
+    /// Whether the WiFi device we would drive is ACTIVATED as a station
+    /// (infrastructure mode, not an access point). Read without probing.
+    /// Failed reads must answer `false`: that is the behaviour from before
+    /// this fallback existed, and the portal comes up.
+    async fn station_activated(&self, device: &DeviceInfo) -> Result<bool, NetworkError>;
+
+    /// The single "are we online?" decision, shared by the startup gate and
+    /// the autoconnect wait so the two cannot disagree.
+    ///
+    /// A definite verdict from the probe stands: `Limited` and `None` mean
+    /// the user may need the portal to pick a different network, even if
+    /// the radio is associated.
+    ///
+    /// `Unknown` — no probe ran, usually because checking is disabled —
+    /// counts as online only when the radio is already a connected station.
+    /// That is the one case where raising the access point does damage: it
+    /// would replace that very connection, and with no activity timeout the
+    /// device would never get it back. NetworkManager's global `State` is
+    /// deliberately *not* consulted: with checking disabled it reads
+    /// `CONNECTED_GLOBAL` for any link with a default route, including an
+    /// ethernet LAN with no internet, and trusting it there would stop the
+    /// portal from ever appearing on a device that needs it.
+    async fn is_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
+        match self.check_connectivity().await? {
+            Connectivity::Full => Ok(true),
+            Connectivity::Unknown => self.station_activated(device).await,
+            Connectivity::Limited | Connectivity::None => Ok(false),
+        }
+    }
+
     /// How many WiFi profiles are already saved.
     ///
     /// Drives the asymmetry in the "should we raise the portal at all" gate:
@@ -248,8 +286,9 @@ pub trait NetworkControl: Send + Sync + 'static {
         config: &ApConfig,
     ) -> Result<ApHandle, NetworkError>;
 
-    /// Deactivate and delete the AP profile. Best-effort: a teardown that
-    /// fails must not stop the rest of the teardown running.
+    /// Deactivate and delete the AP profile this handle names, by its UUID.
+    /// Best-effort: a teardown that fails must not stop the rest of the
+    /// teardown running.
     async fn tear_down_ap(&self, handle: &ApHandle) -> Result<(), NetworkError>;
 
     /// Attempt to join, returning a *reason* on failure rather than an error.
@@ -260,10 +299,24 @@ pub trait NetworkControl: Send + Sync + 'static {
         budget: std::time::Duration,
     ) -> Result<JoinOutcome, NetworkError>;
 
-    /// Delete a station profile we created that turned out not to work.
-    /// Without this, NM's autoconnect retries a known-bad profile forever
-    /// and fights the portal for the radio.
-    async fn forget(&self, ssid: &Ssid) -> Result<(), NetworkError>;
+    /// The UUIDs of every saved *station* (not access-point) WiFi profile
+    /// whose SSID is `ssid`.
+    ///
+    /// Used to work out which profile a failed join created: snapshot before,
+    /// snapshot after, and the difference is ours. Matching on the SSID as
+    /// well as on "new" narrows that difference to the one network we were
+    /// asked to join, so a profile someone else adds through `nmcli` during
+    /// the join window is not swept up with it.
+    async fn station_profile_uuids(&self, ssid: &Ssid) -> Result<Vec<String>, NetworkError>;
+
+    /// Delete one saved profile, identified by UUID. "Already gone" is
+    /// success.
+    ///
+    /// There is deliberately no delete-by-name. Names are not identities: a
+    /// `connection.id` or an SSID typed into the portal can equal the name of
+    /// an unrelated profile — `Wired connection 1`, a VPN, the device's real
+    /// home network — and a by-name delete takes that profile out with it.
+    async fn delete_profile(&self, uuid: &str) -> Result<(), NetworkError>;
 
     /// Put the device back in managed station mode.
     async fn restore(&self, device: &DeviceInfo) -> Result<(), NetworkError>;

@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "wifi-connect"
-version = "2026.10.1"
+version = "2026.10.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -1941,6 +1941,8 @@ dependencies = [
  "dhcproto",
  "hex",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "mime_guess",
  "nmrs",
