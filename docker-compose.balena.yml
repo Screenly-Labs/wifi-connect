@@ -55,10 +55,11 @@ services:
 
     # NOT required. We never configure the interface ourselves —
     # NetworkManager does, as root, on the host — and SO_BINDTODEVICE has
-    # been unprivileged since Linux 5.7 for a not-yet-bound socket.
+    # been unprivileged since Linux 5.7 for a socket not already pinned to a
+    # device.
     #
     # Uncomment only if your kernel denies SO_BINDTODEVICE; the symptom is
-    # the DHCP server failing to start with EPERM.
+    # the DHCP, DNS or portal server failing to start with EPERM.
     # cap_add:
     #   - NET_ADMIN
     #   - NET_RAW

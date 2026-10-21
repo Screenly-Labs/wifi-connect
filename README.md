@@ -88,7 +88,17 @@ sudo systemctl enable --now wifi-connect
    has saved WiFi profiles, wait up to 60s for one to come up first —
    associating plus DHCP plus a probe genuinely takes 15-30s from cold. If
    it has none, show the portal immediately rather than making a first-boot
-   user stare at nothing for a minute.
+   user stare at nothing for a minute. "Online" is NetworkManager's
+   connectivity check saying so — or, where that check is disabled (the
+   default on Debian, Raspberry Pi OS and Ubuntu Server, which ship no check
+   URI), the WiFi device already being connected as a station: the access
+   point is never raised over a working WiFi connection on that basis; use
+   `--force` to override. A wired link alone does not count when the check
+   is disabled, because nothing then tells a LAN with internet from one
+   without — configure a check URI if ethernet should suppress the portal.
+   A probe that positively reports no or limited connectivity still brings
+   the portal up, so a device stuck on a dead network can be moved to
+   another.
 3. **Scan, then raise the access point.** In that order: a radio in AP mode
    cannot scan.
 4. **Serve the portal.** DHCP hands out leases and advertises the portal via
@@ -123,9 +133,11 @@ Every flag has an environment variable. Flags win.
 | `--log-passphrase` | | `WIFI_CONNECT_LOG_PASSPHRASE` | `false` |
 | `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
 | `--brand-css` | | `WIFI_CONNECT_BRAND_CSS` | — |
+| `--brand-logo` | | `WIFI_CONNECT_BRAND_LOGO` | — |
 | `--force` | | `WIFI_CONNECT_FORCE` | `false` |
 | `--connection-timeout` | | `WIFI_CONNECT_CONNECTION_TIMEOUT` | `45` |
 | `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
+| `--insecure-eap-skip-server-verification` | | `WIFI_CONNECT_INSECURE_EAP` | `false` |
 
 ### Migrating from balena wifi-connect
 
@@ -205,11 +217,56 @@ more than the `:root` that sets the light defaults, so a stylesheet loaded
 after them wins in either scheme. Use a `prefers-color-scheme` arm only to
 set a *different* value in dark.
 
+`--brand-logo` points at an image shown in the header in place of the
+product name, served at `/brand-logo`:
+
+```bash
+wifi-connect --brand-name Anthias --brand-logo /etc/wifi-connect/logo.svg
+```
+
+SVG, PNG, JPEG or WebP, up to 256 KB; anything else is refused at startup
+rather than served as a broken image. `--brand-name` is still required and
+becomes the image's alt text, so the heading reads correctly to a screen
+reader and to anyone whose image did not load. The logo *replaces* the
+wordmark rather than sitting above it.
+
+`--default-theme` decides which scheme the page opens in:
+
+```bash
+wifi-connect --brand-name Anthias --default-theme dark
+```
+
+`system` (the default) follows the phone and leaves an in-page **Switch
+theme** control in the footer. `light` or `dark` pins the page — the
+attribute is rendered on `<html>` server side, so it is right in the first
+paint rather than flashing the other scheme — and **removes that control**.
+Which of two colour schemes a one-minute setup page uses is the
+integrator's decision, and an end user who flips it is only undoing it. A
+preference already in the phone's storage from another portal does not
+override a pinned theme either.
+
 The file is read once at startup, so a path that does not exist stops the
 portal with a clear message rather than quietly serving an unbranded page.
 When the flag is unset the pages link nothing at all and stay a single
 request, which is what makes them work in a captive-portal mini-browser with
 no internet behind it.
+
+## Exit codes
+
+A run ends in one of these. They matter to whoever writes the unit file:
+`0`, `3`, `4` and `6` are endings nobody can act on from a service manager,
+and belong in `SuccessExitStatus=`. The rest are worth surfacing as a
+failed unit.
+
+| code | meaning | actionable? |
+| --- | --- | --- |
+| 0 | joined, already online, or asked to stop | no |
+| 1 | anything not listed below | yes |
+| 3 | no WiFi device on this machine | no — nothing to configure |
+| 4 | adapter cannot do AP mode, is unmanaged, or the radio is blocked | no — a hardware fact |
+| 5 | NetworkManager is unreachable over the bus | yes |
+| 6 | the activity timeout elapsed with no join | no — the ordinary "nobody came" ending |
+| 7 | the portal could not bind its address or port | yes — it will recur until something changes |
 
 ## Requirements and limitations
 
@@ -225,11 +282,20 @@ no internet behind it.
 - **Architectures:** amd64, arm64, armv7 and armv6. ARMv6 covers the
   Raspberry Pi 1 and Pi Zero, which is the architecture upstream dropped in
   v4.4.6 without anyone noticing for three years.
-- **Enterprise WiFi is PEAP/MSCHAPv2 and TTLS/PAP only.** Certificate-based
-  EAP-TLS needs key and certificate paths a portal cannot collect. Also note
-  that without `domain-suffix-match` the supplicant will accept any server
-  certificate its CA store chains to, so PEAP here is not proof against a
-  determined on-path attacker.
+- **Enterprise WiFi is PEAP/MSCHAPv2 only.** Certificate-based EAP-TLS
+  needs key and certificate paths a portal cannot collect. The RADIUS
+  server's certificate must chain to the **host's** system CA store
+  (NetworkManager's `system-ca-certs`; it is the host's wpa_supplicant that
+  reads it, so the `FROM scratch` container image is irrelevant). The
+  portal also asks for an optional *server domain*, which becomes
+  `domain-suffix-match`: without one, any certificate a public CA has issued
+  for *any* name passes, so it is worth filling in. The outer identity is
+  sent as `anonymous@<realm>` (or `anonymous`), so the real username stays
+  inside the TLS tunnel. A network whose RADIUS server uses a **private CA**
+  will fail to join; `--insecure-eap-skip-server-verification` turns CA
+  checking off for it, logs a warning, and lets anyone in radio range who
+  copies the network's name capture the user's MSCHAPv2 exchange, which
+  cracks offline to their password hash.
 - **No rescan button.** A radio in AP mode cannot scan, so rescanning would
   mean dropping the access point and disconnecting the user mid-setup. Use
   the hidden-network field to enter an SSID that did not appear.
