@@ -121,6 +121,10 @@ jobs:
       packages: write # push to GHCR (and the attestation, below)
       id-token: write # OIDC, to sign the attestation
       attestations: write
+      # With push-to-registry, the attest action also records where the
+      # image is stored (the org's "Linked artifacts" page). Without this
+      # it only warns, but the record is silently missing.
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -228,6 +232,12 @@ jobs:
     # Publishing authenticates with the store secret, not GITHUB_TOKEN.
     permissions:
       contents: read
+    # A step's `if` cannot see that same step's `env:`, so the publish
+    # step needs this from the job. Only the boolean lives here; the
+    # credential itself stays in the publish step's env, out of reach of
+    # the snapcraft build.
+    env:
+      HAS_SNAP_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -253,7 +263,7 @@ jobs:
       # first few releases, before the store listing exists — still produce
       # a downloadable .snap rather than failing the run.
       - name: publish to the snap store
-        if: ${{ env.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        if: ${{ env.HAS_SNAP_STORE_CREDENTIALS == 'true' }}
         uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40 # v1.2.0
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
