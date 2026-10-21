@@ -169,7 +169,9 @@ environment variables. Two behaviours changed:
   behaviour, logs a warning, and is not CRA-compliant.
 - **`--ui-directory` is now an override**, not a requirement. The UI is
   embedded in the binary, so the common deployment failure of the binary
-  not finding a relative `ui/` directory is gone.
+  not finding a relative `ui/` directory is gone. The directory it takes
+  is not interchangeable with upstream's: see
+  [Replacing the pages](#replacing-the-pages---ui-directory).
 
 `--portal-interface` is accepted as a hidden alias for `--interface`.
 
@@ -269,6 +271,45 @@ portal with a clear message rather than quietly serving an unbranded page.
 When the flag is unset the pages link nothing at all and stay a single
 request, which is what makes them work in a captive-portal mini-browser with
 no internet behind it.
+
+### Replacing the pages: `--ui-directory`
+
+When the role tokens are not enough, `--ui-directory` serves the pages from
+a directory instead of the copy embedded in the binary:
+
+```bash
+wifi-connect --ui-directory /etc/wifi-connect/ui
+```
+
+- **It replaces the embedded UI wholesale.** `index.html` and
+  `connecting.html` must both be there, and `/assets/<path>` serves files
+  from the directory and nothing else. There is no per-file fallback, so a
+  misspelt file name fails loudly rather than giving you a mixed portal.
+- **The pages are this portal's templates**, not static HTML. They are
+  rendered with the same `{{TOKENS}}` as the embedded ones (`{{NETWORKS}}`,
+  `{{BANNER}}`, `{{SSID}}`, `{{BRAND_NAME}}`, `{{BRAND_HEADING}}`,
+  `{{BRAND_CSS}}`, `{{THEME_ATTR}}`, `{{THEME_TOGGLE}}`) and must keep the
+  form fields the server reads. Start by copying `ui/dist`. **balena's
+  React UI build will not work** — it expects an API this portal does not
+  have — and an `index.html` with no `{{NETWORKS}}` token is refused at
+  startup for that reason. Any other token the built-in pages use but
+  yours lack is logged as a warning at startup: a template copied from an
+  older release still works, but without `{{BRAND_CSS}}` or
+  `{{BRAND_HEADING}}`, `--brand-css` and `--brand-logo` have nowhere to go.
+- **It is read once, at startup**, like `--brand-css`: a missing directory
+  or template stops the portal with the path in the message. Restart to
+  pick up edits. The directory is capped at 256 files and 8 MB, dotfiles
+  are skipped, and a symlink that resolves outside it is refused.
+- **Inline script and style are allowed by hash.** The portal sends a
+  Content-Security-Policy; with `--ui-directory` it is built at startup
+  from the SHA-256 of each bare `<script>…</script>` and
+  `<style>…</style>` block in your two templates, and `script-src` also
+  allows `'self'`, so `<script src="/assets/app.js">` works. Everything
+  else in the policy is unchanged. A block with attributes
+  (`<script type="module">`, `<style media="…">`) is not hashed, and a
+  `{{TOKEN}}` inside a block changes its bytes per request; the browser
+  blocks both, so both are logged as a warning at startup. Inline event
+  handlers (`onclick="…"`) and `style="…"` attributes are blocked too.
 
 ## Exit codes
 
