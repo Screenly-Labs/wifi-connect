@@ -184,6 +184,25 @@ mod tests {
         assert_eq!(fs::read(&f).unwrap(), b"secret");
     }
 
+    /// A crash between the open and the rename leaves the temp file
+    /// behind. O_EXCL would then refuse every later write, so the next run
+    /// must clear it, not fail on it forever.
+    #[test]
+    fn a_temp_file_left_by_a_crash_does_not_block_later_writes() {
+        let s = Scratch::new("stale-temp");
+        let f = s.0.join("wifi-connect-qr.txt");
+        let tmp = temp_path(&f).unwrap();
+        fs::write(&tmp, b"stale").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write(&f, b"fresh").unwrap();
+        write(&f, b"fresher").unwrap();
+
+        assert_eq!(fs::read(&f).unwrap(), b"fresher");
+        assert_eq!(mode(&f) & 0o007, 0, "inherited the stale temp's mode");
+        assert!(fs::symlink_metadata(&tmp).is_err(), "temp file left behind");
+    }
+
     /// Same attack aimed at the temp file instead of the target.
     #[test]
     fn a_symlink_at_the_temp_path_is_not_followed() {

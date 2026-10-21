@@ -21,13 +21,18 @@
 #
 # Both files contain the passphrase, so they are written mode 0640 (and the
 # directory, if wifi-connect creates it, 0750). The application displaying
-# them must run as the same user or group as wifi-connect.
+# them must run as the same user or group as wifi-connect: if it is not
+# root, put `Group=<its group>` in a drop-in for wifi-connect.service.
 #WIFI_CONNECT_QR_OUTPUT=/var/lib/wifi-connect/qr
 
 # The QR is also printed to stdout for a plain console. Under systemd,
 # stdout goes to the journal, where anyone who can read it (on many
 # distributions, the adm and systemd-journal groups) can scan it. Set this
 # if those people should not be able to join the setup access point.
+#
+# Not set by default because with the defaults above (no QR_OUTPUT, a
+# generated passphrase), the journal QR is the only place the passphrase
+# appears. Set WIFI_CONNECT_QR_OUTPUT first.
 #WIFI_CONNECT_NO_QR_STDOUT=true
 
 # Also log the passphrase as plain text. Off by default: the journal is

@@ -152,12 +152,18 @@ the network and therefore cannot be served over it:
   is the primary path. Both files contain the passphrase, so they are
   written mode `0640` (a directory wifi-connect creates is `0750`),
   atomically, and never through a symlink at the target. The application
-  displaying them must run as the same user or group as wifi-connect.
+  displaying them must run as the same user or group as wifi-connect. The
+  files take wifi-connect's group, so give it the reader's group rather
+  than loosening the mode: in Docker, `user: '0:<reader gid>'` (root is
+  still needed for NetworkManager; see `docker-compose.balena.yml`); under
+  systemd, `Group=` in a drop-in.
 - A Unicode QR is printed to stdout, which a plain HDMI console or a serial
   terminal renders directly with no host application at all. Under systemd
   or Docker, stdout is captured into the journal or container log, where a
   QR is as good as the passphrase; `--no-qr-stdout` turns it off if those
-  logs are readable by people who should not join.
+  logs are readable by people who should not join. Set `--qr-output` (or a
+  fixed `PORTAL_PASSPHRASE`) first: without it, the journal QR is the only
+  place a generated passphrase appears.
 - The passphrase is **not** logged. The log names the SSID and says the
   passphrase is in the QR. `--log-passphrase` adds it as plain text, for a
   bench where a scanner refuses the QR; leave it off anywhere logs are
