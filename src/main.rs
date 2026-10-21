@@ -324,16 +324,20 @@ async fn run() -> ExitCode {
     // written here rather than beside the QR so that a consumer can treat
     // its presence as "a portal run is live". The guard removes it again
     // on every exit from here down, including the error paths.
-    let _state_file = args.state_file.as_ref().and_then(|path| {
-        portal_state::PortalState::new(
-            &ssid,
-            passphrase.as_ref(),
-            args.portal_url(),
-            args.portal_gateway,
-            args.portal_listening_port,
-        )
-        .publish(path)
-    });
+    let _state_file = args
+        .state_file
+        .as_ref()
+        .and_then(|path| {
+            portal_state::PortalState::new(
+                &ssid,
+                passphrase.as_ref(),
+                args.portal_url(),
+                args.portal_gateway,
+                args.portal_listening_port,
+            )
+            .publish(path)
+        })
+        .map(std::sync::Arc::new);
 
     let branding = state::Branding {
         css: brand_css,
@@ -429,10 +433,37 @@ async fn run() -> ExitCode {
         })
     };
 
+    // Refresh the state file's heartbeat for as long as the portal is
+    // up. A consumer treats a file that has stopped beating as a portal
+    // that has stopped running, which is the only thing that catches a
+    // process killed too hard to remove its own file — NetworkManager
+    // keeps the access point raised in that case, so the radio looks
+    // healthy from outside.
+    let heartbeat = _state_file.as_ref().map(|file| {
+        let cancel = cancel.clone();
+        let file = std::sync::Arc::clone(file);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(portal_state::HEARTBEAT_INTERVAL);
+            // The first tick is immediate and the file was just written.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    _ = ticker.tick() => file.beat(),
+                }
+            }
+        })
+    });
+
     let result = app::run_portal(&nm, &device, &run_config, &shared, joins, cancel.clone()).await;
 
     cancel.cancel();
     signals.abort();
+    // Before the guard below removes the file: a beat racing the
+    // removal would recreate it and leave a dead portal looking live.
+    if let Some(heartbeat) = heartbeat {
+        heartbeat.abort();
+    }
     let server_failure = servers.await.ok().flatten();
 
     // If a support server died, the portal was never reachable. Unless the
