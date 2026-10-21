@@ -60,14 +60,25 @@ services:
 ### Ubuntu Core
 
 ```bash
+sudo snap install network-manager
 sudo snap install wifi-connect
 sudo snap connect wifi-connect:network-manager network-manager:service
 sudo snap start --enable wifi-connect
 ```
 
-The `network-manager` interface does **not** auto-connect, so that second
-line is required. For an image you build yourself, declare it in
-`gadget.yaml` instead so it is connected on first boot.
+Ubuntu Core does not ship NetworkManager, hence the first line. The
+`network-manager` interface does **not** auto-connect, hence the third.
+Configure it with `snap set`, e.g.
+`sudo snap set wifi-connect portal-ssid="Device Setup"`.
+
+Every GitHub Release also carries the `.snap` for `amd64`, `arm64` and
+`armhf`, which installs the same way with
+`sudo snap install --dangerous ./wifi-connect_<version>_<arch>.snap`
+(no automatic updates).
+
+[docs/snap.md](docs/snap.md) covers configuration keys, building an Ubuntu
+Core image with the connection and defaults declared in `gadget.yaml`, and
+troubleshooting.
 
 ### Debian / Raspberry Pi OS
 

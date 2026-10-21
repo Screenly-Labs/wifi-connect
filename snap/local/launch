@@ -1,0 +1,46 @@
+#!/bin/sh
+# Turn `snap set wifi-connect <key>=<value>` into the environment variables
+# the binary already reads, then exec it.
+#
+# A snap daemon has no /etc/default file to source, so without this the
+# only configuration on Ubuntu Core would be the compiled-in defaults.
+#
+# Each key is the binary's own long flag name, so `wifi-connect --help` is
+# the reference for both. Environment variables rather than `--flag=value`
+# because the boolean flags take no value on the command line, while clap
+# accepts true/false for them from the environment.
+#
+# An unset key exports nothing and the binary's default applies. The
+# configure hook has already validated whatever is set.
+set -eu
+
+pass() {
+	value="$(snapctl get "$1")"
+	if [ -n "${value}" ]; then
+		export "$2=${value}"
+	fi
+}
+
+pass portal-ssid PORTAL_SSID
+pass portal-passphrase PORTAL_PASSPHRASE
+pass portal-security WIFI_CONNECT_PORTAL_SECURITY
+pass insecure-open-portal WIFI_CONNECT_INSECURE_OPEN_PORTAL
+pass portal-gateway PORTAL_GATEWAY
+pass portal-dhcp-range PORTAL_DHCP_RANGE
+pass portal-listening-port PORTAL_LISTENING_PORT
+pass interface WIFI_CONNECT_INTERFACE
+pass activity-timeout ACTIVITY_TIMEOUT
+pass ui-directory UI_DIRECTORY
+pass qr-output WIFI_CONNECT_QR_OUTPUT
+pass no-qr-stdout WIFI_CONNECT_NO_QR_STDOUT
+pass force WIFI_CONNECT_FORCE
+pass wait-for-connection WIFI_CONNECT_WAIT_FOR_CONNECTION
+pass connection-timeout WIFI_CONNECT_CONNECTION_TIMEOUT
+pass brand-name WIFI_CONNECT_BRAND_NAME
+pass brand-css WIFI_CONNECT_BRAND_CSS
+pass brand-logo WIFI_CONNECT_BRAND_LOGO
+pass default-theme WIFI_CONNECT_DEFAULT_THEME
+pass log-format WIFI_CONNECT_LOG_FORMAT
+pass log-level WIFI_CONNECT_LOG_LEVEL
+
+exec "${SNAP}/bin/wifi-connect" "$@"
