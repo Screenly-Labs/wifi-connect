@@ -1,5 +1,6 @@
 <!doctype html>
-<html lang="en" class="no-js">
+<!-- prettier-ignore -->
+<html lang="en" class="no-js"{{THEME_ATTR}}>
   <head>
     <meta charset="utf-8" />
     <!-- viewport-fit=cover pairs with env(safe-area-inset-*) so the submit
@@ -18,6 +19,9 @@
       ;(function () {
         var r = document.documentElement
         r.className = r.className.replace("no-js", "has-js")
+        // Already set means --default-theme pinned it: that is the
+        // integrator's choice and a stored preference does not outrank it.
+        if (r.hasAttribute("data-theme")) return
         try {
           var t = localStorage.getItem("wc-theme")
           if (t === "dark" || t === "light") r.setAttribute("data-theme", t)
@@ -103,7 +107,7 @@
 
       <footer class="foot">
         <span>{{BRAND_NAME}}</span>
-        <button class="link-btn" type="button" id="theme-toggle" hidden>Switch theme</button>
+        {{THEME_TOGGLE}}
       </footer>
     </main>
 

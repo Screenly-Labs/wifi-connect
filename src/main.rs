@@ -205,7 +205,12 @@ async fn run() -> ExitCode {
         },
     };
 
-    let (shared, joins) = state::Shared::new(args.portal_url(), args.brand_name.clone(), brand_css);
+    let branding = state::Branding {
+        css: brand_css,
+        theme: args.default_theme,
+        ..state::Branding::new(args.brand_name.clone())
+    };
+    let (shared, joins) = state::Shared::new(args.portal_url(), branding);
     let cancel = CancellationToken::new();
 
     // DHCP, DNS and HTTP. DHCP is pinned to the access-point interface;

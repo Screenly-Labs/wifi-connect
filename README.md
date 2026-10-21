@@ -181,6 +181,21 @@ more than the `:root` that sets the light defaults, so a stylesheet loaded
 after them wins in either scheme. Use a `prefers-color-scheme` arm only to
 set a *different* value in dark.
 
+`--default-theme` decides which scheme the page opens in:
+
+```bash
+wifi-connect --brand-name Anthias --default-theme dark
+```
+
+`system` (the default) follows the phone and leaves an in-page **Switch
+theme** control in the footer. `light` or `dark` pins the page — the
+attribute is rendered on `<html>` server side, so it is right in the first
+paint rather than flashing the other scheme — and **removes that control**.
+Which of two colour schemes a one-minute setup page uses is the
+integrator's decision, and an end user who flips it is only undoing it. A
+preference already in the phone's storage from another portal does not
+override a pinned theme either.
+
 The file is read once at startup, so a path that does not exist stops the
 portal with a clear message rather than quietly serving an unbranded page.
 When the flag is unset the pages link nothing at all and stay a single
