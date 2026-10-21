@@ -136,8 +136,24 @@ pub struct Cli {
     pub qr_output: Option<PathBuf>,
 
     /// Do not print the QR code to stdout.
+    ///
+    /// Under systemd or Docker, stdout is captured into the journal or the
+    /// container log, and a scannable QR there is as good as the
+    /// passphrase. Set this when those logs are readable by people who
+    /// should not be able to join the setup access point.
     #[arg(long, env = "WIFI_CONNECT_NO_QR_STDOUT", default_value_t = false)]
     pub no_qr_stdout: bool,
+
+    /// Also log the setup access point's passphrase as plain text.
+    ///
+    /// Off by default: logs travel further than the device's screen
+    /// (journald, `docker logs`, a fleet manager's log shipping), and the
+    /// passphrase is what gets you onto the setup network and so to the
+    /// portal. Turn it on only when people who can read the logs are
+    /// trusted to join, for instance on a bench where a scanner refuses
+    /// the QR.
+    #[arg(long, env = "WIFI_CONNECT_LOG_PASSPHRASE", default_value_t = false)]
+    pub log_passphrase: bool,
 
     /// Raise the portal even when the device is already online.
     #[arg(long, env = "WIFI_CONNECT_FORCE", default_value_t = false)]
@@ -337,6 +353,25 @@ mod tests {
         assert_eq!(c.portal_dhcp_range, "192.168.42.2,192.168.42.254");
         assert_eq!(c.portal_listening_port, 80);
         assert_eq!(c.activity_timeout, 0, "0 means no timeout, as upstream");
+    }
+
+    /// The passphrase must not reach the logs unless asked for.
+    #[test]
+    fn the_passphrase_is_not_logged_by_default() {
+        assert!(!cli(&[]).log_passphrase);
+        assert!(cli(&["--log-passphrase"]).log_passphrase);
+
+        // Setting the variable for real would race the other tests (and
+        // `set_var` is unsafe), so check the wiring instead.
+        let cmd = Cli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "log_passphrase")
+            .unwrap();
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("WIFI_CONNECT_LOG_PASSPHRASE")
+        );
     }
 
     /// The one deliberate behavioural change from upstream, which the

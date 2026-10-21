@@ -18,7 +18,22 @@
 
 # Where to write the join QR code (SVG, plus the raw payload as .txt) so a
 # host application can display it on the device's screen.
+#
+# Both files contain the passphrase, so they are written mode 0640 (and the
+# directory, if wifi-connect creates it, 0750). The application displaying
+# them must run as the same user or group as wifi-connect.
 #WIFI_CONNECT_QR_OUTPUT=/var/lib/wifi-connect/qr
+
+# The QR is also printed to stdout for a plain console. Under systemd,
+# stdout goes to the journal, where anyone who can read it (on many
+# distributions, the adm and systemd-journal groups) can scan it. Set this
+# if those people should not be able to join the setup access point.
+#WIFI_CONNECT_NO_QR_STDOUT=true
+
+# Also log the passphrase as plain text. Off by default: the journal is
+# readable well beyond root and is often shipped off the device. Turn it on
+# only where everyone who can read the logs may join the setup network.
+#WIFI_CONNECT_LOG_PASSPHRASE=false
 
 # Network layout of the setup access point.
 #PORTAL_GATEWAY=192.168.42.1

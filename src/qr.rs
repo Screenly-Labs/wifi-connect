@@ -11,8 +11,9 @@
 //!   full-screen. This is the path the Anthias integration will consume.
 //! * A Unicode half-block rendering on stdout, which a plain HDMI TTY or a
 //!   serial console displays directly with no host app at all.
-//! * The SSID and passphrase as plain text in the log, for operators and for
-//!   anyone whose scanner refuses.
+//! * Only with `--log-passphrase`: the SSID and passphrase as plain text in
+//!   the log, for anyone whose scanner refuses. Off by default, because logs
+//!   are shipped and kept far beyond the device's screen.
 
 use qrcode::{Color, EcLevel, QrCode, render::svg};
 

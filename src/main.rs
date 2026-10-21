@@ -17,6 +17,7 @@ mod dns;
 mod http;
 mod nm;
 mod passphrase;
+mod private_file;
 mod qr;
 mod secret;
 mod sockets;
@@ -81,18 +82,21 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
     };
 
     if let Some(dir) = &args.qr_output {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        // Both files carry the passphrase (the .txt in plain text), so they
+        // are written like a credential: not world-readable, and never
+        // through a symlink planted at the target. See private_file.
+        if let Err(e) = private_file::create_dir(dir) {
             error!(error = %e, path = %dir.display(), "could not create the QR output directory");
         } else {
             let svg = dir.join("wifi-connect-qr.svg");
-            match std::fs::write(&svg, code.to_svg(512)) {
+            match private_file::write(&svg, code.to_svg(512).as_bytes()) {
                 Ok(()) => info!(path = %svg.display(), "wrote the join QR code"),
                 Err(e) => error!(error = %e, path = %svg.display(), "could not write the QR code"),
             }
             // The raw payload too, so a host application can render the
             // code itself at whatever size its screen wants.
             let txt = dir.join("wifi-connect-qr.txt");
-            if let Err(e) = std::fs::write(&txt, &payload) {
+            if let Err(e) = private_file::write(&txt, payload.as_bytes()) {
                 error!(error = %e, path = %txt.display(), "could not write the QR payload");
             }
         }
@@ -108,14 +112,33 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
         println!();
     }
 
-    // The fallback for anyone whose scanner refuses, and for operators
-    // reading the journal. The passphrase is deliberately exposed here and
-    // nowhere else: this is the one place it is meant to be read.
-    info!(
-        ssid = %ssid,
-        passphrase = %passphrase.expose(),
-        "setup access point credentials"
-    );
+    // The passphrase stays out of the logs unless the operator opts in.
+    // Logs travel further than the screen — journald, `docker logs`, a
+    // fleet manager's log shipping — and the passphrase is what gets you
+    // onto the setup network and therefore to the portal. An explicit flag
+    // rather than DEBUG level, because raising the log level is what you do
+    // to troubleshoot a misbehaving radio, and that should not quietly
+    // start shipping a credential.
+    if args.log_passphrase {
+        info!(
+            ssid = %ssid,
+            passphrase = %passphrase.expose(),
+            "setup access point credentials"
+        );
+    } else {
+        info!(
+            ssid = %ssid,
+            qr_output = args.qr_output.as_ref().map(|d| d.display().to_string()),
+            "setup access point is up; the passphrase is in the join QR \
+             (pass --log-passphrase to also log it)"
+        );
+        if args.qr_output.is_none() && args.no_qr_stdout {
+            warn!(
+                "the setup passphrase is not published anywhere: set --qr-output, \
+                 drop --no-qr-stdout, or pass --log-passphrase"
+            );
+        }
+    }
 }
 
 /// The /24 broadcast address for a gateway.

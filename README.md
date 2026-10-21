@@ -118,6 +118,8 @@ Every flag has an environment variable. Flags win.
 | `--activity-timeout` | `-a` | `ACTIVITY_TIMEOUT` | `0` (never) |
 | `--ui-directory` | `-u` | `UI_DIRECTORY` | embedded |
 | `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |
+| `--no-qr-stdout` | | `WIFI_CONNECT_NO_QR_STDOUT` | `false` |
+| `--log-passphrase` | | `WIFI_CONNECT_LOG_PASSPHRASE` | `false` |
 | `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
 | `--brand-css` | | `WIFI_CONNECT_BRAND_CSS` | — |
 | `--force` | | `WIFI_CONNECT_FORCE` | `false` |
@@ -145,12 +147,23 @@ The access point always has a passphrase, so the user needs it before they
 can join. It is rendered **on the device**, since it is what gets you onto
 the network and therefore cannot be served over it:
 
-- `--qr-output <dir>` writes `wifi-connect-qr.svg` plus the raw payload, for
-  a host application to show full-screen. This is the primary path.
+- `--qr-output <dir>` writes `wifi-connect-qr.svg` plus the raw payload
+  (`wifi-connect-qr.txt`), for a host application to show full-screen. This
+  is the primary path. Both files contain the passphrase, so they are
+  written mode `0640` (a directory wifi-connect creates is `0750`),
+  atomically, and never through a symlink at the target. The application
+  displaying them must run as the same user or group as wifi-connect.
 - A Unicode QR is printed to stdout, which a plain HDMI console or a serial
-  terminal renders directly with no host application at all.
-- The SSID and passphrase are logged as text, for operators and for anyone
-  whose scanner refuses.
+  terminal renders directly with no host application at all. Under systemd
+  or Docker, stdout is captured into the journal or container log, where a
+  QR is as good as the passphrase; `--no-qr-stdout` turns it off if those
+  logs are readable by people who should not join.
+- The passphrase is **not** logged. The log names the SSID and says the
+  passphrase is in the QR. `--log-passphrase` adds it as plain text, for a
+  bench where a scanner refuses the QR; leave it off anywhere logs are
+  shipped off the device or readable beyond the people allowed to join.
+  It is a dedicated flag rather than DEBUG level so that raising the log
+  level to troubleshoot a radio does not start shipping a credential.
 
 ## White-labelling the portal
 
