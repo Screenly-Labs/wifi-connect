@@ -263,7 +263,13 @@ async fn run() -> ExitCode {
         )
     };
 
-    let ssid = Ssid::from(args.portal_ssid.as_str());
+    // The one place the configured name becomes the name on the air. Built
+    // once per run and passed on from here, so the access point, the QR
+    // payload, the logs and anything an integrator renders all agree —
+    // generating it twice would put two different names in front of one
+    // user.
+    let portal_ssid = ssid::with_random_suffix(&args.portal_ssid, args.portal_ssid_suffix);
+    let ssid = Ssid::from(portal_ssid.as_str());
     publish_qr(&args, &ssid, passphrase.as_ref());
 
     let eap_server_check = if args.insecure_eap_skip_server_verification {
