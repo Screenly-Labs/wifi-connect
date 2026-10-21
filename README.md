@@ -60,14 +60,25 @@ services:
 ### Ubuntu Core
 
 ```bash
+sudo snap install network-manager
 sudo snap install wifi-connect
 sudo snap connect wifi-connect:network-manager network-manager:service
 sudo snap start --enable wifi-connect
 ```
 
-The `network-manager` interface does **not** auto-connect, so that second
-line is required. For an image you build yourself, declare it in
-`gadget.yaml` instead so it is connected on first boot.
+Ubuntu Core does not ship NetworkManager, hence the first line. The
+`network-manager` interface does **not** auto-connect, hence the third.
+Configure it with `snap set`, e.g.
+`sudo snap set wifi-connect portal-ssid="Device Setup"`.
+
+Every GitHub Release also carries the `.snap` for `amd64`, `arm64` and
+`armhf`, which installs the same way with
+`sudo snap install --dangerous ./wifi-connect_<version>_<arch>.snap`
+(no automatic updates).
+
+[docs/snap.md](docs/snap.md) covers configuration keys, building an Ubuntu
+Core image with the connection and defaults declared in `gadget.yaml`, and
+troubleshooting.
 
 ### Debian / Raspberry Pi OS
 
@@ -88,7 +99,17 @@ sudo systemctl enable --now wifi-connect
    has saved WiFi profiles, wait up to 60s for one to come up first —
    associating plus DHCP plus a probe genuinely takes 15-30s from cold. If
    it has none, show the portal immediately rather than making a first-boot
-   user stare at nothing for a minute.
+   user stare at nothing for a minute. "Online" is NetworkManager's
+   connectivity check saying so — or, where that check is disabled (the
+   default on Debian, Raspberry Pi OS and Ubuntu Server, which ship no check
+   URI), the WiFi device already being connected as a station: the access
+   point is never raised over a working WiFi connection on that basis; use
+   `--force` to override. A wired link alone does not count when the check
+   is disabled, because nothing then tells a LAN with internet from one
+   without — configure a check URI if ethernet should suppress the portal.
+   A probe that positively reports no or limited connectivity still brings
+   the portal up, so a device stuck on a dead network can be moved to
+   another.
 3. **Scan, then raise the access point.** In that order: a radio in AP mode
    cannot scan.
 4. **Serve the portal.** DHCP hands out leases and advertises the portal via
@@ -118,12 +139,16 @@ Every flag has an environment variable. Flags win.
 | `--activity-timeout` | `-a` | `ACTIVITY_TIMEOUT` | `0` (never) |
 | `--ui-directory` | `-u` | `UI_DIRECTORY` | embedded |
 | `--qr-output` | | `WIFI_CONNECT_QR_OUTPUT` | — |
+| `--qr-stdout` | | `WIFI_CONNECT_QR_STDOUT` | `false` (see below) |
+| `--no-qr-stdout` | | `WIFI_CONNECT_NO_QR_STDOUT` | `false` |
+| `--log-passphrase` | | `WIFI_CONNECT_LOG_PASSPHRASE` | `false` |
 | `--brand-name` | | `WIFI_CONNECT_BRAND_NAME` | `WiFi Connect` |
 | `--brand-css` | | `WIFI_CONNECT_BRAND_CSS` | — |
 | `--brand-logo` | | `WIFI_CONNECT_BRAND_LOGO` | — |
 | `--force` | | `WIFI_CONNECT_FORCE` | `false` |
 | `--connection-timeout` | | `WIFI_CONNECT_CONNECTION_TIMEOUT` | `45` |
 | `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
+| `--insecure-eap-skip-server-verification` | | `WIFI_CONNECT_INSECURE_EAP` | `false` |
 
 `--portal-security` takes `auto`, `wpa2` or `wpa3`. `auto` is currently
 WPA2-PSK (CCMP), identical to `wpa2`; the name is reserved for picking the
@@ -154,12 +179,33 @@ The access point always has a passphrase, so the user needs it before they
 can join. It is rendered **on the device**, since it is what gets you onto
 the network and therefore cannot be served over it:
 
-- `--qr-output <dir>` writes `wifi-connect-qr.svg` plus the raw payload, for
-  a host application to show full-screen. This is the primary path.
-- A Unicode QR is printed to stdout, which a plain HDMI console or a serial
-  terminal renders directly with no host application at all.
-- The SSID and passphrase are logged as text, for operators and for anyone
-  whose scanner refuses.
+- `--qr-output <dir>` writes `wifi-connect-qr.svg` plus the raw payload
+  (`wifi-connect-qr.txt`), for a host application to show full-screen. This
+  is the primary path. Both files contain the passphrase, so they are
+  written mode `0640` (a directory wifi-connect creates is `0750`),
+  atomically, and never through a symlink at the target. The application
+  displaying them must run as the same user or group as wifi-connect. The
+  files take wifi-connect's group, so give it the reader's group rather
+  than loosening the mode: in Docker, `user: '0:<reader gid>'` (root is
+  still needed for NetworkManager; see `docker-compose.balena.yml`); under
+  systemd, `Group=` in a drop-in.
+- A Unicode QR on stdout, which a plain HDMI console or a serial terminal
+  renders directly with no host application at all. Under systemd or
+  Docker, stdout is captured into the journal or container log, where a QR
+  is as good as the passphrase. So it is printed only when stdout is a
+  terminal, or when there is no other channel: `--qr-output` is not set, or
+  writing its files failed. With the files written and stdout not a
+  terminal (the balena and Anthias setup), the QR stays out of the logs.
+  `--qr-stdout` prints it regardless; `--no-qr-stdout` never prints it and
+  wins over `--qr-stdout`. With neither `--qr-output` nor a fixed
+  `PORTAL_PASSPHRASE`, the journal QR is the only place a generated
+  passphrase appears, so `--no-qr-stdout` there leaves nobody able to join.
+- The passphrase is **not** logged. The log names the SSID and says the
+  passphrase is in the QR. `--log-passphrase` adds it as plain text, for a
+  bench where a scanner refuses the QR; leave it off anywhere logs are
+  shipped off the device or readable beyond the people allowed to join.
+  It is a dedicated flag rather than DEBUG level so that raising the log
+  level to troubleshoot a radio does not start shipping a credential.
 
 ## White-labelling the portal
 
@@ -224,6 +270,23 @@ When the flag is unset the pages link nothing at all and stay a single
 request, which is what makes them work in a captive-portal mini-browser with
 no internet behind it.
 
+## Exit codes
+
+A run ends in one of these. They matter to whoever writes the unit file:
+`0`, `3`, `4` and `6` are endings nobody can act on from a service manager,
+and belong in `SuccessExitStatus=`. The rest are worth surfacing as a
+failed unit.
+
+| code | meaning | actionable? |
+| --- | --- | --- |
+| 0 | joined, already online, or asked to stop | no |
+| 1 | anything not listed below | yes |
+| 3 | no WiFi device on this machine | no — nothing to configure |
+| 4 | adapter cannot do AP mode, is unmanaged, or the radio is blocked | no — a hardware fact |
+| 5 | NetworkManager is unreachable over the bus | yes |
+| 6 | the activity timeout elapsed with no join | no — the ordinary "nobody came" ending |
+| 7 | the portal could not bind its address or port | yes — it will recur until something changes |
+
 ## Requirements and limitations
 
 - **NetworkManager is required.** This tool drives it; it does not replace it.
@@ -238,11 +301,20 @@ no internet behind it.
 - **Architectures:** amd64, arm64, armv7 and armv6. ARMv6 covers the
   Raspberry Pi 1 and Pi Zero, which is the architecture upstream dropped in
   v4.4.6 without anyone noticing for three years.
-- **Enterprise WiFi is PEAP/MSCHAPv2 and TTLS/PAP only.** Certificate-based
-  EAP-TLS needs key and certificate paths a portal cannot collect. Also note
-  that without `domain-suffix-match` the supplicant will accept any server
-  certificate its CA store chains to, so PEAP here is not proof against a
-  determined on-path attacker.
+- **Enterprise WiFi is PEAP/MSCHAPv2 only.** Certificate-based EAP-TLS
+  needs key and certificate paths a portal cannot collect. The RADIUS
+  server's certificate must chain to the **host's** system CA store
+  (NetworkManager's `system-ca-certs`; it is the host's wpa_supplicant that
+  reads it, so the `FROM scratch` container image is irrelevant). The
+  portal also asks for an optional *server domain*, which becomes
+  `domain-suffix-match`: without one, any certificate a public CA has issued
+  for *any* name passes, so it is worth filling in. The outer identity is
+  sent as `anonymous@<realm>` (or `anonymous`), so the real username stays
+  inside the TLS tunnel. A network whose RADIUS server uses a **private CA**
+  will fail to join; `--insecure-eap-skip-server-verification` turns CA
+  checking off for it, logs a warning, and lets anyone in radio range who
+  copies the network's name capture the user's MSCHAPv2 exchange, which
+  cracks offline to their password hash.
 - **No rescan button.** A radio in AP mode cannot scan, so rescanning would
   mean dropping the access point and disconnecting the user mid-setup. Use
   the hidden-network field to enter an SSID that did not appear.

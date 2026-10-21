@@ -46,12 +46,20 @@ services:
     volumes:
       - wifi-connect-qr:/data/qr
 
+    # The QR files carry the passphrase, so they are written 0640 and owned
+    # by this container's uid:gid. The container that displays them must
+    # share that group. If it runs as non-root (the Anthias viewer is
+    # uid/gid 1000), give this one its group. The uid stays 0: polkit only
+    # lets root drive NetworkManager here.
+    # user: '0:1000'
+
     # NOT required. We never configure the interface ourselves —
     # NetworkManager does, as root, on the host — and SO_BINDTODEVICE has
-    # been unprivileged since Linux 5.7 for a not-yet-bound socket.
+    # been unprivileged since Linux 5.7 for a socket not already pinned to a
+    # device.
     #
     # Uncomment only if your kernel denies SO_BINDTODEVICE; the symptom is
-    # the DHCP server failing to start with EPERM.
+    # the DHCP, DNS or portal server failing to start with EPERM.
     # cap_add:
     #   - NET_ADMIN
     #   - NET_RAW

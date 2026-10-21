@@ -89,7 +89,22 @@ pub struct Cli {
     )]
     pub insecure_open_portal: bool,
 
+    /// Join enterprise (802.1X) networks WITHOUT verifying the RADIUS
+    /// server's certificate.
+    ///
+    /// By default the server must chain to the host's system CA store, and
+    /// to the server domain the user typed, when they typed one. A network
+    /// whose RADIUS server uses a private CA will then fail to join; this
+    /// restores the old accept-anything behaviour for it. Anyone in radio
+    /// range can then impersonate the network and capture the user's
+    /// MSCHAPv2 exchange, which cracks offline to their password hash.
+    #[arg(long, env = "WIFI_CONNECT_INSECURE_EAP", default_value_t = false)]
+    pub insecure_eap_skip_server_verification: bool,
+
     /// Gateway address of the setup network.
+    ///
+    /// The access point is always a /24 on this address, so it must be a
+    /// host address of that /24 (not .0 or .255).
     #[arg(
         short = 'g',
         long,
@@ -99,6 +114,9 @@ pub struct Cli {
     pub portal_gateway: Ipv4Addr,
 
     /// DHCP range of the setup network, as `first,last`.
+    ///
+    /// Must lie inside the gateway's /24, excluding its .0 and .255 and the
+    /// gateway itself; anything else is refused at startup.
     #[arg(
         short = 'd',
         long,
@@ -139,9 +157,36 @@ pub struct Cli {
     #[arg(long, env = "WIFI_CONNECT_QR_OUTPUT")]
     pub qr_output: Option<PathBuf>,
 
-    /// Do not print the QR code to stdout.
+    /// Never print the QR code to stdout. Wins over `--qr-stdout`.
+    ///
+    /// Under systemd or Docker, stdout is captured into the journal or the
+    /// container log, and a scannable QR there is as good as the
+    /// passphrase. By default it is only printed there when `--qr-output`
+    /// is not set; see `--qr-stdout`.
     #[arg(long, env = "WIFI_CONNECT_NO_QR_STDOUT", default_value_t = false)]
     pub no_qr_stdout: bool,
+
+    /// Print the QR code to stdout even when stdout is not a terminal and
+    /// `--qr-output` is set.
+    ///
+    /// By default the QR goes to stdout when stdout is a terminal (a plain
+    /// HDMI or serial console), or when `--qr-output` is not set and stdout
+    /// is therefore the only place the passphrase is published. Otherwise
+    /// stdout is a log — journald, `docker logs`, a fleet dashboard — and
+    /// the QR stays out of it.
+    #[arg(long, env = "WIFI_CONNECT_QR_STDOUT", default_value_t = false)]
+    pub qr_stdout: bool,
+
+    /// Also log the setup access point's passphrase as plain text.
+    ///
+    /// Off by default: logs travel further than the device's screen
+    /// (journald, `docker logs`, a fleet manager's log shipping), and the
+    /// passphrase is what gets you onto the setup network and so to the
+    /// portal. Turn it on only when people who can read the logs are
+    /// trusted to join, for instance on a bench where a scanner refuses
+    /// the QR.
+    #[arg(long, env = "WIFI_CONNECT_LOG_PASSPHRASE", default_value_t = false)]
+    pub log_passphrase: bool,
 
     /// Raise the portal even when the device is already online.
     #[arg(long, env = "WIFI_CONNECT_FORCE", default_value_t = false)]
@@ -207,19 +252,64 @@ pub enum ConfigError {
     DhcpRangeInverted { first: Ipv4Addr, last: Ipv4Addr },
     #[error("the gateway {0} must not be inside the DHCP range, or it will be handed to a client")]
     GatewayInRange(Ipv4Addr),
+    #[error(
+        "--portal-gateway {0} is the network or broadcast address of its /24; use a host address such as x.y.z.1"
+    )]
+    GatewayNotHost(Ipv4Addr),
+    #[error(
+        "--portal-dhcp-range address {addr} is outside the gateway's subnet {network}/24; clients given it could not reach the portal"
+    )]
+    DhcpRangeOutsideSubnet { addr: Ipv4Addr, network: Ipv4Addr },
+    #[error(
+        "--portal-dhcp-range must not include {0}, the network or broadcast address of the gateway's /24"
+    )]
+    DhcpRangeIncludesReserved(Ipv4Addr),
     #[error("--portal-ssid must be 1 to 32 bytes, got {0}")]
     SsidLength(usize),
     #[error("--portal-passphrase: {0}")]
     Passphrase(String),
 }
 
+/// The access point is always configured as a /24 on the gateway (the NM
+/// `prefix`, the DHCP netmask and the advertised broadcast address all assume
+/// it), so the pool has to live inside that /24 too.
+const AP_PREFIX_MASK: u32 = 0xffff_ff00;
+
 pub fn parse_dhcp_range(spec: &str, gateway: Ipv4Addr) -> Result<DhcpRange, ConfigError> {
     let (a, b) = spec.split_once(',').ok_or(ConfigError::DhcpRangeShape)?;
     let first: Ipv4Addr = a.trim().parse().map_err(|_| ConfigError::DhcpRangeShape)?;
     let last: Ipv4Addr = b.trim().parse().map_err(|_| ConfigError::DhcpRangeShape)?;
 
+    let network = gateway.to_bits() & AP_PREFIX_MASK;
+    let broadcast = network | !AP_PREFIX_MASK;
+    let is_reserved = |ip: Ipv4Addr| ip.to_bits() == network || ip.to_bits() == broadcast;
+
+    // A gateway on .0 or .255 gives the AP an address no client can use as a
+    // router; NetworkManager would accept it and the portal would silently
+    // never load.
+    if is_reserved(gateway) {
+        return Err(ConfigError::GatewayNotHost(gateway));
+    }
     if first > last {
         return Err(ConfigError::DhcpRangeInverted { first, last });
+    }
+    // Outside the gateway's /24, a lease is unusable: the client is told
+    // its netmask is 255.255.255.0 and the gateway is not on its link. This
+    // check also bounds the pool at 254 addresses, so a typo such as
+    // `1.0.0.0,192.168.41.255` is a startup error rather than a pool of
+    // billions.
+    for addr in [first, last] {
+        if addr.to_bits() & AP_PREFIX_MASK != network {
+            return Err(ConfigError::DhcpRangeOutsideSubnet {
+                addr,
+                network: Ipv4Addr::from_bits(network),
+            });
+        }
+    }
+    // Both ends are in the /24 and ordered, so only an end can be .0 or
+    // .255. Handing either to a client gives it an address it cannot use.
+    if let Some(addr) = [first, last].into_iter().find(|ip| is_reserved(*ip)) {
+        return Err(ConfigError::DhcpRangeIncludesReserved(addr));
     }
     // Handing the gateway's own address to a client breaks the portal in a
     // way that is very hard to diagnose from the client side.
@@ -241,6 +331,20 @@ impl Cli {
             SecurityMode::Wpa3 => ApSecurity::Wpa3Sae,
             SecurityMode::Auto | SecurityMode::Wpa2 => ApSecurity::Wpa2Psk,
         }
+    }
+
+    /// Whether the join QR goes to stdout, given whether stdout is a
+    /// terminal and whether the `--qr-output` files were written.
+    ///
+    /// A non-terminal stdout is a log, and a QR in a log is as good as the
+    /// passphrase, so it is only printed there when asked for or when it
+    /// is the only way the passphrase reaches anyone — including when
+    /// `--qr-output` is set but writing it failed.
+    pub fn print_qr_to_stdout(&self, stdout_is_terminal: bool, wrote_qr_files: bool) -> bool {
+        if self.no_qr_stdout {
+            return false;
+        }
+        self.qr_stdout || stdout_is_terminal || !wrote_qr_files
     }
 
     pub fn activity_timeout(&self) -> Duration {
@@ -332,6 +436,14 @@ mod tests {
             c.ui_directory.as_deref(),
             Some(std::path::Path::new("/srv/ui"))
         );
+        assert_eq!(
+            c.validate().unwrap(),
+            DhcpRange {
+                first: Ipv4Addr::new(10, 0, 0, 10),
+                last: Ipv4Addr::new(10, 0, 0, 20),
+            },
+            "a custom gateway with a pool in its /24 must stay valid"
+        );
     }
 
     /// `--portal-interface` was upstream's name; it must keep working.
@@ -353,6 +465,45 @@ mod tests {
         assert_eq!(c.activity_timeout, 0, "0 means no timeout, as upstream");
     }
 
+    /// The passphrase must not reach the logs unless asked for.
+    #[test]
+    fn the_passphrase_is_not_logged_by_default() {
+        assert!(!cli(&[]).log_passphrase);
+        assert!(cli(&["--log-passphrase"]).log_passphrase);
+
+        // Setting the variable for real would race the other tests (and
+        // `set_var` is unsafe), so check the wiring instead.
+        let cmd = Cli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "log_passphrase")
+            .unwrap();
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("WIFI_CONNECT_LOG_PASSPHRASE")
+        );
+    }
+
+    /// With `--qr-output` set, stdout under systemd or Docker is a log the
+    /// QR would leak into. Without it, stdout is the only channel left.
+    #[test]
+    fn the_stdout_qr_stays_out_of_logs_when_there_is_another_channel() {
+        // No terminal (journald, docker logs).
+        assert!(
+            cli(&[]).print_qr_to_stdout(false, false),
+            "the only channel"
+        );
+        assert!(!cli(&[]).print_qr_to_stdout(false, true), "QR files exist");
+        assert!(cli(&["--qr-stdout"]).print_qr_to_stdout(false, true));
+
+        // A real console is a screen, not a log.
+        assert!(cli(&[]).print_qr_to_stdout(true, true));
+
+        // --no-qr-stdout always wins, including over --qr-stdout.
+        assert!(!cli(&["--no-qr-stdout"]).print_qr_to_stdout(true, false));
+        assert!(!cli(&["--no-qr-stdout", "--qr-stdout"]).print_qr_to_stdout(true, false));
+    }
+
     /// The one deliberate behavioural change from upstream, which the
     /// migration guide has to call out.
     #[test]
@@ -361,6 +512,16 @@ mod tests {
         assert!(
             !c.insecure_open_portal,
             "upstream defaults to an open AP; we must not"
+        );
+    }
+
+    /// Skipping RADIUS server verification hands the user's credentials to
+    /// any look-alike access point, so it must never be the default.
+    #[test]
+    fn enterprise_server_verification_is_on_by_default() {
+        assert!(!cli(&[]).insecure_eap_skip_server_verification);
+        assert!(
+            cli(&["--insecure-eap-skip-server-verification"]).insecure_eap_skip_server_verification
         );
     }
 
@@ -413,6 +574,97 @@ mod tests {
             err,
             ConfigError::GatewayInRange(Ipv4Addr::new(192, 168, 42, 1))
         );
+    }
+
+    /// A pool outside the gateway's /24 hands out addresses from which the
+    /// gateway (and so the portal) is unreachable, given the /24 netmask we
+    /// advertise.
+    #[test]
+    fn a_dhcp_range_outside_the_gateway_subnet_is_rejected() {
+        let gw = Ipv4Addr::new(192, 168, 42, 1);
+        for (spec, bad) in [
+            (
+                "192.168.43.2,192.168.43.254",
+                Ipv4Addr::new(192, 168, 43, 2),
+            ),
+            (
+                "192.168.42.2,192.168.43.10",
+                Ipv4Addr::new(192, 168, 43, 10),
+            ),
+            ("10.0.0.2,10.0.0.9", Ipv4Addr::new(10, 0, 0, 2)),
+        ] {
+            assert_eq!(
+                parse_dhcp_range(spec, gw).unwrap_err(),
+                ConfigError::DhcpRangeOutsideSubnet {
+                    addr: bad,
+                    network: Ipv4Addr::new(192, 168, 42, 0),
+                },
+                "accepted {spec:?}"
+            );
+        }
+    }
+
+    /// The typo the /24 rule exists to catch: before it, this range was
+    /// accepted and the lease table tried to materialise every address in
+    /// it, exhausting memory at startup.
+    #[test]
+    fn a_dhcp_range_spanning_most_of_the_address_space_is_rejected() {
+        assert_eq!(
+            parse_dhcp_range("1.0.0.0,192.168.41.255", Ipv4Addr::new(192, 168, 42, 1)).unwrap_err(),
+            ConfigError::DhcpRangeOutsideSubnet {
+                addr: Ipv4Addr::new(1, 0, 0, 0),
+                network: Ipv4Addr::new(192, 168, 42, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn a_dhcp_range_including_the_network_or_broadcast_address_is_rejected() {
+        let gw = Ipv4Addr::new(192, 168, 42, 1);
+        assert_eq!(
+            parse_dhcp_range(
+                "192.168.42.0,192.168.42.0",
+                Ipv4Addr::new(192, 168, 42, 200)
+            )
+            .unwrap_err(),
+            ConfigError::DhcpRangeIncludesReserved(Ipv4Addr::new(192, 168, 42, 0))
+        );
+        assert_eq!(
+            parse_dhcp_range("192.168.42.2,192.168.42.255", gw).unwrap_err(),
+            ConfigError::DhcpRangeIncludesReserved(Ipv4Addr::new(192, 168, 42, 255))
+        );
+        // The network address with the gateway placed above the pool.
+        assert_eq!(
+            parse_dhcp_range(
+                "192.168.42.0,192.168.42.100",
+                Ipv4Addr::new(192, 168, 42, 254)
+            )
+            .unwrap_err(),
+            ConfigError::DhcpRangeIncludesReserved(Ipv4Addr::new(192, 168, 42, 0))
+        );
+    }
+
+    #[test]
+    fn a_gateway_on_the_network_or_broadcast_address_is_rejected() {
+        for gw in [
+            Ipv4Addr::new(192, 168, 42, 0),
+            Ipv4Addr::new(192, 168, 42, 255),
+        ] {
+            assert_eq!(
+                parse_dhcp_range("192.168.42.2,192.168.42.254", gw).unwrap_err(),
+                ConfigError::GatewayNotHost(gw),
+                "accepted gateway {gw}"
+            );
+        }
+    }
+
+    /// The widest legal pool: every host address but the gateway's.
+    #[test]
+    fn the_default_range_and_a_full_host_range_still_parse() {
+        assert!(cli(&[]).validate().is_ok(), "the default must be valid");
+        let r = parse_dhcp_range("10.0.0.1,10.0.0.253", Ipv4Addr::new(10, 0, 0, 254)).unwrap();
+        assert_eq!(r.first, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(r.last, Ipv4Addr::new(10, 0, 0, 253));
     }
 
     #[test]
