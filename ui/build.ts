@@ -14,6 +14,7 @@
  */
 
 import { $ } from 'bun'
+import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -149,6 +150,27 @@ function stripCssComments(css: string): string {
     .trim()
 }
 
+/**
+ * The CSP source expression for every inline `<tag>` block in `html`.
+ *
+ * The server sends a Content-Security-Policy that allows inline script and
+ * style ONLY by hash, so the hashes have to be of the exact bytes the
+ * browser sees between the tags. They are taken from the finished page
+ * rather than from the inputs to it, which is the only way to be sure the
+ * newline and indentation around each block are counted the way the
+ * browser counts them.
+ *
+ * The Rust side substitutes its tokens into the page after this, but only
+ * into markup and text, never into these bodies, and a test there
+ * recomputes every hash from the rendered page to keep it that way.
+ */
+function inlineHashes(html: string, tag: 'script' | 'style'): string[] {
+  const block = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'g')
+  return [...html.matchAll(block)].map(
+    (m) => `'sha256-${createHash('sha256').update(m[1], 'utf8').digest('base64')}'`,
+  )
+}
+
 async function build(): Promise<void> {
   await mkdir(tmp, { recursive: true })
   await mkdir(dist, { recursive: true })
@@ -195,6 +217,9 @@ async function build(): Promise<void> {
     stripCssComments(dark),
   ].join('\n')
 
+  const scriptHashes = new Set<string>()
+  const styleHashes = new Set<string>()
+
   for (const page of ['index', 'connecting']) {
     const html = await readFile(join(src, `${page}.html`), 'utf8')
     // The markers are HTML comments, not {{tokens}} inside <style>/<script>
@@ -208,7 +233,20 @@ async function build(): Promise<void> {
       // single-request property this file's test asserts.
       .replace('<!--BRAND-->', () => '{{BRAND_CSS}}')
     await writeFile(join(dist, `${page}.html`), out, 'utf8')
+
+    for (const h of inlineHashes(out, 'script')) scriptHashes.add(h)
+    for (const h of inlineHashes(out, 'style')) styleHashes.add(h)
   }
+
+  // Read by src/http/assets.rs to build the Content-Security-Policy. Only
+  // the hashes live here; the policy itself is written in Rust, next to
+  // the routes it has to agree with. Sorted so an unchanged UI rebuilds to
+  // an unchanged file.
+  await writeFile(
+    join(dist, 'csp.json'),
+    `${JSON.stringify({ script: [...scriptHashes].sort(), style: [...styleHashes].sort() }, null, 2)}\n`,
+    'utf8',
+  )
 
   // A worked example for integrators: override roles, never primitives.
   await writeFile(

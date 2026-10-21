@@ -62,8 +62,14 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # And no IPAddressDeny: the DHCP server has to talk to clients that have no
 # address yet, which no address-based filter can express.
 
+# The QR files under here carry the setup AP's passphrase, so nothing in
+# the state directory is world-readable. The files themselves are created
+# 0640 regardless; UMask covers anything else the service writes. A host
+# application that displays the QR must run as root or in this unit's
+# group (root, unless you set Group=).
 StateDirectory=wifi-connect
-StateDirectoryMode=0755
+StateDirectoryMode=0750
+UMask=0027
 ReadWritePaths=/var/lib/wifi-connect
 
 [Install]

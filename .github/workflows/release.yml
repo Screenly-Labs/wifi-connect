@@ -4,11 +4,20 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write # create the release
-  packages: write # push to GHCR
-  id-token: write # OIDC, for the attestation
-  attestations: write
+# Nothing by default; each job asks for exactly what it uses.
+#
+# These used to be granted here, at workflow level, which handed a
+# release-writing, package-pushing, OIDC-minting token to every job --
+# including the build matrix, which runs `bun install`, executes
+# third-party `cross` containers and compiles a few hundred crates' build
+# scripts. None of that needs to write anything to GitHub, so none of it
+# gets a token that can.
+#
+# Same-run artifacts do NOT need `actions: read`: upload-/download-artifact
+# talk to the artifact service with the runner's own ACTIONS_RUNTIME_TOKEN,
+# not GITHUB_TOKEN. (That permission is only for pulling artifacts out of a
+# different run via `github-token:`, which nothing here does.)
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,8 +30,12 @@ jobs:
   # immutable by the time anyone notices.
   version:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: the tag matches Cargo.toml
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -56,20 +69,32 @@ jobs:
             arch: armv6
             platform: linux/arm/v6
     runs-on: ubuntu-24.04
+    # Read-only: this is the job that runs other people's code (npm
+    # packages, cross images, crate build scripts).
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.3"
+          # setup-bun otherwise restores the bun executable itself from the
+          # Actions cache, and that executable then runs in this job before
+          # `cross build`. Same reasoning as the missing rust-cache below.
+          no-cache: true
       # Rebuilt rather than trusted: a release must not ship whatever
       # happened to be committed in ui/dist.
       - run: bun install --frozen-lockfile && bun run build
         working-directory: ui
       - run: git diff --exit-code -- ui/dist
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: ${{ matrix.target }}
+      # Deliberately no Swatinem/rust-cache here (ci.yml keeps it). A
+      # restored cache is a target/ directory written by some earlier
+      # workflow run, and a release binary must not be linked against
+      # build outputs this run did not produce. A clean build costs a few
+      # minutes per tag; a poisoned cache would ship in every artifact.
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cross
@@ -95,8 +120,19 @@ jobs:
   image:
     needs: [build]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write # push to GHCR (and the attestation, below)
+      id-token: write # OIDC, to sign the attestation
+      attestations: write
+      # With push-to-registry, the attest action also records where the
+      # image is stored (the org's "Linked artifacts" page). Without this
+      # it only warns, but the record is silently missing.
+      artifact-metadata: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*
@@ -106,7 +142,14 @@ jobs:
 
       # No setup-qemu: nothing is emulated. The Dockerfile only COPYs
       # binaries that `cross` already built.
+      #
+      # BuildKit assembles the image, generates its provenance and SBOM, and is
+      # handed the GHCR credentials to do it, so it is pinned like the
+      # cross images: tag for humans, digest for Docker. (Left alone,
+      # setup-buildx runs whatever moby/buildkit:buildx-stable-1 is today.)
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -197,8 +240,13 @@ jobs:
       matrix:
         platform: [amd64, arm64, armhf]
     runs-on: ubuntu-24.04
+    # Publishing authenticates with the store secret, not GITHUB_TOKEN.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*
@@ -216,24 +264,69 @@ jobs:
           name: snap-${{ matrix.platform }}
           path: ${{ steps.snapcraft.outputs.snap }}
 
-      # Publishing is gated on the secret existing, so a fork — and the
-      # first few releases, before the store listing exists — still produce
-      # a downloadable .snap rather than failing the run.
+      # Publishing is gated on the secret existing, so a fork still
+      # produces a downloadable .snap rather than failing the run.
+      #
+      # The gate is its own step. It used to be `if: env.SNAPCRAFT_...`
+      # on the publish step, reading the `env:` of that same step — but a
+      # step's `if` is evaluated before its own `env` is applied, so the
+      # condition was always false and the publish was skipped on every
+      # release whether the secret existed or not. Nothing ever reached
+      # the store. A job-level env would also fix it, at the cost of
+      # handing the store credentials to every action in the job.
+      - name: are store credentials configured
+        id: store
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [ -n "${SNAPCRAFT_STORE_CREDENTIALS}" ]; then
+            echo "configured=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "configured=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: publish to the snap store
-        if: ${{ env.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        if: ${{ steps.store.outputs.configured == 'true' }}
         uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40 # v1.2.0
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
         with:
           snap: ${{ steps.snapcraft.outputs.snap }}
-          release: edge
+          # A tag is a release, and the GitHub Release it produces is not
+          # marked pre-release, so the snap goes where `snap install`
+          # looks by default.
+          release: stable
+
+      # Skipping is right for a fork and wrong here. Say so on the run
+      # summary rather than skipping silently, which is how the missing
+      # store listing went unnoticed.
+      - name: say so when the store publish was skipped
+        if: ${{ steps.store.outputs.configured != 'true' && github.repository == 'Screenly-Labs/wifi-connect' }}
+        run: |
+          echo "::warning::SNAPCRAFT_STORE_CREDENTIALS is not set, so the" \
+               "${{ matrix.platform }} snap was NOT published to the Snap" \
+               "Store. See docs/snap.md, 'Publishing'."
 
   release:
     needs: [image, snap]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the release, generate its notes
+      id-token: write # OIDC, to sign the tarball attestation
+      attestations: write
     steps:
+      # Only what this workflow means to ship. An unfiltered download also
+      # picks up the build record build-push-action uploads as an artifact
+      # (`*.dockerbuild`), which then went out as a release asset and into
+      # SHA256SUMS.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: snap-*
           path: dist
           merge-multiple: true
       - name: checksums

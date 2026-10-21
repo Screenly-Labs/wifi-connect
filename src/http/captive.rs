@@ -4,7 +4,9 @@
 //! known URL and checking for an exact response. Our DNS answers every name
 //! with our own address, so those probes arrive here — carrying
 //! `Host: captive.apple.com`, `Host: connectivitycheck.gstatic.com` and so
-//! on. **Never route on the Host header**: doing so 404s every probe.
+//! on. **Never route on the Host header**: doing so 404s every probe. (The
+//! one place Host matters is *how* the portal page is delivered — in place
+//! or by redirect — never *whether* a probe is answered.)
 //!
 //! What we return decides whether the sign-in sheet opens:
 //!
