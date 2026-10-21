@@ -170,11 +170,35 @@ describe('works without JavaScript', () => {
     expect(connecting).toMatch(/http-equiv=["']refresh["']/i)
   })
 
+  test('the server domain is posted from inside the enterprise block', () => {
+    // It only means something next to an 802.1X username, so it shows and
+    // hides with that block, and the field name is what /connect reads.
+    const block = indexEff.match(/<div[^>]+id="identity-field"[^>]*>([\s\S]*?)<\/div>/)
+    expect(block, 'the enterprise block').not.toBeNull()
+    expect(block?.[0]).toMatch(/id="identity-field"[^>]*hidden/)
+    expect(block?.[1]).toMatch(/<input[^>]+name="server_domain"/)
+    expect(block?.[1]).toMatch(/<label[^>]+for="server-domain"/)
+  })
+
   test('enhancement-only controls start hidden', () => {
-    // Show/hide and the theme toggle do nothing without JS, so they must
-    // not be visible to a user who has none.
+    // Show/hide does nothing without JS, so it must not be visible to a
+    // user who has none. The theme toggle is the same, but it is emitted
+    // by the server now (only when the theme is not pinned), so its
+    // `hidden` attribute is asserted in src/http/assets.rs instead.
     expect(index).toMatch(/id="pw-toggle"[^>]*hidden/)
-    expect(index).toMatch(/id="theme-toggle"[^>]*hidden/)
+    expect(index).toMatch(/\{\{THEME_TOGGLE\}\}/)
+  })
+
+  test('a pinned theme survives a stored preference', () => {
+    // --default-theme renders data-theme on <html>. The boot script must
+    // leave it alone: a phone that visited a differently-themed portal
+    // earlier has a wc-theme in storage, and it does not get to overrule
+    // the integrator.
+    expect(index).toMatch(/\{\{THEME_ATTR\}\}/)
+    expect(index).toMatch(/hasAttribute\(["']data-theme["']\)/)
+    const guard = index.indexOf('hasAttribute')
+    const read = index.indexOf('localStorage.getItem')
+    expect(guard, 'the guard must come before the storage read').toBeLessThan(read)
   })
 })
 

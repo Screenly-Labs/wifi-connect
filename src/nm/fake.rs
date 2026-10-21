@@ -6,6 +6,15 @@
 //! station profile was deleted before the AP came back", "teardown ran even
 //! on SIGTERM" — and a `Vec<Call>` expresses those far more directly than
 //! expectation macros do.
+//!
+//! It also keeps a small table of **saved profiles**, because the other
+//! property that matters is *which* profiles a run deletes. Like
+//! NetworkManager, every join attempt leaves a station profile behind (the
+//! worst case: nmrs cleans up after some failures itself, but not, for
+//! example, when our timeout cancels it mid-activation), and every raise
+//! leaves an access-point profile. Deletion is by UUID only, exactly as the
+//! trait allows, so a test can seed the table with an unrelated profile that
+//! shares a name and prove it survives.
 
 #![cfg(test)]
 
@@ -28,11 +37,46 @@ pub enum Call {
     AwaitAutoconnect,
     Scan,
     RaiseAp { ssid: String, encrypted: bool },
-    TearDownAp,
+    TearDownAp { uuid: String },
     Join { ssid: String },
-    Forget { ssid: String },
+    DeleteProfile { uuid: String },
     Restore,
     SweepStaleAps,
+}
+
+/// A saved NetworkManager profile, reduced to what deletion decisions
+/// depend on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeProfile {
+    pub uuid: String,
+    /// `connection.id`.
+    pub id: String,
+    /// `802-11-wireless.ssid`; `None` for a non-WiFi profile.
+    pub ssid: Option<String>,
+    /// `802-11-wireless.mode == "ap"`.
+    pub ap: bool,
+}
+
+impl FakeProfile {
+    /// A station profile as nmrs names one: `connection.id` is the SSID.
+    pub fn station(uuid: &str, ssid: &str) -> Self {
+        Self {
+            uuid: uuid.into(),
+            id: ssid.into(),
+            ssid: Some(ssid.into()),
+            ap: false,
+        }
+    }
+
+    /// A non-WiFi profile, e.g. `Wired connection 1` or a VPN.
+    pub fn other(uuid: &str, id: &str) -> Self {
+        Self {
+            uuid: uuid.into(),
+            id: id.into(),
+            ssid: None,
+            ap: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -40,6 +84,8 @@ struct State {
     calls: Vec<Call>,
     join_results: Vec<JoinOutcome>,
     ap_raises: u32,
+    joins: u32,
+    profiles: Vec<FakeProfile>,
 }
 
 /// A scriptable network stack.
@@ -53,6 +99,8 @@ pub struct FakeNm {
     pub autoconnect_succeeds: bool,
     pub networks: Vec<WifiNetwork>,
     pub ap_fails: bool,
+    /// Make `station_profile_uuids` fail, as a D-Bus error would.
+    pub profiles_unreadable: bool,
 }
 
 impl FakeNm {
@@ -62,6 +110,8 @@ impl FakeNm {
                 calls: Vec::new(),
                 join_results: Vec::new(),
                 ap_raises: 0,
+                joins: 0,
+                profiles: Vec::new(),
             })),
             device: DeviceInfo {
                 interface: "wlan0".into(),
@@ -75,7 +125,35 @@ impl FakeNm {
             autoconnect_succeeds: false,
             networks: Vec::new(),
             ap_fails: false,
+            profiles_unreadable: false,
         }
+    }
+
+    /// Seed the saved-profile table with profiles that existed before the run.
+    pub fn with_profiles(self, profiles: Vec<FakeProfile>) -> Self {
+        self.state.lock().unwrap().profiles = profiles;
+        self
+    }
+
+    pub fn with_unreadable_profiles(mut self) -> Self {
+        self.profiles_unreadable = true;
+        self
+    }
+
+    /// The saved-profile table as it stands now.
+    pub fn profiles(&self) -> Vec<FakeProfile> {
+        self.state.lock().unwrap().profiles.clone()
+    }
+
+    /// Every UUID the run asked to delete, in order.
+    pub fn deleted(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::DeleteProfile { uuid } => Some(uuid),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Script the outcome of each successive join attempt, in order.
@@ -187,14 +265,30 @@ impl NetworkControl for FakeNm {
         }
         let mut state = self.state.lock().unwrap();
         state.ap_raises += 1;
+        // A fresh UUID per raise, as the real implementation mints one, so
+        // a test can tell which raise a teardown was aimed at.
+        let uuid = format!("ap-{}", state.ap_raises);
+        state.profiles.push(FakeProfile {
+            uuid: uuid.clone(),
+            id: crate::nm::nmrs_impl::AP_PROFILE_ID.into(),
+            ssid: Some(config.ssid.to_display_string()),
+            ap: true,
+        });
         Ok(ApHandle {
-            uuid: "00000000-0000-4000-8000-00000000fake".into(),
+            uuid,
             interface: "wlan0".into(),
         })
     }
 
-    async fn tear_down_ap(&self, _handle: &ApHandle) -> Result<(), NetworkError> {
-        self.record(Call::TearDownAp);
+    async fn tear_down_ap(&self, handle: &ApHandle) -> Result<(), NetworkError> {
+        self.record(Call::TearDownAp {
+            uuid: handle.uuid.clone(),
+        });
+        self.state
+            .lock()
+            .unwrap()
+            .profiles
+            .retain(|p| p.uuid != handle.uuid);
         Ok(())
     }
 
@@ -208,6 +302,12 @@ impl NetworkControl for FakeNm {
             ssid: request.ssid.to_display_string(),
         });
         let mut state = self.state.lock().unwrap();
+        // Every attempt leaves a new profile named after the SSID, as
+        // NetworkManager does, whatever profiles already carry that name.
+        state.joins += 1;
+        let uuid = format!("join-{}", state.joins);
+        let ssid = request.ssid.to_display_string();
+        state.profiles.push(FakeProfile::station(&uuid, &ssid));
         if state.join_results.is_empty() {
             Ok(JoinOutcome::Joined)
         } else {
@@ -215,10 +315,29 @@ impl NetworkControl for FakeNm {
         }
     }
 
-    async fn forget(&self, ssid: &Ssid) -> Result<(), NetworkError> {
-        self.record(Call::Forget {
-            ssid: ssid.to_display_string(),
-        });
+    async fn station_profile_uuids(&self, ssid: &Ssid) -> Result<Vec<String>, NetworkError> {
+        if self.profiles_unreadable {
+            return Err(NetworkError::Other("scripted failure".into()));
+        }
+        let want = ssid.to_display_string();
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .profiles
+            .iter()
+            .filter(|p| !p.ap && p.ssid.as_deref() == Some(want.as_str()))
+            .map(|p| p.uuid.clone())
+            .collect())
+    }
+
+    async fn delete_profile(&self, uuid: &str) -> Result<(), NetworkError> {
+        self.record(Call::DeleteProfile { uuid: uuid.into() });
+        self.state
+            .lock()
+            .unwrap()
+            .profiles
+            .retain(|p| p.uuid != uuid);
         Ok(())
     }
 
