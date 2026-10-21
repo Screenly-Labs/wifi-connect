@@ -125,8 +125,9 @@ pub async fn preflight<N: NetworkControl>(
 
     // Not merely "connectivity is Full": where NetworkManager's checking is
     // disabled (the Debian-family default) the verdict is always Unknown,
-    // and treating that as offline raised the portal on devices online over
-    // ethernet — or over WiFi, on the very radio the AP would replace.
+    // and treating that as offline raised the access point on the very
+    // radio that was already connected as a station, dropping that link.
+    // A wired-only device still gets the portal; see `is_online`.
     if nm.is_online(&device).await? {
         info!("already online; the portal is not needed");
         return Ok(None);

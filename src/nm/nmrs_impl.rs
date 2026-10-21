@@ -305,7 +305,8 @@ fn to_connectivity(state: nmrs::ConnectivityState) -> Connectivity {
         nmrs::ConnectivityState::Unknown => Connectivity::Unknown,
         // The enum is #[non_exhaustive]. A state we have never heard of
         // must not read as "online": that would skip the portal on a device
-        // that needs it, which is the worse of the two failures.
+        // that needs it. As Unknown it only counts as online when the radio
+        // is already a connected station, the same as no probe at all.
         _ => Connectivity::Unknown,
     }
 }
