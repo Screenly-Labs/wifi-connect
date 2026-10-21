@@ -164,6 +164,11 @@ pub enum Connectivity {
     /// Associated but behind someone else's captive portal, or no route out.
     Limited,
     None,
+    /// NetworkManager did not probe. Usually because connectivity checking
+    /// is disabled — the default on Debian, Raspberry Pi OS and Ubuntu
+    /// Server/Core, which ship no check URI. This is "we cannot tell", not
+    /// "offline": [`NetworkControl::is_online`] then asks whether the WiFi
+    /// radio is already a connected station before anything acts on it.
     Unknown,
 }
 
@@ -224,6 +229,36 @@ pub trait NetworkControl: Send + Sync + 'static {
     /// Ask NetworkManager to re-check, rather than reading its cached
     /// property, which can be arbitrarily stale.
     async fn check_connectivity(&self) -> Result<Connectivity, NetworkError>;
+
+    /// Whether the WiFi device we would drive is ACTIVATED as a station
+    /// (infrastructure mode, not an access point). Read without probing.
+    /// Failed reads must answer `false`: that is the behaviour from before
+    /// this fallback existed, and the portal comes up.
+    async fn station_activated(&self, device: &DeviceInfo) -> Result<bool, NetworkError>;
+
+    /// The single "are we online?" decision, shared by the startup gate and
+    /// the autoconnect wait so the two cannot disagree.
+    ///
+    /// A definite verdict from the probe stands: `Limited` and `None` mean
+    /// the user may need the portal to pick a different network, even if
+    /// the radio is associated.
+    ///
+    /// `Unknown` — no probe ran, usually because checking is disabled —
+    /// counts as online only when the radio is already a connected station.
+    /// That is the one case where raising the access point does damage: it
+    /// would replace that very connection, and with no activity timeout the
+    /// device would never get it back. NetworkManager's global `State` is
+    /// deliberately *not* consulted: with checking disabled it reads
+    /// `CONNECTED_GLOBAL` for any link with a default route, including an
+    /// ethernet LAN with no internet, and trusting it there would stop the
+    /// portal from ever appearing on a device that needs it.
+    async fn is_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
+        match self.check_connectivity().await? {
+            Connectivity::Full => Ok(true),
+            Connectivity::Unknown => self.station_activated(device).await,
+            Connectivity::Limited | Connectivity::None => Ok(false),
+        }
+    }
 
     /// How many WiFi profiles are already saved.
     ///

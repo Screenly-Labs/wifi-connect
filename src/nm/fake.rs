@@ -32,6 +32,7 @@ use crate::ssid::Ssid;
 pub enum Call {
     FindDevice,
     CheckConnectivity,
+    StationActivated,
     SavedProfileCount,
     AwaitAutoconnect,
     Scan,
@@ -93,6 +94,7 @@ pub struct FakeNm {
     state: Arc<Mutex<State>>,
     pub device: DeviceInfo,
     pub connectivity: Connectivity,
+    pub station_activated: bool,
     pub saved_profiles: usize,
     pub autoconnect_succeeds: bool,
     pub networks: Vec<WifiNetwork>,
@@ -118,6 +120,7 @@ impl FakeNm {
                 managed: true,
             },
             connectivity: Connectivity::None,
+            station_activated: false,
             saved_profiles: 0,
             autoconnect_succeeds: false,
             networks: Vec::new(),
@@ -161,6 +164,11 @@ impl FakeNm {
 
     pub fn with_connectivity(mut self, c: Connectivity) -> Self {
         self.connectivity = c;
+        self
+    }
+
+    pub fn with_station_activated(mut self, activated: bool) -> Self {
+        self.station_activated = activated;
         self
     }
 
@@ -217,6 +225,11 @@ impl NetworkControl for FakeNm {
     async fn check_connectivity(&self) -> Result<Connectivity, NetworkError> {
         self.record(Call::CheckConnectivity);
         Ok(self.connectivity)
+    }
+
+    async fn station_activated(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {
+        self.record(Call::StationActivated);
+        Ok(self.station_activated)
     }
 
     async fn saved_wifi_profile_count(&self) -> Result<usize, NetworkError> {

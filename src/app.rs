@@ -39,8 +39,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::nm::{
-    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinOutcome, JoinRequest, NetworkControl,
-    NetworkError,
+    ApConfig, ApHandle, DeviceInfo, JoinOutcome, JoinRequest, NetworkControl, NetworkError,
 };
 
 use crate::ssid::Ssid;
@@ -128,7 +127,12 @@ pub async fn preflight<N: NetworkControl>(
         return Ok(Some(device));
     }
 
-    if nm.check_connectivity().await? == Connectivity::Full {
+    // Not merely "connectivity is Full": where NetworkManager's checking is
+    // disabled (the Debian-family default) the verdict is always Unknown,
+    // and treating that as offline raised the access point on the very
+    // radio that was already connected as a station, dropping that link.
+    // A wired-only device still gets the portal; see `is_online`.
+    if nm.is_online(&device).await? {
         info!("already online; the portal is not needed");
         return Ok(None);
     }
@@ -373,7 +377,7 @@ mod tests {
     use super::*;
     use crate::nm::fake::{Call, FakeNm, FakeProfile};
     use crate::nm::security::Security;
-    use crate::nm::{ApSecurity, JoinFailure, WifiNetwork};
+    use crate::nm::{ApSecurity, Connectivity, JoinFailure, WifiNetwork};
     use crate::secret::Secret;
     use crate::ssid::Ssid;
     use crate::state::Branding;
@@ -420,6 +424,68 @@ mod tests {
             !nm.calls().iter().any(|c| matches!(c, Call::RaiseAp { .. })),
             "an online device must not broadcast a setup network"
         );
+    }
+
+    /// With connectivity checking disabled (Debian, Raspberry Pi OS, Ubuntu
+    /// Server) NM never says Full. A radio already connected as a station
+    /// must not be turned into an access point on that basis: doing so
+    /// drops the working connection, and with no activity timeout the
+    /// device never gets it back.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_over_a_connected_station_does_not_raise_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(1)
+            .with_station_activated(true);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+        assert!(
+            !nm.calls().contains(&Call::AwaitAutoconnect),
+            "already connected; there is nothing to wait for"
+        );
+    }
+
+    /// The fallback must not swallow the case the portal exists for. This
+    /// also covers a device online only over ethernet: with checking
+    /// disabled nothing distinguishes a LAN with internet from one without,
+    /// so the portal comes up as it always did.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_without_a_connected_station_raises_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(0)
+            .with_station_activated(false);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_some());
+        assert!(nm.calls().contains(&Call::StationActivated));
+    }
+
+    /// Saved profiles, nothing up yet, checking disabled: the autoconnect
+    /// wait still runs and, when nothing comes up, the portal is raised.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_with_saved_profiles_still_waits_then_raises_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(1)
+            .with_station_activated(false);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_some());
+        assert!(nm.calls().contains(&Call::AwaitAutoconnect));
+    }
+
+    /// A definite verdict from a probe stands. An associated station that
+    /// NM *knows* cannot reach the internet is exactly when the user may
+    /// need the portal to pick another network, so the station is not even
+    /// consulted.
+    #[tokio::test(start_paused = true)]
+    async fn a_definite_offline_verdict_is_not_overridden_by_a_connected_station() {
+        for verdict in [Connectivity::None, Connectivity::Limited] {
+            let nm = FakeNm::new()
+                .with_connectivity(verdict)
+                .with_station_activated(true);
+            assert!(preflight(&nm, &config()).await.unwrap().is_some());
+            assert!(!nm.calls().contains(&Call::StationActivated));
+        }
     }
 
     /// Associating, DHCP and a probe take 15-30s from cold. Without this

@@ -24,7 +24,10 @@ use nmrs::raw::zbus;
 use nmrs::{ConnectionError, NetworkManager, WifiSecurity};
 use tracing::{debug, info, warn};
 
-use super::proxies::{DeviceProxy, DeviceWirelessProxy, WIFI_MODE_AP, is_device_busy};
+use super::proxies::{
+    DEVICE_STATE_ACTIVATED, DeviceProxy, DeviceWirelessProxy, WIFI_MODE_AP, WIFI_MODE_INFRA,
+    is_device_busy,
+};
 use super::security;
 use super::settings::{ApProfile, ap_settings};
 use super::{
@@ -524,6 +527,13 @@ fn classify_failure(e: &ConnectionError) -> JoinFailure {
     }
 }
 
+/// A device fully activated in infrastructure mode: a connected station.
+/// An activated *access point* is not one — that is a previous run's AP,
+/// which the startup sweep deals with.
+fn is_activated_station(device_state: u32, wifi_mode: u32) -> bool {
+    device_state == DEVICE_STATE_ACTIVATED && wifi_mode == WIFI_MODE_INFRA
+}
+
 fn to_connectivity(state: nmrs::ConnectivityState) -> Connectivity {
     match state {
         nmrs::ConnectivityState::Full => Connectivity::Full,
@@ -532,7 +542,8 @@ fn to_connectivity(state: nmrs::ConnectivityState) -> Connectivity {
         nmrs::ConnectivityState::Unknown => Connectivity::Unknown,
         // The enum is #[non_exhaustive]. A state we have never heard of
         // must not read as "online": that would skip the portal on a device
-        // that needs it, which is the worse of the two failures.
+        // that needs it. As Unknown it only counts as online when the radio
+        // is already a connected station, the same as no probe at all.
         _ => Connectivity::Unknown,
     }
 }
@@ -629,15 +640,58 @@ impl NetworkControl for NmrsControl {
         // can be arbitrarily stale on a device that just booted.
         match self.nm.check_connectivity().await {
             Ok(s) => Ok(to_connectivity(s)),
-            // NM can be built with connectivity checking disabled, in which
-            // case "unknown" is the honest answer and the portal should
-            // come up rather than the tool giving up.
+            // Connectivity checking is disabled — NM's behaviour wherever no
+            // check URI is configured, which includes Debian, Raspberry Pi
+            // OS and Ubuntu Server/Core. "Unknown" is the honest answer;
+            // `is_online` then asks whether the radio is a connected
+            // station, so this must not be read as "offline".
             Err(ConnectionError::ConnectivityCheckDisabled) => {
                 debug!("NetworkManager connectivity checking is disabled");
                 Ok(Connectivity::Unknown)
             }
             Err(e) => Err(NetworkError::Other(e.to_string())),
         }
+    }
+
+    async fn station_activated(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
+        // Best-effort: every failed read answers "not a station", which is
+        // the behaviour from before this fallback existed — the portal
+        // comes up.
+        let dev = match self.nm.wifi_device_by_interface(&device.interface).await {
+            Ok(dev) => dev,
+            Err(e) => {
+                debug!(error = %e, "could not look up the WiFi device");
+                return Ok(false);
+            }
+        };
+        let state = match DeviceProxy::builder(self.bus()).path(dev.path.clone()) {
+            Ok(b) => match b.build().await {
+                Ok(p) => p.state().await.unwrap_or_else(|e| {
+                    debug!(error = %e, "could not read the WiFi device's State");
+                    0
+                }),
+                Err(_) => 0,
+            },
+            Err(_) => 0,
+        };
+        let mode = match DeviceWirelessProxy::builder(self.bus()).path(dev.path) {
+            Ok(b) => match b.build().await {
+                Ok(p) => p.mode().await.unwrap_or_else(|e| {
+                    debug!(error = %e, "could not read the WiFi device's Mode");
+                    0
+                }),
+                Err(_) => 0,
+            },
+            Err(_) => 0,
+        };
+        let activated = is_activated_station(state, mode);
+        debug!(
+            state,
+            mode,
+            activated,
+            "connectivity unknown; checking whether the radio is a connected station"
+        );
+        Ok(activated)
     }
 
     async fn saved_wifi_profile_count(&self) -> Result<usize, NetworkError> {
@@ -655,17 +709,20 @@ impl NetworkControl for NmrsControl {
 
     async fn await_autoconnect(
         &self,
-        _device: &DeviceInfo,
+        device: &DeviceInfo,
         budget: Duration,
     ) -> Result<bool, NetworkError> {
         // Poll NM's own connectivity verdict rather than tracking device
         // state ourselves: "associated" is not the same as "usable", and
         // the whole point of the wait is to find out whether the device can
-        // actually reach the internet.
+        // actually reach the internet. Through `is_online`, so that with
+        // checking disabled — where the verdict is always Unknown — a WiFi
+        // station that comes up still ends the wait, instead of the wait running
+        // out and the access point being raised over that link.
         let deadline = tokio::time::Instant::now() + budget;
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
-            if self.check_connectivity().await? == Connectivity::Full {
+            if self.is_online(device).await? {
                 return Ok(true);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1346,6 +1403,21 @@ mod tests {
             Some(display.as_bytes()),
             &odd
         ));
+    }
+
+    #[test]
+    fn only_an_activated_infrastructure_device_is_a_station() {
+        assert!(is_activated_station(
+            DEVICE_STATE_ACTIVATED,
+            WIFI_MODE_INFRA
+        ));
+        // Our own (or a crashed run's) access point is not a station.
+        assert!(!is_activated_station(DEVICE_STATE_ACTIVATED, WIFI_MODE_AP));
+        // Still getting an address, or disconnected, is not connected.
+        assert!(!is_activated_station(70, WIFI_MODE_INFRA));
+        assert!(!is_activated_station(30, WIFI_MODE_INFRA));
+        // A failed read (zeroes) must fail towards "not a station".
+        assert!(!is_activated_station(0, 0));
     }
 
     #[test]
