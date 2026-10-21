@@ -153,6 +153,26 @@ describe('theming', () => {
   })
 })
 
+describe('wording', () => {
+  test('the credential is called a passphrase, because that is what WPA calls it', () => {
+    // "Password" is what the field said, and it is the wrong word for a
+    // WPA-PSK network: the back of every router, and 802.11 itself, say
+    // passphrase. 802.1X is the exception — that really is a directory
+    // password — and portal.ts swaps the label for it, the same way it
+    // already swaps the hint.
+    expect(indexEff).toMatch(/<label[^>]*for="pw"[^>]*>\s*Passphrase\s*<\/label>/)
+    expect(indexEff).toMatch(/id="pw-label"/)
+  })
+
+  test('the enterprise arm still says password', () => {
+    // Telling someone their directory password is a "passphrase" sends
+    // them looking for the wrong credential just as surely.
+    // Quote-agnostic: the bundler rewrites '' to "" on the way out.
+    expect(indexEff).toMatch(/needsIdentity\s*\?\s*["']Password["']\s*:\s*["']Passphrase["']/)
+    expect(indexEff).toMatch(/enterprise \(802\.1X\) password/)
+  })
+})
+
 describe('works without JavaScript', () => {
   test('the page is a real form that posts to /connect', () => {
     expect(index).toMatch(/<form[^>]+method=["']post["']/i)
