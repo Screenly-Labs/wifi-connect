@@ -80,6 +80,10 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: "1.4.3"
+          # setup-bun otherwise restores the bun executable itself from the
+          # Actions cache, and that executable then runs in this job before
+          # `cross build`. Same reasoning as the missing rust-cache below.
+          no-cache: true
       # Rebuilt rather than trusted: a release must not ship whatever
       # happened to be committed in ui/dist.
       - run: bun install --frozen-lockfile && bun run build
@@ -138,7 +142,14 @@ jobs:
 
       # No setup-qemu: nothing is emulated. The Dockerfile only COPYs
       # binaries that `cross` already built.
+      #
+      # BuildKit assembles the image, generates its provenance and SBOM, and is
+      # handed the GHCR credentials to do it, so it is pinned like the
+      # cross images: tag for humans, digest for Docker. (Left alone,
+      # setup-buildx runs whatever moby/buildkit:buildx-stable-1 is today.)
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -279,8 +290,18 @@ jobs:
       id-token: write # OIDC, to sign the tarball attestation
       attestations: write
     steps:
+      # Only what this workflow means to ship. An unfiltered download also
+      # picks up the build record build-push-action uploads as an artifact
+      # (`*.dockerbuild`), which then went out as a release asset and into
+      # SHA256SUMS.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: snap-*
           path: dist
           merge-multiple: true
       - name: checksums
