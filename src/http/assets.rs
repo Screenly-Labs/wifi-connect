@@ -11,18 +11,336 @@
 //! a handful of tokens and the page is a fixed shape; a dependency that could
 //! render arbitrary templates would be more machinery than the problem has.
 
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::cli::ThemeMode;
 use crate::nm::WifiNetwork;
 use crate::nm::security::Security;
-use crate::state::{Branding, PortalState};
+use crate::state::{Branding, PortalState, Shared};
 
 #[derive(rust_embed::Embed)]
 #[folder = "ui/dist/"]
 struct Assets;
+
+/// The most a `--ui-directory` may hold, in total.
+///
+/// The embedded UI is under 40 KB because the pages inline their own CSS
+/// and script. Eight megabytes is two orders of magnitude of headroom for
+/// fonts and images, and small enough that pointing the flag at the wrong
+/// directory — `/`, a home directory, a node_modules — fails at boot
+/// instead of pulling it into the memory of a Pi Zero-class board.
+const UI_DIRECTORY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The most files a `--ui-directory` may hold. Same reasoning as the
+/// byte cap; a real portal is a handful of files.
+const UI_DIRECTORY_MAX_FILES: usize = 256;
+
+/// How deep a `--ui-directory` may nest. Also what stops a symlink to an
+/// ancestor *inside* the directory from recursing forever.
+const UI_DIRECTORY_MAX_DEPTH: usize = 8;
+
+/// The pages the portal renders. A `--ui-directory` must supply both.
+const TEMPLATES: [&str; 2] = ["index.html", "connecting.html"];
+
+/// A `--ui-directory`, read into memory at startup.
+///
+/// It replaces the embedded UI wholesale rather than file by file: when
+/// the flag is set, the pages and everything under `/assets/` come from
+/// the directory and nothing falls back to the embedded copy. A per-file
+/// fallback would mean an operator who misspells `conecting.html` gets the
+/// stock page after the join with their own page before it, and nothing
+/// in the log to say why.
+///
+/// Read eagerly, for the same reason as `--brand-css`: a missing directory
+/// or template stops the portal at boot with the path in the message.
+/// Reading everything up front is also the path-traversal defence. Requests
+/// are answered by an exact lookup in a map whose keys were built from the
+/// directory listing, so no request path ever reaches the filesystem and
+/// `..`, absolute paths and NUL bytes have nothing to resolve against.
+pub struct UiDirectory {
+    files: std::collections::HashMap<String, axum::body::Bytes>,
+    /// The `Content-Security-Policy` for every response while this
+    /// directory is the UI: the embedded policy's hashes are of the
+    /// embedded pages, and would block every inline block an operator has
+    /// edited. Computed once here, from these templates; see
+    /// `ui_directory_content_security_policy`.
+    content_security_policy: HeaderValue,
+}
+
+/// Prefix an I/O error with the file it concerns.
+///
+/// `std::io::Error` carries no path, so without this a dangling symlink
+/// three levels down stops the portal with a bare "No such file or
+/// directory" while the log names only the top-level directory, which
+/// plainly does exist.
+fn at(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> std::io::Error + '_ {
+    move |e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+fn too_big() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "more than {UI_DIRECTORY_MAX_FILES} files or \
+             {UI_DIRECTORY_MAX_BYTES} bytes; is this the right directory?"
+        ),
+    )
+}
+
+/// Read one file of a `--ui-directory`, at most `budget` bytes of it.
+///
+/// `expected` is the `lstat` of the canonical path. The open is checked
+/// against it by device and inode, so a file swapped for a symlink (or a
+/// FIFO) between the directory walk and the read is refused rather than
+/// followed. The read itself is bounded, so a file that grows after it was
+/// measured cannot carry the total past the cap.
+fn read_file(
+    path: &std::path::Path,
+    expected: &std::fs::Metadata,
+    budget: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    if expected.len() > budget {
+        return Err(too_big());
+    }
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return Err(std::io::Error::other("changed while it was being read"));
+    }
+    let mut data = Vec::new();
+    file.take(budget + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > budget {
+        return Err(too_big());
+    }
+    Ok(data)
+}
+
+impl UiDirectory {
+    /// Read `dir` and check it is a UI this portal can render.
+    pub fn load(dir: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
+
+        let root = std::fs::canonicalize(dir).map_err(at(dir))?;
+        if !root.is_dir() {
+            return Err(Error::new(ErrorKind::InvalidInput, "not a directory"));
+        }
+
+        let mut ui = Self {
+            files: std::collections::HashMap::new(),
+            content_security_policy: HeaderValue::from_static("default-src 'none'"),
+        };
+        let mut total = 0u64;
+        ui.read_dir(&root, &root, "", 0, &mut total)?;
+
+        for name in TEMPLATES {
+            let Some(bytes) = ui.files.get(name) else {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    format!("{name} is missing; the directory must supply both {TEMPLATES:?}"),
+                ));
+            };
+            if std::str::from_utf8(bytes).is_err() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{name} is not valid UTF-8"),
+                ));
+            }
+        }
+
+        // The tell for upstream's React build, which is what most people
+        // carrying `--ui-directory` over from balena will be pointing at.
+        // Its index.html renders an empty <div id="root"> and expects an
+        // API this portal does not have; served as-is it is a blank page.
+        let index = String::from_utf8_lossy(&ui.files["index.html"]);
+        if !index.contains("{{NETWORKS}}") {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "index.html has no {{NETWORKS}} token; the directory must hold \
+                 templates written for this portal (start from ui/dist), not \
+                 balena's React build",
+            ));
+        }
+
+        ui.content_security_policy = policy_header(&ui_directory_content_security_policy(
+            &InlineHashes::of_pages(ui.templates()),
+        ));
+        Ok(ui)
+    }
+
+    /// The two templates, as text. Both were checked to be UTF-8 at load.
+    fn templates(&self) -> impl Iterator<Item = (&'static str, std::borrow::Cow<'_, str>)> {
+        TEMPLATES.into_iter().map(|name| {
+            (
+                name,
+                String::from_utf8_lossy(self.get(name).unwrap_or_default()),
+            )
+        })
+    }
+
+    /// The `Content-Security-Policy` to send while this UI is served.
+    pub fn content_security_policy(&self) -> HeaderValue {
+        self.content_security_policy.clone()
+    }
+
+    /// Inline blocks in these templates that the policy will not allow.
+    ///
+    /// Not an error, for the same reason as `missing_tokens`: the page
+    /// still loads. But the browser drops the block and says so only in a
+    /// console nobody has open on a captive-portal sheet, so the caller
+    /// logs these at startup.
+    ///
+    /// Two ways in. A `{{TOKEN}}` inside a `<script>` or `<style>` body is
+    /// substituted per request, after the hash was taken from the
+    /// template, so the rendered bytes no longer match it. And only bare
+    /// `<script>` and `<style>` tags are hashed (the rule ui/build.ts uses):
+    /// an inline `<script type="module">` or `<style media="…">` is not,
+    /// so it is blocked. `<script src=…>` is fine; it is allowed by
+    /// `'self'`.
+    pub fn unhashed_inline_blocks(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, html) in self.templates() {
+            for tag in ["script", "style"] {
+                for body in inline_blocks(&html, tag) {
+                    for token in tokens(body) {
+                        out.push(format!("{name}: {token} inside <{tag}>"));
+                    }
+                }
+                for open in attributed_inline_tags(&html, tag) {
+                    out.push(format!("{name}: {open}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// Recurse into `dir`, keying each file by its path below `root`.
+    fn read_dir(
+        &mut self,
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        prefix: &str,
+        depth: usize,
+        total: &mut u64,
+    ) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+
+        if depth > UI_DIRECTORY_MAX_DEPTH {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "nested more than {UI_DIRECTORY_MAX_DEPTH} levels deep at {}",
+                    dir.display()
+                ),
+            ));
+        }
+
+        for entry in std::fs::read_dir(dir).map_err(at(dir))? {
+            let entry = entry.map_err(at(dir))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("{} is not a UTF-8 file name", entry.path().display()),
+                ));
+            };
+            // Dotfiles are an editor's swap file or a .git directory, never
+            // part of a page, and the second would publish the operator's
+            // history to anyone on the access point.
+            if name.starts_with('.') {
+                continue;
+            }
+
+            // Resolve symlinks, then insist the target is still inside the
+            // directory. A link to /etc/shadow inside the UI directory must
+            // not make it servable at /assets/shadow.
+            let path = std::fs::canonicalize(entry.path()).map_err(at(&entry.path()))?;
+            if !path.starts_with(root) {
+                return Err(Error::new(
+                    ErrorKind::PermissionDenied,
+                    format!("{} links outside the UI directory", entry.path().display()),
+                ));
+            }
+
+            let key = format!("{prefix}{name}");
+            // `lstat`, not `stat`: `path` is canonical, so its last component
+            // is not a link. If it is one now, it was swapped in after
+            // canonicalize looked, and it is skipped with the other oddities
+            // below rather than followed.
+            let meta = std::fs::symlink_metadata(&path).map_err(at(&path))?;
+            if meta.is_dir() {
+                self.read_dir(root, &path, &format!("{key}/"), depth + 1, total)?;
+            } else if meta.is_file() {
+                if self.files.len() >= UI_DIRECTORY_MAX_FILES {
+                    return Err(too_big());
+                }
+                let data = read_file(&path, &meta, UI_DIRECTORY_MAX_BYTES - *total)
+                    .map_err(at(&entry.path()))?;
+                *total += data.len() as u64;
+                self.files.insert(key, data.into());
+            }
+            // Sockets, FIFOs, devices and links swapped in mid-walk are
+            // skipped: opening a FIFO would block startup forever, and none
+            // of them is a web asset.
+        }
+        Ok(())
+    }
+
+    fn get(&self, name: &str) -> Option<&[u8]> {
+        self.files.get(name).map(|b| &b[..])
+    }
+
+    /// Tokens the embedded pages use that these templates do not.
+    ///
+    /// Not an error: a template written against an older release, before
+    /// `{{BRAND_CSS}}` or `{{BRAND_HEADING}}` existed, still renders and
+    /// still joins. But it silently drops whatever the token carried, so
+    /// `--brand-css`, `--brand-logo` or `--default-theme` would appear to
+    /// do nothing. The caller logs this at startup so that is visible.
+    ///
+    /// Compared against the embedded copy rather than a hard-coded list,
+    /// so a token added to `ui/` later is covered without touching this.
+    pub fn missing_tokens(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        for name in TEMPLATES {
+            let Some(embedded) = Assets::get(name) else {
+                continue;
+            };
+            let embedded = String::from_utf8_lossy(&embedded.data).into_owned();
+            let ours = String::from_utf8_lossy(self.get(name).unwrap_or_default());
+            for token in tokens(&embedded) {
+                if !ours.contains(token) {
+                    missing.push(format!("{name}: {token}"));
+                }
+            }
+        }
+        missing
+    }
+}
+
+/// The distinct `{{UPPER_CASE}}` tokens in a template, in order.
+fn tokens(html: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let inner = &after[..end];
+        if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
+            let token = &rest[start..start + 2 + end + 2];
+            if !out.contains(&token) {
+                out.push(token);
+            }
+            rest = &after[end + 2..];
+        } else {
+            rest = after;
+        }
+    }
+    out
+}
 
 /// Escape text for interpolation into HTML.
 ///
@@ -45,7 +363,11 @@ fn escape(text: &str) -> String {
     out
 }
 
-fn template(name: &str) -> String {
+fn template(branding: &Branding, name: &str) -> String {
+    // Checked at load: both templates exist and are UTF-8.
+    if let Some(ui) = &branding.ui {
+        return String::from_utf8_lossy(ui.get(name).unwrap_or_default()).into_owned();
+    }
     Assets::get(name)
         .map(|f| String::from_utf8_lossy(f.data.as_ref()).into_owned())
         .unwrap_or_else(|| {
@@ -258,7 +580,7 @@ fn render_page(name: &str, branding: &Branding, page_tokens: &[(&str, &str)]) ->
         ("THEME_TOGGLE", render_theme_toggle(branding.theme)),
     ];
     tokens.extend_from_slice(page_tokens);
-    render(&template(name), &tokens)
+    render(&template(branding, name), &tokens)
 }
 
 /// Render the portal page.
@@ -299,11 +621,92 @@ pub fn render_connecting(branding: &Branding, ssid: &str) -> String {
 }
 
 /// The hashes of the inline `<script>` and `<style>` blocks, as written by
-/// ui/build.ts into `ui/dist/csp.json`.
-#[derive(Debug, Default, serde::Deserialize)]
+/// ui/build.ts into `ui/dist/csp.json`, or as computed from a
+/// `--ui-directory` by `of_pages`.
+#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize)]
 struct InlineHashes {
     script: Vec<String>,
     style: Vec<String>,
+}
+
+impl InlineHashes {
+    /// The embedded hashes, from `ui/dist/csp.json`.
+    fn embedded() -> Self {
+        Assets::get("csp.json")
+            .and_then(|f| serde_json::from_slice(f.data.as_ref()).ok())
+            .unwrap_or_default()
+    }
+
+    /// Hash every inline block of `pages` the way ui/build.ts does, so the
+    /// embedded pages come out exactly as `csp.json`: distinct, sorted.
+    fn of_pages<S: AsRef<str>>(pages: impl IntoIterator<Item = (&'static str, S)>) -> Self {
+        let mut script = std::collections::BTreeSet::new();
+        let mut style = std::collections::BTreeSet::new();
+        for (_, html) in pages {
+            let html = html.as_ref();
+            script.extend(inline_blocks(html, "script").into_iter().map(csp_source));
+            style.extend(inline_blocks(html, "style").into_iter().map(csp_source));
+        }
+        Self {
+            script: script.into_iter().collect(),
+            style: style.into_iter().collect(),
+        }
+    }
+}
+
+/// The bodies of the bare `<tag>…</tag>` blocks in `html`, exactly the
+/// bytes a browser hashes.
+///
+/// The same rule as `inlineHashes` in ui/build.ts, which is the regex
+/// `<tag>([\s\S]*?)</tag>`: a literal, attribute-free, lower-case opening
+/// tag, up to the first closing tag after it. An opening tag with no
+/// closing tag after it ends the scan, as it does the regex. Anything else
+/// (`<script src>`, `<script type="module">`) is not an inline block to
+/// this rule; see `attributed_inline_tags` for the second kind.
+fn inline_blocks<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find(&open) {
+        let body = &rest[start + open.len()..];
+        let Some(end) = body.find(&close) else { break };
+        out.push(&body[..end]);
+        rest = &body[end + close.len()..];
+    }
+    out
+}
+
+/// Opening `<tag …>`s with attributes that carry an inline body, which
+/// the hash rule above does not cover and the policy therefore blocks.
+///
+/// A `<script>` with `src=` is not one of them: it has no body to hash and
+/// is allowed by `'self'`. Case-sensitive like the rule it complements.
+fn attributed_inline_tags<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}");
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find('>') else { break };
+        let attrs = &after[..end];
+        let is_attributed = attrs.starts_with(|c: char| c.is_ascii_whitespace());
+        if is_attributed && !(tag == "script" && attrs.contains("src=")) {
+            out.push(&rest[start..start + open.len() + end + 1]);
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+/// The CSP hash source for one inline block body.
+fn csp_source(body: &str) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body.as_bytes());
+    format!(
+        "'sha256-{}'",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
 }
 
 /// Is `source` a CSP hash source we are willing to put in a header?
@@ -347,11 +750,11 @@ fn is_sha256_source(source: &str) -> bool {
 /// If the hashes are missing the policy still goes out, just with no script
 /// or style allowed: the only page that can be served in that state is the
 /// "assets missing" notice, which needs neither.
-fn build_content_security_policy() -> String {
-    let hashes: InlineHashes = Assets::get("csp.json")
-        .and_then(|f| serde_json::from_slice(f.data.as_ref()).ok())
-        .unwrap_or_default();
-
+///
+/// `script_self` adds `'self'` to `script-src`, for a `--ui-directory`
+/// whose pages may load their script from `/assets/`. The embedded pages
+/// inline all of theirs, so the built-in policy leaves it out.
+fn build_content_security_policy(hashes: &InlineHashes, script_self: bool) -> String {
     let sources = |list: &[String]| -> String {
         list.iter()
             .filter(|s| is_sha256_source(s))
@@ -372,9 +775,10 @@ fn build_content_security_policy() -> String {
             s => format!(" 'unsafe-inline'{s}"),
         }
     };
-    let script = match with_fallback(&hashes.script) {
-        s if s.is_empty() => String::from(" 'none'"),
-        s => s,
+    let script = match (script_self, with_fallback(&hashes.script)) {
+        (true, s) => format!(" 'self'{s}"),
+        (false, s) if s.is_empty() => String::from(" 'none'"),
+        (false, s) => s,
     };
 
     format!(
@@ -407,21 +811,58 @@ pub const SVG_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; \
      frame-ancestors 'none'; \
      base-uri 'none'";
 
-/// The `Content-Security-Policy` header value for every portal response.
+/// The policy for a `--ui-directory`: the embedded policy, with that
+/// directory's own hashes in place of the embedded ones and `'self'` added
+/// to `script-src`.
+///
+/// Only those two change. The rest (`form-action`, `frame-ancestors`,
+/// `base-uri`, `default-src 'none'`) is what protects the password form,
+/// and an operator's template is no reason to relax it. `'self'` is the
+/// one widening: a custom UI may well ship `<script src="/assets/…">`,
+/// and everything at `/assets/` is the operator's own directory.
+fn ui_directory_content_security_policy(hashes: &InlineHashes) -> String {
+    build_content_security_policy(hashes, true)
+}
+
+/// A policy string as a header value. The sources were filtered by
+/// `is_sha256_source`, so this cannot fail; if it somehow did, a policy
+/// that allows nothing is the safe way to be wrong.
+fn policy_header(policy: &str) -> HeaderValue {
+    HeaderValue::from_str(policy).unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'"))
+}
+
+/// The `Content-Security-Policy` header value for every portal response
+/// served from the embedded UI. A `--ui-directory` carries its own; see
+/// `UiDirectory::content_security_policy`.
 ///
 /// Built once: the hashes are compiled into the binary and cannot change.
 pub fn content_security_policy() -> HeaderValue {
     static CSP: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
-        HeaderValue::from_str(&build_content_security_policy())
-            .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'"))
+        policy_header(&build_content_security_policy(
+            &InlineHashes::embedded(),
+            false,
+        ))
     });
     CSP.clone()
 }
 
-/// Serve a file from `ui/dist` under `/assets/`.
-pub async fn serve(Path(path): Path<String>) -> Response {
-    match Assets::get(&path) {
-        Some(file) => {
+/// Serve a file under `/assets/`: from `--ui-directory` when it is set,
+/// otherwise from the embedded `ui/dist`.
+///
+/// Never the filesystem at request time: both sources are exact-match
+/// lookups, so a path like `../../etc/passwd` is just a key that is not
+/// there.
+pub async fn serve(State(shared): State<Shared>, Path(path): Path<String>) -> Response {
+    let data = match &shared.branding.ui {
+        // A refcount bump, not a copy of up to 8 MB per request.
+        Some(ui) => ui.files.get(&path).cloned(),
+        None => Assets::get(&path).map(|f| match f.data {
+            std::borrow::Cow::Borrowed(b) => axum::body::Bytes::from_static(b),
+            std::borrow::Cow::Owned(v) => axum::body::Bytes::from(v),
+        }),
+    };
+    match data {
+        Some(data) => {
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
             (
                 StatusCode::OK,
@@ -434,13 +875,59 @@ pub async fn serve(Path(path): Path<String>) -> Response {
                     ),
                     (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
                 ],
-                file.data.into_owned(),
+                data,
             )
                 .into_response()
         }
         // A 404 here, never the portal redirect: a redirected script or
         // stylesheet would be served HTML and fail in a confusing way.
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// A throwaway `--ui-directory` for tests, removed on drop.
+///
+/// Hand-rolled rather than a tempfile dev-dependency: it is a dozen lines
+/// and only this module and the router tests need it.
+#[cfg(test)]
+pub(crate) struct TestUiDir(pub std::path::PathBuf);
+
+#[cfg(test)]
+impl TestUiDir {
+    /// A directory holding minimal, valid templates.
+    pub(crate) fn new() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wifi-connect-ui-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ui = Self(dir);
+        ui.write(
+            "index.html",
+            "<title>{{BRAND_NAME}}</title>OVERRIDE-INDEX{{BRAND_CSS}}{{BANNER}}{{NETWORKS}}",
+        );
+        ui.write("connecting.html", "OVERRIDE-CONNECTING {{SSID}}");
+        ui
+    }
+
+    pub(crate) fn write(&self, name: &str, contents: &str) {
+        let path = self.0.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    pub(crate) fn load(&self) -> std::io::Result<UiDirectory> {
+        UiDirectory::load(&self.0)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestUiDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -797,20 +1284,6 @@ mod tests {
         assert!(html.contains("&quot;"));
     }
 
-    /// The `<tag>` bodies in `html`, exactly as the browser hashes them.
-    fn inline_blocks<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
-        let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-        let mut out = Vec::new();
-        let mut rest = html;
-        while let Some(start) = rest.find(&open) {
-            let body = &rest[start + open.len()..];
-            let end = body.find(&close).expect("unterminated inline block");
-            out.push(&body[..end]);
-            rest = &body[end + close.len()..];
-        }
-        out
-    }
-
     /// The sources listed for one directive of `csp`.
     fn directive<'a>(csp: &'a str, name: &str) -> Vec<&'a str> {
         csp.split(';')
@@ -819,16 +1292,6 @@ mod tests {
             .unwrap_or_else(|| panic!("no {name} in {csp}"))
             .split(' ')
             .collect()
-    }
-
-    fn csp_source(body: &str) -> String {
-        use base64::Engine;
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(body.as_bytes());
-        format!(
-            "'sha256-{}'",
-            base64::engine::general_purpose::STANDARD.encode(digest)
-        )
     }
 
     /// The guard against a UI rebuild silently breaking the portal.
@@ -1037,7 +1500,7 @@ mod tests {
     /// The old renderer, verbatim: a chain of `str::replace`. Kept only to
     /// pin the new one to its output wherever no value spells a token.
     fn chained_replace(name: &str, branding: &Branding, page: &[(&str, &str)]) -> String {
-        let mut html = template(name)
+        let mut html = template(branding, name)
             .replace("{{BRAND_HEADING}}", &render_brand_heading(branding))
             .replace("{{BRAND_NAME}}", &escape(&branding.name))
             .replace("{{BRAND_CSS}}", render_brand_css(branding.css.is_some()))
@@ -1103,5 +1566,326 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn with_ui(name: &str, ui: UiDirectory) -> Branding {
+        Branding {
+            ui: Some(std::sync::Arc::new(ui)),
+            ..Branding::new(name)
+        }
+    }
+
+    #[test]
+    fn a_ui_directory_replaces_both_pages() {
+        let dir = TestUiDir::new();
+        let branding = with_ui("Anthias", dir.load().unwrap());
+
+        let index = render_index(
+            &branding,
+            &[net("<b>Home</b>", 80, Security::WpaPsk)],
+            &PortalState::Portal,
+        );
+        assert!(index.contains("OVERRIDE-INDEX"), "embedded page served");
+        assert!(index.contains("<title>Anthias</title>"));
+        // The override gets the same rendering, escaping included: an
+        // integrator's template is no reason to trust a neighbour's SSID.
+        assert!(index.contains("&lt;b&gt;Home&lt;/b&gt;"));
+        assert!(!index.contains("{{"), "unsubstituted token: {index:.0}");
+
+        let connecting = render_connecting(&branding, "Office");
+        assert_eq!(connecting, "OVERRIDE-CONNECTING Office");
+    }
+
+    #[test]
+    fn a_missing_ui_directory_fails_to_load() {
+        let dir = TestUiDir::new();
+        let gone = dir.0.join("not-here");
+        let err = UiDirectory::load(&gone)
+            .err()
+            .expect("loaded a missing dir");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_file_is_not_a_ui_directory() {
+        let dir = TestUiDir::new();
+        assert!(UiDirectory::load(&dir.0.join("index.html")).is_err());
+    }
+
+    /// All-or-nothing: no per-file fallback to the embedded page, which
+    /// would serve a mixed portal with nothing in the log to say why.
+    #[test]
+    fn a_ui_directory_missing_a_template_fails_to_load() {
+        let dir = TestUiDir::new();
+        std::fs::remove_file(dir.0.join("connecting.html")).unwrap();
+        let err = dir.load().err().expect("loaded without connecting.html");
+        assert!(err.to_string().contains("connecting.html"), "{err}");
+    }
+
+    /// What someone migrating from balena will point the flag at.
+    #[test]
+    fn a_ui_directory_without_the_portal_tokens_is_refused() {
+        let dir = TestUiDir::new();
+        dir.write(
+            "index.html",
+            r#"<!doctype html><div id="root"></div><script src="/static/js/main.js"></script>"#,
+        );
+        let err = dir.load().err().expect("loaded balena's React build");
+        assert!(err.to_string().contains("{{NETWORKS}}"), "{err}");
+    }
+
+    #[test]
+    fn a_ui_directory_serves_nested_files_by_relative_path() {
+        let dir = TestUiDir::new();
+        dir.write("fonts/brand.woff2", "font");
+        let ui = dir.load().unwrap();
+        assert_eq!(ui.get("fonts/brand.woff2"), Some(&b"font"[..]));
+    }
+
+    #[test]
+    fn dotfiles_in_a_ui_directory_are_never_served() {
+        let dir = TestUiDir::new();
+        dir.write(".git/config", "[remote]");
+        dir.write(".index.html.swp", "swap");
+        let ui = dir.load().unwrap();
+        assert!(ui.get(".git/config").is_none());
+        assert!(ui.get(".index.html.swp").is_none());
+    }
+
+    /// A symlink is how a file outside the directory would become
+    /// servable at /assets/. It is refused at boot, not skipped, because
+    /// an operator who made one meant something by it.
+    #[test]
+    fn a_symlink_out_of_the_ui_directory_is_refused() {
+        let dir = TestUiDir::new();
+        let outside = TestUiDir::new();
+        outside.write("secret", "s3cret");
+        std::os::unix::fs::symlink(outside.0.join("secret"), dir.0.join("secret")).unwrap();
+
+        let err = dir.load().err().expect("followed a symlink out");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn a_symlink_within_the_ui_directory_is_followed() {
+        let dir = TestUiDir::new();
+        dir.write("real.css", "body{}");
+        std::os::unix::fs::symlink(dir.0.join("real.css"), dir.0.join("alias.css")).unwrap();
+        assert_eq!(dir.load().unwrap().get("alias.css"), Some(&b"body{}"[..]));
+    }
+
+    /// A link to an ancestor would otherwise recurse until the stack ran
+    /// out; the depth cap turns it into a startup error.
+    #[test]
+    fn a_symlink_loop_in_the_ui_directory_fails_rather_than_recursing() {
+        let dir = TestUiDir::new();
+        std::fs::create_dir(dir.0.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&dir.0, dir.0.join("sub").join("loop")).unwrap();
+        assert!(dir.load().is_err());
+    }
+
+    /// Pointing the flag at `/` or a node_modules must fail at boot, not
+    /// read it into memory.
+    #[test]
+    fn an_oversized_ui_directory_is_refused() {
+        let dir = TestUiDir::new();
+        for i in 0..=UI_DIRECTORY_MAX_FILES {
+            dir.write(&format!("f{i}.txt"), "x");
+        }
+        let err = dir.load().err().expect("loaded too many files");
+        assert!(err.to_string().contains("right directory"), "{err}");
+    }
+
+    /// The byte cap, separately from the file cap: one large file is how
+    /// a directory of a few files still fills a small board's memory.
+    #[test]
+    fn a_ui_directory_over_the_byte_cap_is_refused() {
+        let dir = TestUiDir::new();
+        // One byte over on its own, so it is this file that trips the cap
+        // whatever order the directory is listed in.
+        let big = vec![b'x'; UI_DIRECTORY_MAX_BYTES as usize + 1];
+        std::fs::write(dir.0.join("big.bin"), big).unwrap();
+        let err = dir.load().err().expect("loaded more than the byte cap");
+        assert!(err.to_string().contains("right directory"), "{err}");
+        assert!(err.to_string().contains("big.bin"), "{err}");
+    }
+
+    /// An io::Error carries no path; the operator needs to know which of
+    /// the files stopped the portal, not just that one did.
+    #[test]
+    fn a_dangling_symlink_is_named_in_the_error() {
+        let dir = TestUiDir::new();
+        std::os::unix::fs::symlink(dir.0.join("gone.css"), dir.0.join("dangling.css")).unwrap();
+        let err = dir.load().err().expect("loaded a dangling symlink");
+        assert!(err.to_string().contains("dangling.css"), "{err}");
+    }
+
+    /// A template from before a token existed is accepted, but the token
+    /// is reported so --brand-css / --brand-logo / --default-theme do not
+    /// silently look broken.
+    #[test]
+    fn tokens_an_older_template_lacks_are_reported() {
+        let dir = TestUiDir::new();
+        dir.write("index.html", "{{BRAND_NAME}}{{BANNER}}{{NETWORKS}}");
+        let missing = dir.load().unwrap().missing_tokens();
+        for expected in [
+            "index.html: {{BRAND_CSS}}",
+            "index.html: {{BRAND_HEADING}}",
+            "index.html: {{THEME_ATTR}}",
+            "index.html: {{THEME_TOGGLE}}",
+            "connecting.html: {{BRAND_CSS}}",
+        ] {
+            assert!(
+                missing.iter().any(|m| m == expected),
+                "{expected} not in {missing:?}"
+            );
+        }
+        assert!(!missing.iter().any(|m| m.contains("{{NETWORKS}}")));
+    }
+
+    /// The advice is "start from ui/dist", so a copy of it must report
+    /// nothing missing.
+    #[test]
+    fn a_copy_of_the_embedded_ui_lacks_no_tokens() {
+        let dir = copy_of_the_embedded_ui();
+        assert_eq!(dir.load().unwrap().missing_tokens(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tokens_finds_each_upper_case_token_once() {
+        assert_eq!(
+            tokens("{{A}} {{lower}} {{B_C}} {{A}} {{ }} {{"),
+            vec!["{{A}}", "{{B_C}}"]
+        );
+    }
+
+    /// A copy of the embedded templates, as `--ui-directory`.
+    fn copy_of_the_embedded_ui() -> TestUiDir {
+        let dir = TestUiDir::new();
+        for name in TEMPLATES {
+            let data = Assets::get(name).unwrap().data;
+            dir.write(name, std::str::from_utf8(&data).unwrap());
+        }
+        dir
+    }
+
+    /// Every directive of `csp` but the two named, in order.
+    fn other_directives<'a>(csp: &'a str, except: &[&str]) -> Vec<&'a str> {
+        csp.split(';')
+            .map(str::trim)
+            .filter(|d| !except.iter().any(|e| d.split(' ').next() == Some(*e)))
+            .collect()
+    }
+
+    /// The Rust extractor and ui/build.ts must agree byte for byte, or a
+    /// `--ui-directory` copied from ui/dist would get a different policy
+    /// from the very pages the built-in one was made for.
+    #[test]
+    fn the_rust_extractor_reproduces_csp_json_from_the_embedded_pages() {
+        let pages = TEMPLATES.map(|name| {
+            let data = Assets::get(name).unwrap().data;
+            (name, String::from_utf8(data.into_owned()).unwrap())
+        });
+        let embedded = InlineHashes::embedded();
+        assert!(!embedded.script.is_empty() && !embedded.style.is_empty());
+        assert_eq!(InlineHashes::of_pages(pages), embedded);
+    }
+
+    #[test]
+    fn inline_blocks_follows_the_build_ts_rule() {
+        let html = "<script>a</script><script src=x></script>\
+                    <script type=module>b</script><SCRIPT>c</SCRIPT>\
+                    <script>\nd\n</script><script>unterminated";
+        assert_eq!(inline_blocks(html, "script"), vec!["a", "\nd\n"]);
+        assert_eq!(inline_blocks("<style></style>", "style"), vec![""]);
+    }
+
+    /// A copy of ui/dist gets exactly the built-in policy, plus `'self'`
+    /// for script: same hashes, same everything else.
+    #[test]
+    fn a_copy_of_the_embedded_ui_gets_the_built_in_policy_plus_self() {
+        let ui = copy_of_the_embedded_ui().load().unwrap();
+        let built_in = content_security_policy().to_str().unwrap().to_owned();
+        assert_eq!(
+            ui.content_security_policy().to_str().unwrap(),
+            built_in.replacen("script-src ", "script-src 'self' ", 1)
+        );
+        assert_eq!(ui.unhashed_inline_blocks(), Vec::<String>::new());
+    }
+
+    /// The defect this policy exists to fix: an operator's edited inline
+    /// blocks were held to the embedded hashes and blocked.
+    #[test]
+    fn an_edited_ui_directory_is_allowed_by_its_own_hashes() {
+        let dir = TestUiDir::new();
+        dir.write(
+            "index.html",
+            "<style>body{color:red}</style>{{BRAND_CSS}}{{BANNER}}{{NETWORKS}}\
+             <script>document.title='x'</script><script src=\"/assets/app.js\"></script>",
+        );
+        dir.write("connecting.html", "<script>poll()</script>{{SSID}}");
+        let branding = with_ui("B", dir.load().unwrap());
+        let ui = branding.ui.as_ref().unwrap();
+        let csp = ui.content_security_policy().to_str().unwrap().to_owned();
+        let built_in = content_security_policy().to_str().unwrap().to_owned();
+
+        let script = directive(&csp, "script-src");
+        let style = directive(&csp, "style-src");
+        assert_eq!(script[0], "'self'", "{csp}");
+        assert_eq!(style[0], "'self'", "{csp}");
+        for page in [
+            render_index(&branding, &[], &PortalState::Portal),
+            render_connecting(&branding, "Home"),
+        ] {
+            for (tag, allowed) in [("script", &script), ("style", &style)] {
+                for body in inline_blocks(&page, tag) {
+                    let source = csp_source(body);
+                    assert!(allowed.contains(&source.as_str()), "{tag} {source}: {csp}");
+                }
+            }
+        }
+        // Its own hashes, not the embedded ones riding along.
+        for source in directive(&built_in, "script-src") {
+            if is_sha256_source(source) {
+                assert!(!script.contains(&source), "{source}");
+            }
+        }
+        // Nothing else moved.
+        assert_eq!(
+            other_directives(&csp, &["script-src", "style-src"]),
+            other_directives(&built_in, &["script-src", "style-src"])
+        );
+        assert_eq!(ui.unhashed_inline_blocks(), Vec::<String>::new());
+    }
+
+    /// No inline blocks means no hashes, and then no `'unsafe-inline'`
+    /// either: with nothing to switch it off it would allow everything.
+    #[test]
+    fn a_ui_directory_without_inline_blocks_allows_only_self() {
+        let ui = TestUiDir::new().load().unwrap();
+        let csp = ui.content_security_policy().to_str().unwrap().to_owned();
+        assert_eq!(directive(&csp, "script-src"), vec!["'self'"]);
+        assert_eq!(directive(&csp, "style-src"), vec!["'self'"]);
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
+    }
+
+    /// Blocks the policy will refuse are reported for the startup log.
+    #[test]
+    fn inline_blocks_the_policy_cannot_allow_are_reported() {
+        let dir = TestUiDir::new();
+        dir.write(
+            "index.html",
+            "{{NETWORKS}}<script>var n='{{BRAND_NAME}}'</script>\
+             <script type=\"module\">x()</script><style media=\"print\">a{}</style>\
+             <script src=\"/assets/a.js\"></script><styles></styles>",
+        );
+        assert_eq!(
+            dir.load().unwrap().unhashed_inline_blocks(),
+            vec![
+                "index.html: {{BRAND_NAME}} inside <script>",
+                r#"index.html: <script type="module">"#,
+                r#"index.html: <style media="print">"#,
+            ]
+        );
     }
 }

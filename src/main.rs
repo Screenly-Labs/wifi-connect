@@ -173,6 +173,81 @@ async fn run() -> ExitCode {
         }
     };
 
+    // The files the portal serves are read here, with the flags, and not
+    // after preflight decides whether a portal is needed: on a device that
+    // is already online preflight exits 0, so a typo checked any later
+    // would pass every boot on the bench and surface only in the field, on
+    // the day the WiFi goes and the portal it breaks is the way back.
+    //
+    // Read eagerly. A mistyped --brand-css should stop the portal here,
+    // with the path in the message, rather than quietly serving an
+    // unbranded page that looks like the flag was ignored.
+    let brand_css = match &args.brand_css {
+        None => None,
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(css) => Some(std::sync::Arc::from(css.as_str())),
+            Err(e) => {
+                error!(error = %e, path = %path.display(), "could not read --brand-css");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    let brand_logo = match &args.brand_logo {
+        None => None,
+        Some(path) => match read_brand_logo(path) {
+            Ok(logo) => Some(logo),
+            Err(e) => {
+                error!(error = %e, path = %path.display(), "could not read --brand-logo");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    // Read eagerly and whole, like --brand-css: a missing directory or
+    // template stops the portal here with the path in the message.
+    let ui = match &args.ui_directory {
+        None => None,
+        Some(path) => match http::assets::UiDirectory::load(path) {
+            Ok(ui) => {
+                info!(path = %path.display(), "serving the portal UI from --ui-directory");
+                // A template from an older release still works, but whatever
+                // a missing token carried (the --brand-css link, the
+                // --brand-logo heading, the --default-theme attribute) is
+                // silently absent. Say so, rather than let those flags look
+                // broken.
+                let missing = ui.missing_tokens();
+                if !missing.is_empty() {
+                    warn!(
+                        path = %path.display(),
+                        missing = %missing.join(", "),
+                        "--ui-directory templates lack tokens the built-in pages use; \
+                         the features they carry will not appear (compare with ui/dist)"
+                    );
+                }
+                // The policy allows these templates' inline blocks by hash,
+                // taken here from the template bytes. A block the browser
+                // will refuse is otherwise reported only in its console.
+                let blocked = ui.unhashed_inline_blocks();
+                if !blocked.is_empty() {
+                    warn!(
+                        path = %path.display(),
+                        blocked = %blocked.join(", "),
+                        "--ui-directory templates have inline script or style the \
+                         Content-Security-Policy will block: keep template tokens out of \
+                         <script>/<style> bodies, use bare <script> and <style> tags \
+                         for inline code, or move it to a file under /assets/"
+                    );
+                }
+                Some(std::sync::Arc::new(ui))
+            }
+            Err(e) => {
+                error!(error = %e, path = %path.display(), "could not read --ui-directory");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
     // Generated once per RUN, not per activation. A failed join re-raises
     // the access point, and the user's phone only reassociates
     // automatically if the SSID and passphrase are byte-identical to the
@@ -238,34 +313,10 @@ async fn run() -> ExitCode {
         Err(e) => return ExitCode::from(app::report(&Err(e)) as u8),
     };
 
-    // Read eagerly. A mistyped --brand-css should stop the portal here,
-    // with the path in the message, rather than quietly serving an
-    // unbranded page that looks like the flag was ignored.
-    let brand_css = match &args.brand_css {
-        None => None,
-        Some(path) => match std::fs::read_to_string(path) {
-            Ok(css) => Some(std::sync::Arc::from(css.as_str())),
-            Err(e) => {
-                error!(error = %e, path = %path.display(), "could not read --brand-css");
-                return ExitCode::from(2);
-            }
-        },
-    };
-
-    let brand_logo = match &args.brand_logo {
-        None => None,
-        Some(path) => match read_brand_logo(path) {
-            Ok(logo) => Some(logo),
-            Err(e) => {
-                error!(error = %e, path = %path.display(), "could not read --brand-logo");
-                return ExitCode::from(2);
-            }
-        },
-    };
-
     let branding = state::Branding {
         css: brand_css,
         logo: brand_logo,
+        ui,
         theme: args.default_theme,
         ..state::Branding::new(args.brand_name.clone())
     };
