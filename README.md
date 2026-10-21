@@ -238,7 +238,10 @@ wifi-connect --ui-directory /etc/wifi-connect/ui
   form fields the server reads. Start by copying `ui/dist`. **balena's
   React UI build will not work** — it expects an API this portal does not
   have — and an `index.html` with no `{{NETWORKS}}` token is refused at
-  startup for that reason.
+  startup for that reason. Any other token the built-in pages use but
+  yours lack is logged as a warning at startup: a template copied from an
+  older release still works, but without `{{BRAND_CSS}}` or
+  `{{BRAND_HEADING}}`, `--brand-css` and `--brand-logo` have nowhere to go.
 - **It is read once, at startup**, like `--brand-css`: a missing directory
   or template stops the portal with the path in the message. Restart to
   pick up edits. The directory is capped at 256 files and 8 MB, dotfiles

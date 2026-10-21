@@ -60,7 +60,58 @@ const TEMPLATES: [&str; 2] = ["index.html", "connecting.html"];
 /// directory listing, so no request path ever reaches the filesystem and
 /// `..`, absolute paths and NUL bytes have nothing to resolve against.
 pub struct UiDirectory {
-    files: std::collections::HashMap<String, Box<[u8]>>,
+    files: std::collections::HashMap<String, axum::body::Bytes>,
+}
+
+/// Prefix an I/O error with the file it concerns.
+///
+/// `std::io::Error` carries no path, so without this a dangling symlink
+/// three levels down stops the portal with a bare "No such file or
+/// directory" while the log names only the top-level directory, which
+/// plainly does exist.
+fn at(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> std::io::Error + '_ {
+    move |e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+fn too_big() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "more than {UI_DIRECTORY_MAX_FILES} files or \
+             {UI_DIRECTORY_MAX_BYTES} bytes; is this the right directory?"
+        ),
+    )
+}
+
+/// Read one file of a `--ui-directory`, at most `budget` bytes of it.
+///
+/// `expected` is the `lstat` of the canonical path. The open is checked
+/// against it by device and inode, so a file swapped for a symlink (or a
+/// FIFO) between the directory walk and the read is refused rather than
+/// followed. The read itself is bounded, so a file that grows after it was
+/// measured cannot carry the total past the cap.
+fn read_file(
+    path: &std::path::Path,
+    expected: &std::fs::Metadata,
+    budget: u64,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    if expected.len() > budget {
+        return Err(too_big());
+    }
+    let file = std::fs::File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.dev() != expected.dev() || opened.ino() != expected.ino() {
+        return Err(std::io::Error::other("changed while it was being read"));
+    }
+    let mut data = Vec::new();
+    file.take(budget + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > budget {
+        return Err(too_big());
+    }
+    Ok(data)
 }
 
 impl UiDirectory {
@@ -68,7 +119,7 @@ impl UiDirectory {
     pub fn load(dir: &std::path::Path) -> std::io::Result<Self> {
         use std::io::{Error, ErrorKind};
 
-        let root = std::fs::canonicalize(dir)?;
+        let root = std::fs::canonicalize(dir).map_err(at(dir))?;
         if !root.is_dir() {
             return Err(Error::new(ErrorKind::InvalidInput, "not a directory"));
         }
@@ -132,8 +183,8 @@ impl UiDirectory {
             ));
         }
 
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+        for entry in std::fs::read_dir(dir).map_err(at(dir))? {
+            let entry = entry.map_err(at(dir))?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -150,7 +201,7 @@ impl UiDirectory {
             // Resolve symlinks, then insist the target is still inside the
             // directory. A link to /etc/shadow inside the UI directory must
             // not make it servable at /assets/shadow.
-            let path = std::fs::canonicalize(entry.path())?;
+            let path = std::fs::canonicalize(entry.path()).map_err(at(&entry.path()))?;
             if !path.starts_with(root) {
                 return Err(Error::new(
                     ErrorKind::PermissionDenied,
@@ -159,24 +210,25 @@ impl UiDirectory {
             }
 
             let key = format!("{prefix}{name}");
-            let meta = std::fs::metadata(&path)?;
+            // `lstat`, not `stat`: `path` is canonical, so its last component
+            // is not a link. If it is one now, it was swapped in after
+            // canonicalize looked, and it is skipped with the other oddities
+            // below rather than followed.
+            let meta = std::fs::symlink_metadata(&path).map_err(at(&path))?;
             if meta.is_dir() {
                 self.read_dir(root, &path, &format!("{key}/"), depth + 1, total)?;
             } else if meta.is_file() {
-                *total += meta.len();
-                if *total > UI_DIRECTORY_MAX_BYTES || self.files.len() >= UI_DIRECTORY_MAX_FILES {
-                    return Err(Error::new(
-                        ErrorKind::InvalidInput,
-                        format!(
-                            "more than {UI_DIRECTORY_MAX_FILES} files or \
-                             {UI_DIRECTORY_MAX_BYTES} bytes; is this the right directory?"
-                        ),
-                    ));
+                if self.files.len() >= UI_DIRECTORY_MAX_FILES {
+                    return Err(too_big());
                 }
-                self.files.insert(key, std::fs::read(&path)?.into());
+                let data = read_file(&path, &meta, UI_DIRECTORY_MAX_BYTES - *total)
+                    .map_err(at(&entry.path()))?;
+                *total += data.len() as u64;
+                self.files.insert(key, data.into());
             }
-            // Sockets, FIFOs and devices are skipped: opening a FIFO would
-            // block startup forever, and none of them is a web asset.
+            // Sockets, FIFOs, devices and links swapped in mid-walk are
+            // skipped: opening a FIFO would block startup forever, and none
+            // of them is a web asset.
         }
         Ok(())
     }
@@ -184,6 +236,54 @@ impl UiDirectory {
     fn get(&self, name: &str) -> Option<&[u8]> {
         self.files.get(name).map(|b| &b[..])
     }
+
+    /// Tokens the embedded pages use that these templates do not.
+    ///
+    /// Not an error: a template written against an older release, before
+    /// `{{BRAND_CSS}}` or `{{BRAND_HEADING}}` existed, still renders and
+    /// still joins. But it silently drops whatever the token carried, so
+    /// `--brand-css`, `--brand-logo` or `--default-theme` would appear to
+    /// do nothing. The caller logs this at startup so that is visible.
+    ///
+    /// Compared against the embedded copy rather than a hard-coded list,
+    /// so a token added to `ui/` later is covered without touching this.
+    pub fn missing_tokens(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        for name in TEMPLATES {
+            let Some(embedded) = Assets::get(name) else {
+                continue;
+            };
+            let embedded = String::from_utf8_lossy(&embedded.data).into_owned();
+            let ours = String::from_utf8_lossy(self.get(name).unwrap_or_default());
+            for token in tokens(&embedded) {
+                if !ours.contains(token) {
+                    missing.push(format!("{name}: {token}"));
+                }
+            }
+        }
+        missing
+    }
+}
+
+/// The distinct `{{UPPER_CASE}}` tokens in a template, in order.
+fn tokens(html: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let inner = &after[..end];
+        if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') {
+            let token = &rest[start..start + 2 + end + 2];
+            if !out.contains(&token) {
+                out.push(token);
+            }
+            rest = &after[end + 2..];
+        } else {
+            rest = after;
+        }
+    }
+    out
 }
 
 /// Escape text for interpolation into HTML.
@@ -410,8 +510,12 @@ pub fn render_connecting(branding: &Branding, ssid: &str) -> String {
 /// there.
 pub async fn serve(State(shared): State<Shared>, Path(path): Path<String>) -> Response {
     let data = match &shared.branding.ui {
-        Some(ui) => ui.get(&path).map(<[u8]>::to_vec),
-        None => Assets::get(&path).map(|f| f.data.into_owned()),
+        // A refcount bump, not a copy of up to 8 MB per request.
+        Some(ui) => ui.files.get(&path).cloned(),
+        None => Assets::get(&path).map(|f| match f.data {
+            std::borrow::Cow::Borrowed(b) => axum::body::Bytes::from_static(b),
+            std::borrow::Cow::Owned(v) => axum::body::Bytes::from(v),
+        }),
     };
     match data {
         Some(data) => {
@@ -962,5 +1066,72 @@ mod tests {
         }
         let err = dir.load().err().expect("loaded too many files");
         assert!(err.to_string().contains("right directory"), "{err}");
+    }
+
+    /// The byte cap, separately from the file cap: one large file is how
+    /// a directory of a few files still fills a small board's memory.
+    #[test]
+    fn a_ui_directory_over_the_byte_cap_is_refused() {
+        let dir = TestUiDir::new();
+        // One byte over on its own, so it is this file that trips the cap
+        // whatever order the directory is listed in.
+        let big = vec![b'x'; UI_DIRECTORY_MAX_BYTES as usize + 1];
+        std::fs::write(dir.0.join("big.bin"), big).unwrap();
+        let err = dir.load().err().expect("loaded more than the byte cap");
+        assert!(err.to_string().contains("right directory"), "{err}");
+        assert!(err.to_string().contains("big.bin"), "{err}");
+    }
+
+    /// An io::Error carries no path; the operator needs to know which of
+    /// the files stopped the portal, not just that one did.
+    #[test]
+    fn a_dangling_symlink_is_named_in_the_error() {
+        let dir = TestUiDir::new();
+        std::os::unix::fs::symlink(dir.0.join("gone.css"), dir.0.join("dangling.css")).unwrap();
+        let err = dir.load().err().expect("loaded a dangling symlink");
+        assert!(err.to_string().contains("dangling.css"), "{err}");
+    }
+
+    /// A template from before a token existed is accepted, but the token
+    /// is reported so --brand-css / --brand-logo / --default-theme do not
+    /// silently look broken.
+    #[test]
+    fn tokens_an_older_template_lacks_are_reported() {
+        let dir = TestUiDir::new();
+        dir.write("index.html", "{{BRAND_NAME}}{{BANNER}}{{NETWORKS}}");
+        let missing = dir.load().unwrap().missing_tokens();
+        for expected in [
+            "index.html: {{BRAND_CSS}}",
+            "index.html: {{BRAND_HEADING}}",
+            "index.html: {{THEME_ATTR}}",
+            "index.html: {{THEME_TOGGLE}}",
+            "connecting.html: {{BRAND_CSS}}",
+        ] {
+            assert!(
+                missing.iter().any(|m| m == expected),
+                "{expected} not in {missing:?}"
+            );
+        }
+        assert!(!missing.iter().any(|m| m.contains("{{NETWORKS}}")));
+    }
+
+    /// The advice is "start from ui/dist", so a copy of it must report
+    /// nothing missing.
+    #[test]
+    fn a_copy_of_the_embedded_ui_lacks_no_tokens() {
+        let dir = TestUiDir::new();
+        for name in TEMPLATES {
+            let data = Assets::get(name).unwrap().data;
+            dir.write(name, std::str::from_utf8(&data).unwrap());
+        }
+        assert_eq!(dir.load().unwrap().missing_tokens(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn tokens_finds_each_upper_case_token_once() {
+        assert_eq!(
+            tokens("{{A}} {{lower}} {{B_C}} {{A}} {{ }} {{"),
+            vec!["{{A}}", "{{B_C}}"]
+        );
     }
 }

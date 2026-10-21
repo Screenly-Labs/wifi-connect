@@ -223,6 +223,20 @@ async fn run() -> ExitCode {
         Some(path) => match http::assets::UiDirectory::load(path) {
             Ok(ui) => {
                 info!(path = %path.display(), "serving the portal UI from --ui-directory");
+                // A template from an older release still works, but whatever
+                // a missing token carried (the --brand-css link, the
+                // --brand-logo heading, the --default-theme attribute) is
+                // silently absent. Say so, rather than let those flags look
+                // broken.
+                let missing = ui.missing_tokens();
+                if !missing.is_empty() {
+                    warn!(
+                        path = %path.display(),
+                        missing = %missing.join(", "),
+                        "--ui-directory templates lack tokens the built-in pages use; \
+                         the features they carry will not appear (compare with ui/dist)"
+                    );
+                }
                 Some(std::sync::Arc::new(ui))
             }
             Err(e) => {
