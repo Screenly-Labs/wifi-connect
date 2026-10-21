@@ -71,6 +71,7 @@ function initPasswordToggle(): void {
  */
 function initSecurityAwareness(): void {
   const password = document.getElementById('pw')
+  const label = document.getElementById('pw-label')
   const identityField = document.getElementById('identity-field')
   const hint = document.getElementById('pw-hint')
   if (!(password instanceof HTMLInputElement)) return
@@ -110,6 +111,12 @@ function initSecurityAwareness(): void {
     // Telling an enterprise user their directory password must be 8 to 63
     // characters is wrong, and sends them looking for a different one.
     if (hint) hint.textContent = needsIdentity ? 'Your enterprise (802.1X) password.' : pskHint
+    // And it is a different thing, not just a different length. WPA-PSK
+    // takes a *passphrase* — that is the word on the back of every router
+    // and in 802.11 itself — while 802.1X takes the password from a
+    // directory account. One field serves both, so the label follows the
+    // network the way the hint does.
+    if (label) label.textContent = needsIdentity ? 'Password' : 'Passphrase'
     if (identityField instanceof HTMLElement) identityField.hidden = !needsIdentity
     // A hidden input still submits, and a username is what makes the server
     // join over 802.1X. So when the enterprise block hides, clear AND

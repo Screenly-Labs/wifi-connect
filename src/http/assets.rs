@@ -1121,7 +1121,7 @@ mod tests {
         let html = render_index(&plain("B"), &[], &state);
 
         assert!(html.contains(r#"role="alert""#));
-        assert!(html.contains("password was not accepted"));
+        assert!(html.contains("passphrase was not accepted"));
     }
 
     #[test]

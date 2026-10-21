@@ -32,7 +32,7 @@ things that bit us in production:
 | Getting the passphrase to the user | n/a | a QR code on the device's screen |
 | DHCP / DNS | spawns `dnsmasq` | in-process, no external binaries |
 | Runtime | needs a shell and helpers | one static binary, `FROM scratch`, ~4 MB |
-| Wrong password | frequently just hangs | the portal comes back and says so |
+| Wrong passphrase | frequently just hangs | the portal comes back and says so |
 | Static IP | not supported ([#110](https://github.com/balena-os/wifi-connect/issues/110), open since 2017) | IPv4 and IPv6, set from the portal |
 | Architectures | ARMv6 binary silently dropped in 4.4.6 | amd64, arm64, armv7 **and armv6**, each executed in CI |
 | Hidden networks | dropped from the list, cannot be joined | typed by name in the portal |

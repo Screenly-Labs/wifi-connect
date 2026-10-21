@@ -205,7 +205,7 @@ impl JoinFailure {
     pub fn message(self, ssid: &str) -> String {
         match self {
             JoinFailure::BadPassword => {
-                format!("Could not join \u{201c}{ssid}\u{201d}: the password was not accepted.")
+                format!("Could not join \u{201c}{ssid}\u{201d}: the passphrase was not accepted.")
             }
             JoinFailure::SsidNotFound => format!(
                 "\u{201c}{ssid}\u{201d} was not found. It may be out of range, or its name may be \
@@ -448,7 +448,7 @@ mod tests {
         assert_eq!(unique.len(), msgs.len(), "two causes share a message");
 
         // The three that imply different user actions must be distinguishable.
-        assert!(msgs[0].contains("password"));
+        assert!(msgs[0].contains("passphrase"));
         assert!(msgs[1].contains("not found"));
         assert!(msgs[2].contains("IP address"));
     }

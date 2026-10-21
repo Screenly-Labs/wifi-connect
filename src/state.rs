@@ -315,7 +315,7 @@ mod tests {
         match s.state() {
             PortalState::Failed { ssid, error } => {
                 assert_eq!(ssid, "Office WiFi");
-                assert!(error.contains("password"), "unhelpful message: {error}");
+                assert!(error.contains("passphrase"), "unhelpful message: {error}");
             }
             other => panic!("expected Failed, got {other:?}"),
         }
