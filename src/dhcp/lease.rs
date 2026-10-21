@@ -9,8 +9,25 @@
 //! it had a moment ago means its browser's existing connection to the portal
 //! still makes sense, instead of the page breaking in a second, different way
 //! while the user is already confused about the first.
+//!
+//! ## What an associated client can still do
+//!
+//! DHCP has no client authentication, and on the setup AP the only identity a
+//! client presents is a `chaddr` it chooses itself. Anyone who has joined the
+//! AP can therefore send REQUESTs for every pool address under made-up MACs
+//! and hold the whole pool for one lease time. Nothing in this table can tell
+//! those apart from real phones, so it does not try. What it does guarantee:
+//!
+//! * leases and DECLINE bans both age out after [`LEASE_TIME`], so a flood
+//!   costs the attacker continuous effort rather than poisoning the pool for
+//!   the rest of the process;
+//! * one MAC's message never removes the lease another MAC holds (short of
+//!   spoofing that exact MAC, which no L2 check can rule out).
+//!
+//! A client already on the AP can disrupt it in cruder ways (deauth frames,
+//! plain airtime), so this is the same exposure, not a new one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -32,9 +49,12 @@ pub struct Leases {
     pool: Vec<Ipv4Addr>,
     by_mac: HashMap<MacAddr, Ipv4Addr>,
     by_ip: HashMap<Ipv4Addr, Lease>,
-    /// Addresses a client told us were already in use (DHCPDECLINE). We do
-    /// not hand these out again for the life of this process.
-    declined: HashSet<Ipv4Addr>,
+    /// Addresses a client told us were already in use (DHCPDECLINE), and when
+    /// we may try them again. A ban that lasted the whole process would let
+    /// one DECLINE per address empty the pool for good; one lease time is long
+    /// enough for a genuine squatter to be noticed and short enough that a
+    /// bogus ban heals by itself.
+    declined: HashMap<Ipv4Addr, Instant>,
     lease_time: Duration,
 }
 
@@ -55,7 +75,7 @@ impl Leases {
             pool,
             by_mac: HashMap::new(),
             by_ip: HashMap::new(),
-            declined: HashSet::new(),
+            declined: HashMap::new(),
             lease_time,
         }
     }
@@ -68,8 +88,12 @@ impl Leases {
         self.pool.contains(&ip)
     }
 
+    fn is_declined(&self, ip: Ipv4Addr, now: Instant) -> bool {
+        self.declined.get(&ip).is_some_and(|until| *until > now)
+    }
+
     fn is_free(&self, ip: Ipv4Addr, now: Instant, for_mac: MacAddr) -> bool {
-        if self.declined.contains(&ip) {
+        if self.is_declined(ip, now) {
             return false;
         }
         match self.by_ip.get(&ip) {
@@ -108,42 +132,78 @@ impl Leases {
     }
 
     /// Record that `mac` now holds `ip`.
+    ///
+    /// Callers check [`Self::may_use`] first, so if `ip` belonged to another
+    /// MAC that lease has expired. That MAC's `by_mac` entry still points at
+    /// `ip`, though, and must go: left behind, a later RELEASE or address
+    /// change from the old owner would delete the new owner's lease.
     pub fn commit(&mut self, mac: MacAddr, ip: Ipv4Addr, now: Instant) {
         if let Some(old) = self.by_mac.insert(mac, ip)
             && old != ip
         {
-            self.by_ip.remove(&old);
+            self.remove_lease_if_held_by(old, mac);
         }
-        self.by_ip.insert(
+        let previous = self.by_ip.insert(
             ip,
             Lease {
                 mac,
                 expires: now + self.lease_time,
             },
         );
+        if let Some(prev) = previous
+            && prev.mac != mac
+            && self.by_mac.get(&prev.mac) == Some(&ip)
+        {
+            self.by_mac.remove(&prev.mac);
+        }
+        // A successful commit means any DECLINE ban on `ip` has lapsed; drop
+        // the entry so the map does not grow with dead bans.
+        self.declined.remove(&ip);
+    }
+
+    /// Drop the lease on `ip` only if `mac` is the one holding it.
+    fn remove_lease_if_held_by(&mut self, ip: Ipv4Addr, mac: MacAddr) {
+        if self.by_ip.get(&ip).is_some_and(|l| l.mac == mac) {
+            self.by_ip.remove(&ip);
+        }
     }
 
     /// Would an ACK for `ip` be correct for this MAC? Used to decide between
     /// ACK and NAK on a DHCPREQUEST.
     pub fn may_use(&self, mac: MacAddr, ip: Ipv4Addr, now: Instant) -> bool {
-        self.contains(ip) && !self.declined.contains(&ip) && self.is_free(ip, now, mac)
+        self.contains(ip) && self.is_free(ip, now, mac)
     }
 
     /// DHCPRELEASE: drop the lease.
     pub fn release(&mut self, mac: MacAddr) {
         if let Some(ip) = self.by_mac.remove(&mac) {
-            self.by_ip.remove(&ip);
+            self.remove_lease_if_held_by(ip, mac);
         }
     }
 
     /// DHCPDECLINE: the client saw an ARP conflict for this address, so
-    /// something we do not manage is squatting on it. Never offer it again.
-    pub fn decline(&mut self, mac: MacAddr, ip: Ipv4Addr) {
-        self.declined.insert(ip);
+    /// something we do not manage is squatting on it. Stop offering it for
+    /// one lease time.
+    ///
+    /// RFC 2131 4.3.3 has a client decline an address the server gave *it*.
+    /// So the DECLINE is honoured only when `mac` currently holds an unexpired
+    /// lease on `ip`; anything else is ignored. Without that check, any client
+    /// on the AP could ban every pool address and evict other clients'
+    /// leases by naming them in DECLINEs. Returns whether it was honoured.
+    pub fn decline(&mut self, mac: MacAddr, ip: Ipv4Addr, now: Instant) -> bool {
+        let holds_it = self
+            .by_ip
+            .get(&ip)
+            .is_some_and(|l| l.mac == mac && l.expires > now);
+        if !holds_it {
+            return false;
+        }
+        self.by_ip.remove(&ip);
         if self.by_mac.get(&mac) == Some(&ip) {
             self.by_mac.remove(&mac);
         }
-        self.by_ip.remove(&ip);
+        self.declined.insert(ip, now + self.lease_time);
+        true
     }
 }
 
@@ -268,17 +328,110 @@ mod tests {
     }
 
     #[test]
-    fn a_declined_address_is_never_offered_again() {
+    fn a_declined_address_is_not_offered_for_a_lease_time() {
         let mut l = pool();
         let now = Instant::now();
         let ip = l.offer(A, None, now).unwrap();
         l.commit(A, ip, now);
-        l.decline(A, ip);
+        assert!(l.decline(A, ip, now));
 
         for _ in 0..4 {
             assert_ne!(l.offer(B, Some(ip), now), Some(ip));
         }
         assert!(!l.may_use(B, ip, now));
+        // The decliner itself must not be steered straight back onto the
+        // conflicting address either.
+        assert_ne!(l.offer(A, None, now), Some(ip));
+        assert!(!l.may_use(A, ip, now));
+
+        let almost = now + LEASE_TIME - Duration::from_secs(1);
+        assert!(!l.may_use(B, ip, almost));
+    }
+
+    /// A bogus DECLINE (or a squatter that has since gone) must not cost the
+    /// pool that address for the rest of the process.
+    #[test]
+    fn a_declined_address_comes_back_after_a_lease_time() {
+        let mut l = pool();
+        let now = Instant::now();
+        let ip = l.offer(A, None, now).unwrap();
+        l.commit(A, ip, now);
+        assert!(l.decline(A, ip, now));
+
+        let later = now + LEASE_TIME;
+        assert!(l.may_use(B, ip, later));
+        assert_eq!(l.offer(B, Some(ip), later), Some(ip));
+        l.commit(B, ip, later);
+        assert!(!l.may_use(A, ip, later), "B now holds it");
+    }
+
+    /// RFC 2131 has a client decline an address it was given. A DECLINE
+    /// naming somebody else's lease must neither evict that client nor ban
+    /// the address.
+    #[test]
+    fn a_decline_for_another_macs_lease_is_ignored() {
+        let mut l = pool();
+        let now = Instant::now();
+        let ip = l.offer(B, None, now).unwrap();
+        l.commit(B, ip, now);
+
+        assert!(!l.decline(A, ip, now));
+
+        assert!(l.may_use(B, ip, now), "B must keep its lease");
+        assert_eq!(l.offer(B, None, now), Some(ip), "and get it back");
+        assert!(!l.may_use(A, ip, now), "and A still may not take it");
+    }
+
+    /// Without the ownership check, one client could walk the pool sending a
+    /// DECLINE per address and leave nothing for anyone else.
+    #[test]
+    fn a_decline_for_an_unleased_address_is_ignored() {
+        let mut l = pool();
+        let now = Instant::now();
+        for last in 10..=12u8 {
+            assert!(!l.decline(A, Ipv4Addr::new(192, 168, 42, last), now));
+        }
+        assert_eq!(l.offer(B, None, now), Some(Ipv4Addr::new(192, 168, 42, 10)));
+    }
+
+    /// Once A's lease has run out it is no longer A's to decline; the address
+    /// is simply free.
+    #[test]
+    fn a_decline_for_an_expired_lease_is_ignored() {
+        let mut l = pool();
+        let now = Instant::now();
+        let ip = l.offer(A, None, now).unwrap();
+        l.commit(A, ip, now);
+
+        let later = now + LEASE_TIME + Duration::from_secs(1);
+        assert!(!l.decline(A, ip, later));
+        assert!(l.may_use(B, ip, later));
+    }
+
+    /// A's lease expires and the address goes to B. A's old `by_mac` entry
+    /// must not survive that, or A's next RELEASE would delete B's lease.
+    #[test]
+    fn reassigning_an_expired_address_forgets_the_previous_holder() {
+        let mut l = pool();
+        let t0 = Instant::now();
+        let ip = Ipv4Addr::new(192, 168, 42, 10);
+        l.commit(A, ip, t0);
+
+        let later = t0 + LEASE_TIME + Duration::from_secs(1);
+        assert!(l.may_use(B, ip, later));
+        l.commit(B, ip, later);
+
+        l.release(A);
+        assert!(
+            l.may_use(B, ip, later),
+            "B's lease must survive A's RELEASE"
+        );
+        assert!(!l.may_use(A, ip, later), "and A may not take it back");
+
+        // A moving to another address must not drop B's lease either.
+        l.commit(A, Ipv4Addr::new(192, 168, 42, 11), later);
+        assert!(!l.may_use(A, ip, later));
+        assert_eq!(l.offer(B, None, later), Some(ip));
     }
 
     /// A phone that wandered in still holding a lease from its home network
