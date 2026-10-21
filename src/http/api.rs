@@ -176,17 +176,36 @@ pub fn validate(form: &ConnectForm) -> Result<JoinRequest, FormError> {
         return Err(FormError::NoNetwork);
     }
 
-    let passphrase = if form.passphrase.is_empty() {
-        None
-    } else {
-        passphrase::validate(&form.passphrase)
-            .map_err(|e| FormError::BadPassphrase(e.to_string()))?;
-        Some(Secret::new(form.passphrase.clone()))
-    };
-
     let identity = {
         let t = form.identity.trim();
         (!t.is_empty()).then(|| t.to_string())
+    };
+
+    // An identity is what makes this an enterprise (802.1X) join: the NM
+    // backend turns identity + password into WPA-EAP and a bare password
+    // into WPA-PSK. The two secrets obey different rules, so which rules
+    // apply has to follow the same split.
+    let passphrase = match (identity.is_some(), form.passphrase.is_empty()) {
+        // Without a password the backend would quietly fall back to an open
+        // join and drop the identity on the floor. An enterprise network is
+        // never open, so that join can only fail — after an access-point
+        // bounce — and the failure would blame a password the user never
+        // typed. Ask for it instead.
+        (true, true) => {
+            return Err(FormError::BadPassphrase(
+                "Enter the password for this network.".into(),
+            ));
+        }
+        (true, false) => {
+            validate_eap_password(&form.passphrase)?;
+            Some(Secret::new(form.passphrase.clone()))
+        }
+        (false, true) => None,
+        (false, false) => {
+            passphrase::validate(&form.passphrase)
+                .map_err(|e| FormError::BadPassphrase(e.to_string()))?;
+            Some(Secret::new(form.passphrase.clone()))
+        }
     };
 
     Ok(JoinRequest {
@@ -195,6 +214,38 @@ pub fn validate(form: &ConnectForm) -> Result<JoinRequest, FormError> {
         passphrase,
         hidden,
     })
+}
+
+/// The longest enterprise password we pass on, in characters.
+///
+/// EAP itself does not cap the password, but the inner method a PEAP network
+/// almost always runs, MSCHAPv2, does: RFC 2759 limits it to 256 Unicode
+/// characters. Nothing longer can authenticate there, and a bound keeps an
+/// arbitrarily large form field out of the NetworkManager profile.
+const EAP_PASSWORD_MAX_LEN: usize = 256;
+
+/// Validate an enterprise (WPA-EAP) password.
+///
+/// WPA-PSK's 8..=63 printable-ASCII rule is a property of the pre-shared key
+/// derivation, not of passwords in general. A RADIUS account password can be
+/// short, long or non-ASCII, and holding it to PSK rules locks out users
+/// whose credentials are perfectly valid. What we do still refuse is control
+/// characters: NUL cannot cross D-Bus inside a string at all, and a newline
+/// or similar has no business in a value that ends up in NetworkManager's and
+/// wpa_supplicant's line-oriented configuration. No real password needs one.
+fn validate_eap_password(value: &str) -> Result<(), FormError> {
+    let len = value.chars().count();
+    if len > EAP_PASSWORD_MAX_LEN {
+        return Err(FormError::BadPassphrase(format!(
+            "Password is too long: {len} characters, maximum is {EAP_PASSWORD_MAX_LEN}"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(FormError::BadPassphrase(
+            "Password must not contain control characters".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn connect(State(shared): State<Shared>, Form(form): Form<ConnectForm>) -> Response {
@@ -324,6 +375,81 @@ mod tests {
         let mut f = form("486f6d65", "", "abcdefgh");
         f.identity = "   ".into();
         assert!(validate(&f).unwrap().identity.is_none());
+    }
+
+    fn enterprise(passphrase: &str) -> ConnectForm {
+        let mut f = form("486f6d65", "", passphrase);
+        f.identity = "alice".into();
+        f
+    }
+
+    /// RADIUS passwords are not WPA-PSK passphrases: a six-character account
+    /// password is perfectly valid on an 802.1X network.
+    #[test]
+    fn a_short_enterprise_password_is_accepted() {
+        let r = validate(&enterprise("abc123")).unwrap();
+        assert_eq!(r.passphrase.unwrap().expose(), "abc123");
+        assert_eq!(r.identity.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_non_ascii_enterprise_password_is_accepted() {
+        let r = validate(&enterprise("pässwörd\u{1F600}")).unwrap();
+        assert_eq!(r.passphrase.unwrap().expose(), "pässwörd\u{1F600}");
+    }
+
+    /// PSK's 63-character ceiling does not apply, but some ceiling does.
+    #[test]
+    fn an_enterprise_password_is_bounded_by_mschapv2_not_by_psk() {
+        assert!(validate(&enterprise(&"a".repeat(64))).is_ok());
+        assert!(validate(&enterprise(&"a".repeat(EAP_PASSWORD_MAX_LEN))).is_ok());
+        let err = validate(&enterprise(&"a".repeat(EAP_PASSWORD_MAX_LEN + 1))).unwrap_err();
+        match err {
+            FormError::BadPassphrase(m) => assert!(m.contains("256"), "unhelpful: {m}"),
+            other => panic!("expected a passphrase error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_enterprise_password_with_control_characters_is_rejected() {
+        for p in [
+            "pass\0word",
+            "pass\nword",
+            "pass\rword",
+            "pass\u{7f}word",
+            "pass\u{85}word",
+        ] {
+            assert!(
+                matches!(validate(&enterprise(p)), Err(FormError::BadPassphrase(_))),
+                "accepted {p:?}"
+            );
+        }
+    }
+
+    /// The relaxed rules hinge on the identity; without one the password is
+    /// a pre-shared key and the WPA-PSK rules still hold.
+    #[test]
+    fn psk_rules_still_apply_without_an_identity() {
+        for p in ["abc123", "pässwörd", &"a".repeat(64)] {
+            assert!(
+                matches!(
+                    validate(&form("486f6d65", "", p)),
+                    Err(FormError::BadPassphrase(_))
+                ),
+                "accepted {p:?} as a PSK"
+            );
+        }
+    }
+
+    /// An identity with no password would otherwise become an open join that
+    /// silently discards the identity and can only fail.
+    #[test]
+    fn an_identity_without_a_password_is_rejected() {
+        let err = validate(&enterprise("")).unwrap_err();
+        match err {
+            FormError::BadPassphrase(m) => assert!(m.contains("password"), "unhelpful: {m}"),
+            other => panic!("expected a passphrase error, got {other:?}"),
+        }
     }
 
     #[test]
