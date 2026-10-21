@@ -300,6 +300,16 @@ wifi-connect --ui-directory /etc/wifi-connect/ui
   or template stops the portal with the path in the message. Restart to
   pick up edits. The directory is capped at 256 files and 8 MB, dotfiles
   are skipped, and a symlink that resolves outside it is refused.
+- **Inline script and style are allowed by hash.** The portal sends a
+  Content-Security-Policy; with `--ui-directory` it is built at startup
+  from the SHA-256 of each bare `<script>…</script>` and
+  `<style>…</style>` block in your two templates, and `script-src` also
+  allows `'self'`, so `<script src="/assets/app.js">` works. Everything
+  else in the policy is unchanged. A block with attributes
+  (`<script type="module">`, `<style media="…">`) is not hashed, and a
+  `{{TOKEN}}` inside a block changes its bytes per request; the browser
+  blocks both, so both are logged as a warning at startup. Inline event
+  handlers (`onclick="…"`) and `style="…"` attributes are blocked too.
 
 ## Exit codes
 

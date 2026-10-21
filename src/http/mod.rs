@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderValue, header};
 use axum::response::Response;
 use axum::routing::{get, post};
@@ -59,7 +59,10 @@ pub fn router(shared: Shared) -> Router {
 
     app.fallback(api::probe_redirect)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
-        .layer(axum::middleware::map_response(security_headers))
+        .layer(axum::middleware::map_response_with_state(
+            shared.clone(),
+            security_headers,
+        ))
         .with_state(shared)
 }
 
@@ -74,7 +77,10 @@ pub fn router(shared: Shared) -> Router {
 /// inert. The page is reached over the setup access point, but the phone
 /// may still have a cellular connection, so a page from the internet could
 /// otherwise frame the password form and dress it up as something else.
-async fn security_headers(mut resp: Response) -> Response {
+///
+/// The page policy depends on where the pages came from: the embedded UI's
+/// hashes are compiled in, a `--ui-directory` computed its own at startup.
+async fn security_headers(State(shared): State<Shared>, mut resp: Response) -> Response {
     let is_svg = resp
         .headers()
         .get(header::CONTENT_TYPE)
@@ -83,7 +89,10 @@ async fn security_headers(mut resp: Response) -> Response {
     let csp = if is_svg {
         HeaderValue::from_static(assets::SVG_CONTENT_SECURITY_POLICY)
     } else {
-        assets::content_security_policy()
+        match &shared.branding.ui {
+            Some(ui) => ui.content_security_policy(),
+            None => assets::content_security_policy(),
+        }
     };
     let headers = resp.headers_mut();
     headers.insert(header::CONTENT_SECURITY_POLICY, csp);
@@ -1347,6 +1356,75 @@ mod tests {
             csp.contains("style-src 'self' 'unsafe-inline' 'sha256-"),
             "{what}: {csp}"
         );
+    }
+
+    /// With `--ui-directory` every response carries that directory's
+    /// policy: its own hashes, `'self'` for `<script src>`, and every
+    /// other protection unchanged. An SVG under `/assets/` keeps the SVG
+    /// policy.
+    #[tokio::test]
+    async fn a_ui_directory_gets_a_policy_for_its_own_pages() {
+        let ui = crate::http::assets::TestUiDir::new();
+        ui.write(
+            "index.html",
+            "<style>h1{color:red}</style>{{NETWORKS}}<script src=\"/assets/app.js\"></script>",
+        );
+        ui.write("app.js", "void 0");
+        ui.write("img/logo.svg", "<svg/>");
+        let style_hash = {
+            use base64::Engine;
+            use sha2::Digest;
+            format!(
+                "'sha256-{}'",
+                base64::engine::general_purpose::STANDARD
+                    .encode(sha2::Sha256::digest(b"h1{color:red}"))
+            )
+        };
+
+        for path in ["/", "/connecting", "/assets/app.js", "/no/such/path"] {
+            let resp = get_path_with_ui(&ui, path).await;
+            let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(csp.contains("script-src 'self';"), "{path}: {csp}");
+            assert!(
+                csp.contains(&format!("style-src 'self' 'unsafe-inline' {style_hash};")),
+                "{path}: {csp}"
+            );
+            for directive in [
+                "default-src 'none'",
+                "frame-ancestors 'none'",
+                "form-action 'self'",
+                "base-uri 'none'",
+            ] {
+                assert!(csp.contains(directive), "{path}: CSP lacks {directive}");
+            }
+            assert_eq!(resp.headers()[header::X_FRAME_OPTIONS], "DENY");
+            assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        }
+
+        let resp = get_path_with_ui(&ui, "/assets/img/logo.svg").await;
+        assert_eq!(
+            resp.headers()[header::CONTENT_SECURITY_POLICY],
+            crate::http::assets::SVG_CONTENT_SECURITY_POLICY
+        );
+    }
+
+    /// The built-in pages inline everything, so their policy keeps
+    /// `'self'` out of script-src.
+    #[tokio::test]
+    async fn the_built_in_policy_does_not_allow_script_from_self() {
+        let resp = get_path("/").await;
+        let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap();
+        let script = csp
+            .split(';')
+            .map(str::trim)
+            .find(|d| d.starts_with("script-src "))
+            .unwrap();
+        assert!(!script.contains("'self'"), "{csp}");
     }
 
     /// An SVG logo gets its own policy: its inline styling survives, and

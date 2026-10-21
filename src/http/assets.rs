@@ -61,6 +61,12 @@ const TEMPLATES: [&str; 2] = ["index.html", "connecting.html"];
 /// `..`, absolute paths and NUL bytes have nothing to resolve against.
 pub struct UiDirectory {
     files: std::collections::HashMap<String, axum::body::Bytes>,
+    /// The `Content-Security-Policy` for every response while this
+    /// directory is the UI: the embedded policy's hashes are of the
+    /// embedded pages, and would block every inline block an operator has
+    /// edited. Computed once here, from these templates; see
+    /// `ui_directory_content_security_policy`.
+    content_security_policy: HeaderValue,
 }
 
 /// Prefix an I/O error with the file it concerns.
@@ -126,6 +132,7 @@ impl UiDirectory {
 
         let mut ui = Self {
             files: std::collections::HashMap::new(),
+            content_security_policy: HeaderValue::from_static("default-src 'none'"),
         };
         let mut total = 0u64;
         ui.read_dir(&root, &root, "", 0, &mut total)?;
@@ -159,7 +166,56 @@ impl UiDirectory {
             ));
         }
 
+        ui.content_security_policy = policy_header(&ui_directory_content_security_policy(
+            &InlineHashes::of_pages(ui.templates()),
+        ));
         Ok(ui)
+    }
+
+    /// The two templates, as text. Both were checked to be UTF-8 at load.
+    fn templates(&self) -> impl Iterator<Item = (&'static str, std::borrow::Cow<'_, str>)> {
+        TEMPLATES.into_iter().map(|name| {
+            (
+                name,
+                String::from_utf8_lossy(self.get(name).unwrap_or_default()),
+            )
+        })
+    }
+
+    /// The `Content-Security-Policy` to send while this UI is served.
+    pub fn content_security_policy(&self) -> HeaderValue {
+        self.content_security_policy.clone()
+    }
+
+    /// Inline blocks in these templates that the policy will not allow.
+    ///
+    /// Not an error, for the same reason as `missing_tokens`: the page
+    /// still loads. But the browser drops the block and says so only in a
+    /// console nobody has open on a captive-portal sheet, so the caller
+    /// logs these at startup.
+    ///
+    /// Two ways in. A `{{TOKEN}}` inside a `<script>` or `<style>` body is
+    /// substituted per request, after the hash was taken from the
+    /// template, so the rendered bytes no longer match it. And only bare
+    /// `<script>` and `<style>` tags are hashed (the rule ui/build.ts uses):
+    /// an inline `<script type="module">` or `<style media="…">` is not,
+    /// so it is blocked. `<script src=…>` is fine; it is allowed by
+    /// `'self'`.
+    pub fn unhashed_inline_blocks(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (name, html) in self.templates() {
+            for tag in ["script", "style"] {
+                for body in inline_blocks(&html, tag) {
+                    for token in tokens(body) {
+                        out.push(format!("{name}: {token} inside <{tag}>"));
+                    }
+                }
+                for open in attributed_inline_tags(&html, tag) {
+                    out.push(format!("{name}: {open}"));
+                }
+            }
+        }
+        out
     }
 
     /// Recurse into `dir`, keying each file by its path below `root`.
@@ -565,11 +621,92 @@ pub fn render_connecting(branding: &Branding, ssid: &str) -> String {
 }
 
 /// The hashes of the inline `<script>` and `<style>` blocks, as written by
-/// ui/build.ts into `ui/dist/csp.json`.
-#[derive(Debug, Default, serde::Deserialize)]
+/// ui/build.ts into `ui/dist/csp.json`, or as computed from a
+/// `--ui-directory` by `of_pages`.
+#[derive(Debug, Default, PartialEq, Eq, serde::Deserialize)]
 struct InlineHashes {
     script: Vec<String>,
     style: Vec<String>,
+}
+
+impl InlineHashes {
+    /// The embedded hashes, from `ui/dist/csp.json`.
+    fn embedded() -> Self {
+        Assets::get("csp.json")
+            .and_then(|f| serde_json::from_slice(f.data.as_ref()).ok())
+            .unwrap_or_default()
+    }
+
+    /// Hash every inline block of `pages` the way ui/build.ts does, so the
+    /// embedded pages come out exactly as `csp.json`: distinct, sorted.
+    fn of_pages<S: AsRef<str>>(pages: impl IntoIterator<Item = (&'static str, S)>) -> Self {
+        let mut script = std::collections::BTreeSet::new();
+        let mut style = std::collections::BTreeSet::new();
+        for (_, html) in pages {
+            let html = html.as_ref();
+            script.extend(inline_blocks(html, "script").into_iter().map(csp_source));
+            style.extend(inline_blocks(html, "style").into_iter().map(csp_source));
+        }
+        Self {
+            script: script.into_iter().collect(),
+            style: style.into_iter().collect(),
+        }
+    }
+}
+
+/// The bodies of the bare `<tag>…</tag>` blocks in `html`, exactly the
+/// bytes a browser hashes.
+///
+/// The same rule as `inlineHashes` in ui/build.ts, which is the regex
+/// `<tag>([\s\S]*?)</tag>`: a literal, attribute-free, lower-case opening
+/// tag, up to the first closing tag after it. An opening tag with no
+/// closing tag after it ends the scan, as it does the regex. Anything else
+/// (`<script src>`, `<script type="module">`) is not an inline block to
+/// this rule; see `attributed_inline_tags` for the second kind.
+fn inline_blocks<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find(&open) {
+        let body = &rest[start + open.len()..];
+        let Some(end) = body.find(&close) else { break };
+        out.push(&body[..end]);
+        rest = &body[end + close.len()..];
+    }
+    out
+}
+
+/// Opening `<tag …>`s with attributes that carry an inline body, which
+/// the hash rule above does not cover and the policy therefore blocks.
+///
+/// A `<script>` with `src=` is not one of them: it has no body to hash and
+/// is allowed by `'self'`. Case-sensitive like the rule it complements.
+fn attributed_inline_tags<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag}");
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find('>') else { break };
+        let attrs = &after[..end];
+        let is_attributed = attrs.starts_with(|c: char| c.is_ascii_whitespace());
+        if is_attributed && !(tag == "script" && attrs.contains("src=")) {
+            out.push(&rest[start..start + open.len() + end + 1]);
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+/// The CSP hash source for one inline block body.
+fn csp_source(body: &str) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body.as_bytes());
+    format!(
+        "'sha256-{}'",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    )
 }
 
 /// Is `source` a CSP hash source we are willing to put in a header?
@@ -613,11 +750,11 @@ fn is_sha256_source(source: &str) -> bool {
 /// If the hashes are missing the policy still goes out, just with no script
 /// or style allowed: the only page that can be served in that state is the
 /// "assets missing" notice, which needs neither.
-fn build_content_security_policy() -> String {
-    let hashes: InlineHashes = Assets::get("csp.json")
-        .and_then(|f| serde_json::from_slice(f.data.as_ref()).ok())
-        .unwrap_or_default();
-
+///
+/// `script_self` adds `'self'` to `script-src`, for a `--ui-directory`
+/// whose pages may load their script from `/assets/`. The embedded pages
+/// inline all of theirs, so the built-in policy leaves it out.
+fn build_content_security_policy(hashes: &InlineHashes, script_self: bool) -> String {
     let sources = |list: &[String]| -> String {
         list.iter()
             .filter(|s| is_sha256_source(s))
@@ -638,9 +775,10 @@ fn build_content_security_policy() -> String {
             s => format!(" 'unsafe-inline'{s}"),
         }
     };
-    let script = match with_fallback(&hashes.script) {
-        s if s.is_empty() => String::from(" 'none'"),
-        s => s,
+    let script = match (script_self, with_fallback(&hashes.script)) {
+        (true, s) => format!(" 'self'{s}"),
+        (false, s) if s.is_empty() => String::from(" 'none'"),
+        (false, s) => s,
     };
 
     format!(
@@ -673,13 +811,37 @@ pub const SVG_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; \
      frame-ancestors 'none'; \
      base-uri 'none'";
 
-/// The `Content-Security-Policy` header value for every portal response.
+/// The policy for a `--ui-directory`: the embedded policy, with that
+/// directory's own hashes in place of the embedded ones and `'self'` added
+/// to `script-src`.
+///
+/// Only those two change. The rest (`form-action`, `frame-ancestors`,
+/// `base-uri`, `default-src 'none'`) is what protects the password form,
+/// and an operator's template is no reason to relax it. `'self'` is the
+/// one widening: a custom UI may well ship `<script src="/assets/…">`,
+/// and everything at `/assets/` is the operator's own directory.
+fn ui_directory_content_security_policy(hashes: &InlineHashes) -> String {
+    build_content_security_policy(hashes, true)
+}
+
+/// A policy string as a header value. The sources were filtered by
+/// `is_sha256_source`, so this cannot fail; if it somehow did, a policy
+/// that allows nothing is the safe way to be wrong.
+fn policy_header(policy: &str) -> HeaderValue {
+    HeaderValue::from_str(policy).unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'"))
+}
+
+/// The `Content-Security-Policy` header value for every portal response
+/// served from the embedded UI. A `--ui-directory` carries its own; see
+/// `UiDirectory::content_security_policy`.
 ///
 /// Built once: the hashes are compiled into the binary and cannot change.
 pub fn content_security_policy() -> HeaderValue {
     static CSP: std::sync::LazyLock<HeaderValue> = std::sync::LazyLock::new(|| {
-        HeaderValue::from_str(&build_content_security_policy())
-            .unwrap_or_else(|_| HeaderValue::from_static("default-src 'none'"))
+        policy_header(&build_content_security_policy(
+            &InlineHashes::embedded(),
+            false,
+        ))
     });
     CSP.clone()
 }
@@ -1122,20 +1284,6 @@ mod tests {
         assert!(html.contains("&quot;"));
     }
 
-    /// The `<tag>` bodies in `html`, exactly as the browser hashes them.
-    fn inline_blocks<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
-        let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-        let mut out = Vec::new();
-        let mut rest = html;
-        while let Some(start) = rest.find(&open) {
-            let body = &rest[start + open.len()..];
-            let end = body.find(&close).expect("unterminated inline block");
-            out.push(&body[..end]);
-            rest = &body[end + close.len()..];
-        }
-        out
-    }
-
     /// The sources listed for one directive of `csp`.
     fn directive<'a>(csp: &'a str, name: &str) -> Vec<&'a str> {
         csp.split(';')
@@ -1144,16 +1292,6 @@ mod tests {
             .unwrap_or_else(|| panic!("no {name} in {csp}"))
             .split(' ')
             .collect()
-    }
-
-    fn csp_source(body: &str) -> String {
-        use base64::Engine;
-        use sha2::Digest;
-        let digest = sha2::Sha256::digest(body.as_bytes());
-        format!(
-            "'sha256-{}'",
-            base64::engine::general_purpose::STANDARD.encode(digest)
-        )
     }
 
     /// The guard against a UI rebuild silently breaking the portal.
@@ -1609,11 +1747,7 @@ mod tests {
     /// nothing missing.
     #[test]
     fn a_copy_of_the_embedded_ui_lacks_no_tokens() {
-        let dir = TestUiDir::new();
-        for name in TEMPLATES {
-            let data = Assets::get(name).unwrap().data;
-            dir.write(name, std::str::from_utf8(&data).unwrap());
-        }
+        let dir = copy_of_the_embedded_ui();
         assert_eq!(dir.load().unwrap().missing_tokens(), Vec::<String>::new());
     }
 
@@ -1622,6 +1756,136 @@ mod tests {
         assert_eq!(
             tokens("{{A}} {{lower}} {{B_C}} {{A}} {{ }} {{"),
             vec!["{{A}}", "{{B_C}}"]
+        );
+    }
+
+    /// A copy of the embedded templates, as `--ui-directory`.
+    fn copy_of_the_embedded_ui() -> TestUiDir {
+        let dir = TestUiDir::new();
+        for name in TEMPLATES {
+            let data = Assets::get(name).unwrap().data;
+            dir.write(name, std::str::from_utf8(&data).unwrap());
+        }
+        dir
+    }
+
+    /// Every directive of `csp` but the two named, in order.
+    fn other_directives<'a>(csp: &'a str, except: &[&str]) -> Vec<&'a str> {
+        csp.split(';')
+            .map(str::trim)
+            .filter(|d| !except.iter().any(|e| d.split(' ').next() == Some(*e)))
+            .collect()
+    }
+
+    /// The Rust extractor and ui/build.ts must agree byte for byte, or a
+    /// `--ui-directory` copied from ui/dist would get a different policy
+    /// from the very pages the built-in one was made for.
+    #[test]
+    fn the_rust_extractor_reproduces_csp_json_from_the_embedded_pages() {
+        let pages = TEMPLATES.map(|name| {
+            let data = Assets::get(name).unwrap().data;
+            (name, String::from_utf8(data.into_owned()).unwrap())
+        });
+        let embedded = InlineHashes::embedded();
+        assert!(!embedded.script.is_empty() && !embedded.style.is_empty());
+        assert_eq!(InlineHashes::of_pages(pages), embedded);
+    }
+
+    #[test]
+    fn inline_blocks_follows_the_build_ts_rule() {
+        let html = "<script>a</script><script src=x></script>\
+                    <script type=module>b</script><SCRIPT>c</SCRIPT>\
+                    <script>\nd\n</script><script>unterminated";
+        assert_eq!(inline_blocks(html, "script"), vec!["a", "\nd\n"]);
+        assert_eq!(inline_blocks("<style></style>", "style"), vec![""]);
+    }
+
+    /// A copy of ui/dist gets exactly the built-in policy, plus `'self'`
+    /// for script: same hashes, same everything else.
+    #[test]
+    fn a_copy_of_the_embedded_ui_gets_the_built_in_policy_plus_self() {
+        let ui = copy_of_the_embedded_ui().load().unwrap();
+        let built_in = content_security_policy().to_str().unwrap().to_owned();
+        assert_eq!(
+            ui.content_security_policy().to_str().unwrap(),
+            built_in.replacen("script-src ", "script-src 'self' ", 1)
+        );
+        assert_eq!(ui.unhashed_inline_blocks(), Vec::<String>::new());
+    }
+
+    /// The defect this policy exists to fix: an operator's edited inline
+    /// blocks were held to the embedded hashes and blocked.
+    #[test]
+    fn an_edited_ui_directory_is_allowed_by_its_own_hashes() {
+        let dir = TestUiDir::new();
+        dir.write(
+            "index.html",
+            "<style>body{color:red}</style>{{BRAND_CSS}}{{BANNER}}{{NETWORKS}}\
+             <script>document.title='x'</script><script src=\"/assets/app.js\"></script>",
+        );
+        dir.write("connecting.html", "<script>poll()</script>{{SSID}}");
+        let branding = with_ui("B", dir.load().unwrap());
+        let ui = branding.ui.as_ref().unwrap();
+        let csp = ui.content_security_policy().to_str().unwrap().to_owned();
+        let built_in = content_security_policy().to_str().unwrap().to_owned();
+
+        let script = directive(&csp, "script-src");
+        let style = directive(&csp, "style-src");
+        assert_eq!(script[0], "'self'", "{csp}");
+        assert_eq!(style[0], "'self'", "{csp}");
+        for page in [
+            render_index(&branding, &[], &PortalState::Portal),
+            render_connecting(&branding, "Home"),
+        ] {
+            for (tag, allowed) in [("script", &script), ("style", &style)] {
+                for body in inline_blocks(&page, tag) {
+                    let source = csp_source(body);
+                    assert!(allowed.contains(&source.as_str()), "{tag} {source}: {csp}");
+                }
+            }
+        }
+        // Its own hashes, not the embedded ones riding along.
+        for source in directive(&built_in, "script-src") {
+            if is_sha256_source(source) {
+                assert!(!script.contains(&source), "{source}");
+            }
+        }
+        // Nothing else moved.
+        assert_eq!(
+            other_directives(&csp, &["script-src", "style-src"]),
+            other_directives(&built_in, &["script-src", "style-src"])
+        );
+        assert_eq!(ui.unhashed_inline_blocks(), Vec::<String>::new());
+    }
+
+    /// No inline blocks means no hashes, and then no `'unsafe-inline'`
+    /// either: with nothing to switch it off it would allow everything.
+    #[test]
+    fn a_ui_directory_without_inline_blocks_allows_only_self() {
+        let ui = TestUiDir::new().load().unwrap();
+        let csp = ui.content_security_policy().to_str().unwrap().to_owned();
+        assert_eq!(directive(&csp, "script-src"), vec!["'self'"]);
+        assert_eq!(directive(&csp, "style-src"), vec!["'self'"]);
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
+    }
+
+    /// Blocks the policy will refuse are reported for the startup log.
+    #[test]
+    fn inline_blocks_the_policy_cannot_allow_are_reported() {
+        let dir = TestUiDir::new();
+        dir.write(
+            "index.html",
+            "{{NETWORKS}}<script>var n='{{BRAND_NAME}}'</script>\
+             <script type=\"module\">x()</script><style media=\"print\">a{}</style>\
+             <script src=\"/assets/a.js\"></script><styles></styles>",
+        );
+        assert_eq!(
+            dir.load().unwrap().unhashed_inline_blocks(),
+            vec![
+                "index.html: {{BRAND_NAME}} inside <script>",
+                r#"index.html: <script type="module">"#,
+                r#"index.html: <style media="print">"#,
+            ]
         );
     }
 }

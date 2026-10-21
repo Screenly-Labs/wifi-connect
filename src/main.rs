@@ -225,6 +225,20 @@ async fn run() -> ExitCode {
                          the features they carry will not appear (compare with ui/dist)"
                     );
                 }
+                // The policy allows these templates' inline blocks by hash,
+                // taken here from the template bytes. A block the browser
+                // will refuse is otherwise reported only in its console.
+                let blocked = ui.unhashed_inline_blocks();
+                if !blocked.is_empty() {
+                    warn!(
+                        path = %path.display(),
+                        blocked = %blocked.join(", "),
+                        "--ui-directory templates have inline script or style the \
+                         Content-Security-Policy will block: keep template tokens out of \
+                         <script>/<style> bodies, use bare <script> and <style> tags \
+                         for inline code, or move it to a file under /assets/"
+                    );
+                }
                 Some(std::sync::Arc::new(ui))
             }
             Err(e) => {
