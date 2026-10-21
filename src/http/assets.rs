@@ -233,10 +233,12 @@ fn render(template: &str, tokens: &[(&str, &str)]) -> String {
                 rest = &after[close + 2..];
             }
             None => {
-                // Not a token we know: emit the braces and resume just past
-                // them, so a stray `{{` cannot swallow a real token after it.
-                out.push_str("{{");
-                rest = after;
+                // Not a token we know: emit ONE brace and resume at the
+                // second, so a stray `{{` cannot swallow a real token after
+                // it. Skipping both would miss the token in `{{{SSID}}}`,
+                // whose first `{{` is a brace short of `{{SSID}}`.
+                out.push('{');
+                rest = &rest[open + 1..];
             }
         }
     }
@@ -763,6 +765,10 @@ mod tests {
         // A stray `{{` does not swallow the real token that follows it.
         assert_eq!(render("{{{{A}}", &tokens), "{{x");
         assert_eq!(render("{{ {{A}} }}", &tokens), "{{ x }}");
+        // Nor does a single brace in front of one, as in CSS or in a
+        // mustache-style `{{{A}}}`: the token is the last two of the three.
+        assert_eq!(render("{{{A}}}", &tokens), "{x}");
+        assert_eq!(render("a{{{{{A}}}}}", &tokens), "a{{{x}}}");
     }
 
     #[test]
