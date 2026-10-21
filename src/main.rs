@@ -225,10 +225,14 @@ async fn run() -> ExitCode {
     let (shared, joins) = state::Shared::new(args.portal_url(), branding);
     let cancel = CancellationToken::new();
 
-    // DHCP, DNS and HTTP. DHCP is pinned to the access-point interface;
-    // DNS and HTTP bind the gateway address specifically. None of the three
-    // can touch another interface on this device, which matters when the
-    // box also has a live ethernet link to a customer LAN.
+    // DHCP, DNS and HTTP. All three are pinned to the access-point interface
+    // with SO_BINDTODEVICE; DNS and HTTP additionally bind the gateway
+    // address. The pin is what keeps them off every other interface on this
+    // device, which matters when the box also has a live ethernet link to a
+    // customer LAN: the gateway address alone would not, because Linux
+    // accepts a packet for any local address on any interface, so a LAN host
+    // with a static route via our ethernet address could otherwise reach the
+    // portal (and its unauthenticated POST /connect).
     let servers = {
         let cancel = cancel.clone();
         let gateway = args.portal_gateway;
@@ -247,8 +251,13 @@ async fn run() -> ExitCode {
             };
 
             let dhcp = dhcp::serve(&interface, 67, dhcp_cfg, leases, cancel.clone());
-            let dns = dns::serve(gateway, 53, cancel.clone());
-            let portal = http::serve(SocketAddr::from((gateway, port)), shared, cancel.clone());
+            let dns = dns::serve(&interface, gateway, 53, cancel.clone());
+            let portal = http::serve(
+                &interface,
+                SocketAddr::from((gateway, port)),
+                shared,
+                cancel.clone(),
+            );
 
             // Any one of the three failing makes the portal useless. Cancel
             // the run so the access point comes back down and the exit code
