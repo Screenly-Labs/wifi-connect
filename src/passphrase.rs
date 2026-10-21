@@ -25,8 +25,9 @@ use crate::secret::Secret;
 /// bits each. The count, uniqueness and exclusions are pinned by tests.
 const ALPHABET: &[u8] = b"abcdefghijkmnopqrstuvwxyzACDEFGHJKLMNPQRTUVWXYZ3467";
 
-/// 14 symbols × log2(51) ≈ 79.4 bits (a test pins it at ≥ 78). Comfortably inside WPA-PSK's 8..=63 character limit
-/// with room for the operator to not think about it.
+/// 14 symbols × log2(51) ≈ 79.4 bits (a test pins it at ≥ 78). Comfortably
+/// inside WPA-PSK's 8..=63 character limit with room for the operator to not
+/// think about it.
 const DEFAULT_LEN: usize = 14;
 
 /// WPA-PSK passphrases are 8..=63 ASCII characters (a 64-character value is
