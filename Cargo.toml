@@ -29,7 +29,7 @@ nmrs = "3.5.7"
 # the `#[zbus::proxy]` macro expands to paths rooted at `::zbus`, which only
 # resolve if the crate is named in Cargo.toml. `nmrs::raw::zbus` remains the
 # right way to refer to the *types*.
-zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+zbus = { version = "6.0", default-features = false, features = ["tokio"] }
 
 async-trait = "0.1.92"
 # Both already in the build graph, at these versions (nmrs uses base64,
