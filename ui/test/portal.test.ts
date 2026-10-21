@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, test } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -257,6 +258,51 @@ describe('server-rendered placeholders', () => {
     for (const html of [index, connecting]) {
       expect(html).not.toContain('{{STYLE}}')
       expect(html).not.toContain('{{SCRIPT}}')
+    }
+  })
+})
+
+describe('content security policy', () => {
+  // The server allows inline script and style by hash only (see
+  // src/http/assets.rs). Anything the browser would need a looser policy
+  // for has to fail here, at build time, rather than as a portal whose
+  // script silently does not run.
+  const csp = JSON.parse(readFileSync(join(dist, 'csp.json'), 'utf8')) as {
+    script: string[]
+    style: string[]
+  }
+
+  function hashes(html: string, tag: string): string[] {
+    return [...html.matchAll(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'g'))].map(
+      (m) => `'sha256-${createHash('sha256').update(m[1], 'utf8').digest('base64')}'`,
+    )
+  }
+
+  test('every inline block is covered by a published hash', () => {
+    for (const html of [index, connecting]) {
+      const scripts = hashes(html, 'script')
+      const styles = hashes(html, 'style')
+      expect(scripts.length).toBeGreaterThan(0)
+      expect(styles.length).toBeGreaterThan(0)
+      for (const h of scripts) expect(csp.script).toContain(h)
+      for (const h of styles) expect(csp.style).toContain(h)
+    }
+  })
+
+  test('every script and style element is a bare inline block', () => {
+    // A `<script src>` or a `<style media>` would escape the hash scan
+    // above, and the policy would block it.
+    for (const html of [indexEff, connectingEff]) {
+      expect(html).not.toMatch(/<script\s[^>]*>/i)
+      expect(html).not.toMatch(/<style\s[^>]*>/i)
+    }
+  })
+
+  test('nothing needs unsafe-hashes: no style attributes or inline handlers', () => {
+    for (const html of [indexEff, connectingEff]) {
+      expect(html).not.toMatch(/<[^>]+\sstyle\s*=/i)
+      expect(html).not.toMatch(/<[^>]+\son[a-z]+\s*=/i)
+      expect(html).not.toMatch(/javascript:/i)
     }
   })
 })

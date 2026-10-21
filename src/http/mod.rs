@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::http::{HeaderValue, header};
+use axum::response::Response;
 use axum::routing::{get, post};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -57,28 +59,50 @@ pub fn router(shared: Shared) -> Router {
 
     app.fallback(api::probe_redirect)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
-        .layer(axum::middleware::map_response(referrer_policy))
+        .layer(axum::middleware::map_response(security_headers))
         .with_state(shared)
 }
 
-/// `Referrer-Policy: same-origin` on every response.
+/// Headers every portal response carries, whatever route produced it.
 ///
-/// `POST /connect` refuses a request whose `Origin` is `null` (see
-/// `api::connect`), and the Fetch standard makes a form POST carry
-/// `Origin: null` — *even to its own origin* — when the posting page's
-/// referrer policy is `no-referrer`. Chrome and the Android WebView do
-/// exactly that. Left to the browser's default the page is fine, but a
-/// user who has set their browser's default policy to `no-referrer`, or a
-/// later change that sends `no-referrer` from here, would lock every such
-/// browser out of setup with a 403.
+/// A layer rather than per-handler calls so that a route added later, the
+/// fallback, and axum's own 404/405 responses cannot miss them.
 ///
-/// `same-origin` keeps the real `Origin` on our own form's POST and still
-/// tells no other site anything, which is all `no-referrer` would buy. An
-/// explicit header also overrides a browser's configured default.
-async fn referrer_policy(mut resp: axum::response::Response) -> axum::response::Response {
-    resp.headers_mut().insert(
-        axum::http::header::REFERRER_POLICY,
-        axum::http::HeaderValue::from_static("same-origin"),
+/// They go on every response, not only HTML: `/assets/` serves the raw
+/// templates as text/html and `/brand-logo` may be an SVG, which is a
+/// document that can carry script; on JSON, CSS and redirects they are
+/// inert. The page is reached over the setup access point, but the phone
+/// may still have a cellular connection, so a page from the internet could
+/// otherwise frame the password form and dress it up as something else.
+async fn security_headers(mut resp: Response) -> Response {
+    let is_svg = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("image/svg+xml"));
+    let csp = if is_svg {
+        HeaderValue::from_static(assets::SVG_CONTENT_SECURITY_POLICY)
+    } else {
+        assets::content_security_policy()
+    };
+    let headers = resp.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, csp);
+    // frame-ancestors supersedes this where it is understood; the header is
+    // for the captive-portal webviews old enough not to.
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    // Nothing off the portal learns where the user came from, but our own
+    // requests keep their provenance. NOT `no-referrer`: under that policy
+    // a browser sends `Origin: null` on the form's POST (Fetch, "append a
+    // request `Origin` header") and drops `Referer`, which is exactly the
+    // evidence a cross-site-POST check on /connect relies on. `same-origin`
+    // sends both, unchanged, to ourselves and nothing to anyone else.
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("same-origin"),
     );
     resp
 }
@@ -1200,5 +1224,132 @@ mod tests {
                 "{path} is cacheable"
             );
         }
+    }
+
+    /// Every security header, on a response that came back from `resp`.
+    fn assert_security_headers(resp: &axum::response::Response, what: &str) {
+        let get = |name: header::HeaderName| {
+            resp.headers()
+                .get(&name)
+                .map(|v| v.to_str().unwrap().to_owned())
+                .unwrap_or_else(|| panic!("{what}: no {name} header"))
+        };
+        assert_eq!(get(header::X_CONTENT_TYPE_OPTIONS), "nosniff", "{what}");
+        assert_eq!(get(header::X_FRAME_OPTIONS), "DENY", "{what}");
+        assert_eq!(get(header::REFERRER_POLICY), "same-origin", "{what}");
+
+        let csp = get(header::CONTENT_SECURITY_POLICY);
+        for directive in [
+            "default-src 'none'",
+            "frame-ancestors 'none'",
+            "form-action 'self'",
+            "base-uri 'none'",
+        ] {
+            assert!(csp.contains(directive), "{what}: CSP lacks {directive}");
+        }
+        // The point of the hashes: inline script must never be allowed
+        // wholesale, or the policy is no backstop for an escaping bug. The
+        // 'unsafe-inline' kept for CSP 1.0 browsers is ignored by every
+        // later one only because a hash sits beside it.
+        assert!(
+            csp.contains("script-src 'unsafe-inline' 'sha256-"),
+            "{what}: {csp}"
+        );
+        assert!(
+            csp.contains("style-src 'self' 'unsafe-inline' 'sha256-"),
+            "{what}: {csp}"
+        );
+    }
+
+    /// An SVG logo gets its own policy: its inline styling survives, and
+    /// nothing in it can run or be framed.
+    #[tokio::test]
+    async fn an_svg_logo_keeps_its_styles_but_cannot_run_script() {
+        let (shared, _rx) = Shared::new(
+            "http://192.168.42.1/".into(),
+            Branding {
+                logo: Some(crate::state::BrandLogo {
+                    bytes: std::sync::Arc::from(&b"<svg/>"[..]),
+                    content_type: "image/svg+xml",
+                }),
+                ..Branding::new("Anthias")
+            },
+        );
+        let resp = router(shared)
+            .oneshot(
+                Request::builder()
+                    .uri("/brand-logo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        assert!(csp.contains("style-src 'unsafe-inline'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(!csp.contains("script-src"), "{csp}");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(resp.headers()[header::X_FRAME_OPTIONS], "DENY");
+    }
+
+    #[tokio::test]
+    async fn every_page_carries_the_security_headers() {
+        // The pages a user sees, the probe that opens the sign-in sheet on
+        // Apple devices, a redirecting probe, JSON, and the fallback.
+        for path in [
+            "/",
+            "/connecting",
+            "/hotspot-detect.html",
+            "/generate_204",
+            "/api/status",
+            "/brand.css",
+            "/assets/index.html",
+            "/no/such/path",
+        ] {
+            let resp = get_path(path).await;
+            assert_security_headers(&resp, path);
+        }
+    }
+
+    /// The validation-error page is rendered by the POST handler, a
+    /// different path from GET /, and is the one carrying the form back.
+    #[tokio::test]
+    async fn the_connect_error_page_carries_the_security_headers() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connect")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("ssid_hex=&ssid=&passphrase="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_security_headers(&resp, "POST /connect (error)");
+    }
+
+    /// The layer adds headers; it must not take away the ones handlers set.
+    #[tokio::test]
+    async fn the_layer_keeps_the_handlers_own_headers() {
+        let resp = get_path("/").await;
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
     }
 }

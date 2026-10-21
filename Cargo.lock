@@ -1936,6 +1936,7 @@ version = "2026.10.3"
 dependencies = [
  "async-trait",
  "axum",
+ "base64",
  "clap",
  "dhcproto",
  "hex",
@@ -1950,6 +1951,7 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
  "simple-dns",
  "socket2",
  "thiserror",
