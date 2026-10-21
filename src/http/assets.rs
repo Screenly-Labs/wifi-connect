@@ -776,4 +776,87 @@ mod tests {
         let tokens = [("A", "{{B}}"), ("B", "{{A}}")];
         assert_eq!(render("{{A}}|{{B}}", &tokens), "{{B}}|{{A}}");
     }
+
+    /// Positions found by searching for ASCII braces are always char
+    /// boundaries, so multibyte text either side of, or inside, a brace
+    /// pair must neither panic nor be mangled.
+    #[test]
+    fn multibyte_text_around_braces_is_sliced_safely() {
+        let tokens = [("A", "ö")];
+        assert_eq!(render("é{{A}}ü", &tokens), "éöü");
+        assert_eq!(render("{{é}}{{A}}", &tokens), "{{é}}ö");
+        assert_eq!(render("{{🦀", &tokens), "{{🦀");
+        assert_eq!(render("{🦀{{A}}🦀}", &tokens), "{🦀ö🦀}");
+    }
+
+    /// The old renderer, verbatim: a chain of `str::replace`. Kept only to
+    /// pin the new one to its output wherever no value spells a token.
+    fn chained_replace(name: &str, branding: &Branding, page: &[(&str, &str)]) -> String {
+        let mut html = template(name)
+            .replace("{{BRAND_HEADING}}", &render_brand_heading(branding))
+            .replace("{{BRAND_NAME}}", &escape(&branding.name))
+            .replace("{{BRAND_CSS}}", render_brand_css(branding.css.is_some()))
+            .replace("{{THEME_ATTR}}", render_theme_attr(branding.theme))
+            .replace("{{THEME_TOGGLE}}", render_theme_toggle(branding.theme));
+        for (token, value) in page {
+            html = html.replace(&format!("{{{{{token}}}}}"), value);
+        }
+        html
+    }
+
+    /// For every ordinary input the page must be byte-for-byte what the
+    /// chain of `replace` calls produced, so the inlined script and
+    /// stylesheet (whose bytes a CSP hash may pin) pass through untouched.
+    #[test]
+    fn ordinary_values_render_exactly_as_the_chained_replace_did() {
+        let brandings = [
+            plain("Anthias"),
+            plain("Café <&> \"Ünïcødé\" 🦀 {single} }} {"),
+            branded("B"),
+            with_logo("Logo & Co"),
+            pinned("B", ThemeMode::Dark),
+            pinned("B", ThemeMode::Light),
+        ];
+        let networks = [
+            net("Home", 80, Security::WpaPsk),
+            net("Café 🦀 <b>", 10, Security::Open),
+            net("{x} }}{", 55, Security::Sae),
+        ];
+        let failed = PortalState::Failed {
+            ssid: "Office".into(),
+            error: "wrong \"password\" é".into(),
+        };
+        for branding in &brandings {
+            for nets in [&networks[..], &[]] {
+                for state in [&PortalState::Portal, &failed] {
+                    let list = render_networks(nets);
+                    let banner = render_banner(state);
+                    assert_eq!(
+                        render_index(branding, nets, state),
+                        chained_replace(
+                            "index.html",
+                            branding,
+                            &[("NETWORKS", &list), ("BANNER", &banner)]
+                        ),
+                    );
+                }
+                let list = render_networks(nets);
+                let banner = r#"<div class="banner" role="alert">bad &amp; é</div>"#;
+                assert_eq!(
+                    render_index_with_error(branding, nets, "bad & é"),
+                    chained_replace(
+                        "index.html",
+                        branding,
+                        &[("NETWORKS", &list), ("BANNER", banner)]
+                    ),
+                );
+            }
+            for ssid in ["Home", "Café 🦀 <b>", "{x} }}{"] {
+                assert_eq!(
+                    render_connecting(branding, ssid),
+                    chained_replace("connecting.html", branding, &[("SSID", &escape(ssid))]),
+                );
+            }
+        }
+    }
 }
