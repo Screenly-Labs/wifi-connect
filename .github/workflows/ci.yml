@@ -180,6 +180,12 @@ jobs:
           merge-multiple: true
       - run: chmod +x dist/wifi-connect-*
 
+      # The configure hook and the launcher are POSIX sh run by snapd on
+      # the device, where a syntax slip means `snap set` fails for every
+      # key or the daemon never starts.
+      - name: shellcheck the snap's hook and launcher
+        run: shellcheck snap/hooks/configure snap/local/launch
+
       - uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
         id: snapcraft
         with:
