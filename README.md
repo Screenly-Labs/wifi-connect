@@ -381,6 +381,54 @@ Container tags are `2026.10.0` (exact), `2026.10` (latest patch that month)
 and `latest`. There is deliberately no bare `2026` tag: under CalVer its
 meaning would drift for a whole year while reading like a semver promise.
 
+## Verifying releases
+
+Every release is signed keylessly with [Sigstore cosign](https://docs.sigstore.dev/)
+by the release workflow itself: there is no long-lived key to leak, and
+the signing certificate names the exact workflow file and tag that
+produced the artifact. Signatures are recorded in the public Rekor
+transparency log.
+
+The container image (the multi-arch index and each platform manifest
+under it):
+
+```bash
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/Screenly-Labs/wifi-connect/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/screenly-labs/wifi-connect:2026.10.0
+```
+
+Every file on a GitHub Release (binaries, tarballs, snaps and
+`SHA256SUMS`) has a `<file>.sigstore.json` bundle next to it:
+
+```bash
+cosign verify-blob \
+  --bundle wifi-connect-2026.10.0-aarch64-unknown-linux-musl.tar.gz.sigstore.json \
+  --certificate-identity-regexp '^https://github\.com/Screenly-Labs/wifi-connect/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  wifi-connect-2026.10.0-aarch64-unknown-linux-musl.tar.gz
+```
+
+Verifying `SHA256SUMS` this way and then running `sha256sum -c SHA256SUMS
+--ignore-missing` covers whatever else you downloaded. (`SHA256SUMS`
+lists the release files, not the bundles.) Use cosign v3 or later: the
+signatures use the standard Sigstore bundle format, and the image
+signatures are stored as OCI referrers, which is what v3 looks for by
+default.
+
+The image and the tarballs also carry GitHub build-provenance
+attestations, which record the commit and workflow run they were built
+from:
+
+```bash
+gh attestation verify oci://ghcr.io/screenly-labs/wifi-connect:2026.10.0 -R Screenly-Labs/wifi-connect
+gh attestation verify wifi-connect-2026.10.0-aarch64-unknown-linux-musl.tar.gz -R Screenly-Labs/wifi-connect
+```
+
+Snaps installed from the Snap Store are additionally verified by `snapd`
+against the store's own signature.
+
 ## Development
 
 ```bash

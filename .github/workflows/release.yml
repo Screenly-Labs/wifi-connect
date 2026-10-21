@@ -123,7 +123,7 @@ jobs:
     permissions:
       contents: read
       packages: write # push to GHCR (and the attestation, below)
-      id-token: write # OIDC, to sign the attestation
+      id-token: write # OIDC, to sign the attestation and the cosign signature
       attestations: write
       # With push-to-registry, the attest action also records where the
       # image is stored (the org's "Linked artifacts" page). Without this
@@ -188,6 +188,53 @@ jobs:
           subject-name: ghcr.io/screenly-labs/wifi-connect
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+      # Keyless cosign signature, alongside (not instead of) the GitHub
+      # attestation above: it is what `cosign verify`, admission
+      # controllers and most of the ecosystem look for.
+      #
+      # Signed BY DIGEST, never by tag. A tag is a mutable pointer that
+      # could be moved between push and sign; the digest is what
+      # build-push-action actually pushed.
+      #
+      # --recursive signs the multi-arch index AND each manifest under it.
+      # Docker resolves the index to a per-platform manifest on pull, and
+      # anyone who pins `wifi-connect@sha256:<platform digest>` (what
+      # `docker inspect` shows on a device) would otherwise have nothing
+      # to verify against. It also signs buildx's provenance/SBOM
+      # manifests in the index, which is harmless.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.4"
+      - name: sign the image
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes --recursive "ghcr.io/screenly-labs/wifi-connect@${DIGEST}"
+
+      # Verify as a user would, so a signature that does not verify fails
+      # the release instead of shipping. The identity is exact: this
+      # workflow file, at this tag.
+      - name: verify the image signatures
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          image="ghcr.io/screenly-labs/wifi-connect"
+          verify() {
+            cosign verify \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$1" > /dev/null
+            echo "verified $1"
+          }
+          verify "${image}@${DIGEST}"
+          # And every platform manifest, i.e. what --recursive is for.
+          # (`unknown/unknown` entries are buildx attestation manifests.)
+          platforms="$(docker buildx imagetools inspect --raw "${image}@${DIGEST}" \
+            | jq -r '.manifests[] | select(.platform.os != "unknown") | .digest')"
+          [ -n "${platforms}" ] || { echo "::error::no platform manifests in ${DIGEST}"; exit 1; }
+          for d in ${platforms}; do
+            verify "${image}@${d}"
+          done
 
       # A GHCR package is PRIVATE when it is first created, and nothing
       # in a workflow can change that -- visibility is an org setting
@@ -312,7 +359,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write # create the release, generate its notes
-      id-token: write # OIDC, to sign the tarball attestation
+      id-token: write # OIDC, to sign the tarball attestation and cosign bundles
       attestations: write
     steps:
       # Only what this workflow means to ship. An unfiltered download also
@@ -331,6 +378,53 @@ jobs:
           merge-multiple: true
       - name: checksums
         run: cd dist && sha256sum * > SHA256SUMS
+
+      # Keyless cosign signature for every file the release ships: raw
+      # binaries, tarballs, snaps and SHA256SUMS. Each `<file>` gets a
+      # `<file>.sigstore.json` bundle (certificate, signature and Rekor
+      # inclusion proof in one), uploaded next to it by `dist/*` below.
+      #
+      # Runs after SHA256SUMS on purpose: the checksums cover what ships,
+      # not the bundles, which verify themselves. Signing is done here and
+      # not in `build`, which runs third-party code and must never hold
+      # an OIDC token that can sign as this workflow.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.4"
+      - name: sign release files
+        run: |
+          shopt -s nullglob
+          files=()
+          for f in dist/*; do
+            case "$f" in *.sigstore.json) continue ;; esac
+            files+=("$f")
+          done
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::nothing to sign in dist/"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f" > /dev/null
+            echo "signed $f"
+          done
+
+      # Every bundle, not a sample: it is a few seconds, and any one
+      # broken signature is a release asset nobody can verify.
+      - name: verify release signatures
+        run: |
+          shopt -s nullglob
+          n=0
+          for f in dist/*; do
+            case "$f" in *.sigstore.json) continue ;; esac
+            b="${f}.sigstore.json"
+            cosign verify-blob \
+              --bundle "$b" \
+              --certificate-identity "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$f"
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::nothing verified"; exit 1; }
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
