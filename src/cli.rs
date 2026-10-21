@@ -52,9 +52,27 @@ pub enum LogFormat {
     long_about = None,
 )]
 pub struct Cli {
-    /// SSID of the setup access point.
+    /// SSID of the setup access point, before the uniqueness suffix.
+    ///
+    /// See `--portal-ssid-suffix`: by default a few random characters are
+    /// appended to this, so what a phone shows is `WiFi Connect-K3QM`.
     #[arg(short = 's', long, env = "PORTAL_SSID", default_value = "WiFi Connect")]
     pub portal_ssid: String,
+
+    /// Random characters appended to `--portal-ssid`, or 0 to use it as-is.
+    ///
+    /// Defaults to on because the collision it prevents is silent and
+    /// expensive: unbox five screens in one room and they all broadcast
+    /// the same name. A phone shows one entry, joins whichever is
+    /// loudest, and the installer sets up a device at random while
+    /// reading the screen of another — and since each portal generates
+    /// its own passphrase, four of the five will not accept the
+    /// credentials displayed in front of them.
+    ///
+    /// Set 0 if the name is printed on a sticker or in a manual, and
+    /// accept that two devices in earshot are indistinguishable.
+    #[arg(long, env = "PORTAL_SSID_SUFFIX", default_value_t = 4)]
+    pub portal_ssid_suffix: usize,
 
     /// WPA passphrase for the setup access point.
     ///
@@ -389,8 +407,16 @@ impl Cli {
     /// Validate everything that can be checked without touching the radio.
     pub fn validate(&self) -> Result<DhcpRange, ConfigError> {
         // Bytes, not characters: 802.11 caps the SSID element at 32 octets.
-        let ssid_len = self.portal_ssid.len();
-        if ssid_len == 0 || ssid_len > 32 {
+        // Measured WITH the suffix, which is what actually goes on the air:
+        // a 30-byte prefix is fine alone and five bytes too long once four
+        // random characters and a separator are appended, and finding that
+        // out from the radio instead of from this check means a device that
+        // looks configured and raises nothing.
+        if self.portal_ssid.is_empty() {
+            return Err(ConfigError::SsidLength(0));
+        }
+        let ssid_len = crate::ssid::suffixed_len(&self.portal_ssid, self.portal_ssid_suffix);
+        if ssid_len > crate::ssid::MAX_BYTES {
             return Err(ConfigError::SsidLength(ssid_len));
         }
         if let Some(p) = &self.portal_passphrase {
@@ -720,11 +746,33 @@ mod tests {
         assert_eq!(c.validate().unwrap_err(), ConfigError::SsidLength(0));
 
         // 32 bytes is the limit; these emoji are 4 bytes each.
+        c.portal_ssid_suffix = 0;
         c.portal_ssid = "\u{1F600}".repeat(8);
         assert!(c.validate().is_ok(), "32 bytes should be accepted");
 
         c.portal_ssid = "\u{1F600}".repeat(9);
         assert_eq!(c.validate().unwrap_err(), ConfigError::SsidLength(36));
+    }
+
+    /// The limit is on what goes on the air, not on what was configured.
+    ///
+    /// A prefix that fits alone and not once the suffix is appended has to
+    /// fail here, at startup, with the real number in the message. Finding
+    /// it out from the radio instead means a device that looks configured
+    /// and raises no access point.
+    #[test]
+    fn the_ssid_limit_counts_the_suffix() {
+        let mut c = cli(&[]);
+        c.portal_ssid = "a".repeat(32);
+        c.portal_ssid_suffix = 0;
+        assert!(c.validate().is_ok(), "32 bytes alone is the limit");
+
+        c.portal_ssid_suffix = 4;
+        // 32 + separator + 4.
+        assert_eq!(c.validate().unwrap_err(), ConfigError::SsidLength(37));
+
+        c.portal_ssid = "a".repeat(27);
+        assert!(c.validate().is_ok(), "27 + 1 + 4 is exactly 32");
     }
 
     #[test]

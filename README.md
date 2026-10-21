@@ -134,6 +134,7 @@ Every flag has an environment variable. Flags win.
 | Flag | Short | Environment | Default |
 |---|---|---|---|
 | `--portal-ssid` | `-s` | `PORTAL_SSID` | `WiFi Connect` |
+| `--portal-ssid-suffix` | | `PORTAL_SSID_SUFFIX` | `4` |
 | `--portal-passphrase` | `-p` | `PORTAL_PASSPHRASE` | *generated per run* |
 | `--portal-security` | | `WIFI_CONNECT_PORTAL_SECURITY` | `auto` |
 | `--portal-gateway` | `-g` | `PORTAL_GATEWAY` | `192.168.42.1` |
@@ -333,6 +334,40 @@ wifi-connect --ui-directory /etc/wifi-connect/ui
   `{{TOKEN}}` inside a block changes its bytes per request; the browser
   blocks both, so both are logged as a warning at startup. Inline event
   handlers (`onclick="…"`) and `style="…"` attributes are blocked too.
+
+## The setup network's name
+
+`--portal-ssid` is a *prefix*. Four random characters are appended to it, so
+what a phone sees is `WiFi Connect-K3QM`.
+
+That is not decoration. Unbox five screens in one room with a fixed name and
+they all broadcast it: the phone shows one entry, joins whichever is
+loudest, and the installer configures a device at random while reading the
+screen of another — and because every portal generates its own passphrase,
+four of the five will not accept the credentials displayed in front of
+them.
+
+```bash
+wifi-connect --portal-ssid 'Anthias Setup'       # Anthias Setup-7FQR
+wifi-connect --portal-ssid 'Anthias Setup' --portal-ssid-suffix 0   # as-is
+```
+
+Set `0` if the name is printed on a sticker or in a manual, and accept that
+two devices in earshot are indistinguishable.
+
+The suffix is random per run rather than derived from the MAC: the
+passphrase and the QR already change on every run, so a stable name would
+be the only thing implying a continuity it does not have.
+
+Characters come from the upper-case half of the passphrase alphabet, which
+excludes everything needing escaping inside a `WIFI:` QR payload and every
+glyph that is easy to misread — this one is *compared*, against a list on a
+phone, so `K3QM` must not be a guess between `0` and `O`.
+
+**The 32-octet limit counts the suffix.** A 30-byte prefix is legal alone
+and five bytes too long once the separator and four characters are
+appended; that is rejected at startup, with the real length in the message,
+rather than discovered at the radio.
 
 ## Exit codes
 
