@@ -210,6 +210,12 @@ async fn serve_on(listener: TcpListener, app: Router, limits: Limits, cancel: Ca
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
+                // A client that gave up while queued: its problem, not
+                // ours, and no reason to pause accepting everyone else.
+                Err(e) if is_connection_error(&e) => {
+                    debug!(error = %e, "portal accept: client went away");
+                    continue;
+                }
                 Err(e) => {
                     // EMFILE and friends: the next accept fails the same
                     // way at once, so back off rather than spin the one
@@ -265,6 +271,16 @@ async fn serve_on(listener: TcpListener, app: Router, limits: Limits, cancel: Ca
     // Stop accepting before waiting, so nothing new starts during drain.
     drop(listener);
     let _ = slots.acquire_many(limits.max_connections as u32).await;
+}
+
+/// Errors `accept()` reports about one queued connection rather than about
+/// the listener. The same set `axum::serve` skips without backing off.
+fn is_connection_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{ConnectionAborted, ConnectionRefused, ConnectionReset};
+    matches!(
+        e.kind(),
+        ConnectionAborted | ConnectionRefused | ConnectionReset
+    )
 }
 
 #[cfg(test)]
@@ -575,9 +591,17 @@ mod tests {
     }
 
     /// The timeout is a deadline for the whole head, not an idle timer: a
-    /// client sending one header line every 50 ms must not keep it alive.
+    /// client sending one byte every 50 ms must not keep it alive.
+    ///
+    /// The bytes go into one header value rather than a header line each:
+    /// hyper refuses a head with more than 100 headers, which would close a
+    /// line-per-tick connection after ~5 s with no timeout at all, right at
+    /// `PATIENCE`. A byte per tick never reaches hyper's buffer limit, so
+    /// with an idle timer instead of a deadline the connection outlives
+    /// `PATIENCE` and the test fails. No tight bound on elapsed time is
+    /// needed, which keeps this stable under qemu on CI.
     #[tokio::test]
-    async fn trickling_header_lines_does_not_extend_the_header_deadline() {
+    async fn trickling_a_header_does_not_extend_the_header_deadline() {
         let server = start(Limits {
             header_read_timeout: Duration::from_millis(300),
             max_connection_age: NEVER,
@@ -588,16 +612,15 @@ mod tests {
         let client = TcpStream::connect(server.addr).await.unwrap();
         let (mut rx, mut tx) = client.into_split();
         let trickle = tokio::spawn(async move {
-            tx.write_all(b"GET / HTTP/1.1\r\n").await?;
+            tx.write_all(b"GET / HTTP/1.1\r\nX-Slow: ").await?;
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                tx.write_all(b"X-Slow: 1\r\n").await?;
+                tx.write_all(b"a").await?;
             }
             #[allow(unreachable_code)]
             Ok::<(), std::io::Error>(())
         });
 
-        let started = Instant::now();
         let mut out = Vec::new();
         tokio::time::timeout(PATIENCE, rx.read_to_end(&mut out))
             .await
@@ -605,7 +628,101 @@ mod tests {
             .ok();
         trickle.abort();
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            out.is_empty(),
+            "a timed-out head got a response: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// A captive mini-browser keeps connections alive after each response
+    /// and may never reuse them. Each holds a slot, so an idle kept-alive
+    /// connection must be closed by the header timeout too, or one phone's
+    /// ordinary browsing and OS probes could fill the cap.
+    #[tokio::test]
+    async fn an_idle_kept_alive_connection_is_closed_after_the_header_timeout() {
+        let server = start(Limits {
+            header_read_timeout: Duration::from_millis(200),
+            max_connection_age: NEVER,
+            ..Limits::PORTAL
+        })
+        .await;
+
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        client
+            .write_all(b"GET /api/status HTTP/1.1\r\nHost: 192.168.42.1\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_until_closed(&mut client).await;
+
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(
+            !text.to_ascii_lowercase().contains("connection: close"),
+            "the server opted out of keep-alive, so this tests nothing: {text}"
+        );
+    }
+
+    /// The flow the module docs are about, through the real accept loop:
+    /// shutdown starts the moment the join request reaches the state
+    /// machine, as the access point coming down would. The 202 page must
+    /// still arrive whole.
+    #[tokio::test]
+    async fn the_connect_answer_arrives_whole_even_if_shutdown_starts_at_once() {
+        let (shared, mut joins) =
+            Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(serve_on(
+            listener,
+            router(shared),
+            Limits::PORTAL,
+            cancel.clone(),
+        ));
+        let state_machine = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let request = joins.recv().await;
+                cancel.cancel();
+                request
+            })
+        };
+
+        let body = "ssid=Home&passphrase=correct-horse";
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "POST /connect HTTP/1.1\r\nHost: 192.168.42.1\r\n\
+                     Content-Type: application/x-www-form-urlencoded\r\n\
+                     Content-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_until_closed(&mut client).await;
+
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.starts_with("HTTP/1.1 202"), "{text}");
+        let (head, page) = text.split_once("\r\n\r\n").expect("no end of head");
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse().unwrap())
+            })
+            .expect("no content-length");
+        assert_eq!(page.len(), length, "the page was cut short");
+
+        assert!(state_machine.await.unwrap().is_some());
+        tokio::time::timeout(PATIENCE, server)
+            .await
+            .expect("shutdown hung")
+            .unwrap();
     }
 
     /// The header timeout cannot see a client that sends a complete head
