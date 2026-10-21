@@ -355,6 +355,13 @@ mod tests {
             q.len()
         );
         assert_eq!(out.len(), 12, "FORMERR should be the bare header");
+        // On the wire: ID echoed; QR=1, opcode 0, AA=1, RD echoed, RA=0,
+        // RCODE=1; and every section count zero, QDCOUNT included.
+        assert_eq!(
+            out,
+            [0xab, 0xcd, 0x85, 0x01, 0, 0, 0, 0, 0, 0, 0, 0],
+            "unexpected FORMERR header"
+        );
 
         let reply = parse(&out);
         assert_eq!(reply.id(), 0xabcd);
@@ -447,14 +454,81 @@ mod tests {
     /// since we never set TC.
     #[test]
     fn the_largest_single_question_reply_fits_in_512_bytes() {
-        // Four 62-byte labels: 4 * (1 + 62) + 1 = 253 bytes on the wire, near
-        // the 255-byte ceiling (a fifth label would exceed it).
-        let label = "a".repeat(62);
-        let name = [label.as_str(); 4].join(".");
+        // Labels of 63, 63, 63 and 61 bytes: 4 + 250 + 1 = 255 bytes on the
+        // wire, the RFC 1035 maximum.
+        let long = "a".repeat(63);
+        let name = format!("{long}.{long}.{long}.{}", "a".repeat(61));
         for qtype in [QTYPE::TYPE(TYPE::A), QTYPE::ANY] {
             let out = respond(&query(&name, qtype), GW).expect("must be answered");
             assert!(out.len() <= MAX_REPLY, "{} bytes", out.len());
             assert_eq!(parse(&out).answers.len(), 1);
+        }
+    }
+
+    /// A panic here takes the whole portal down (release builds abort on
+    /// panic). Throw random datagrams and randomly corrupted real queries at
+    /// `respond`: it must never panic, and whatever it does send must fit the
+    /// 512-byte limit and be no larger than an A answer to one question.
+    #[test]
+    fn random_and_corrupted_datagrams_never_panic_or_amplify() {
+        // xorshift64: deterministic, no extra dev-dependency.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut opt_query = Packet::new_query(7);
+        opt_query.questions.push(Question::new(
+            Name::new("connectivitycheck.gstatic.com").unwrap(),
+            QTYPE::TYPE(TYPE::HTTPS),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        *opt_query.opt_mut() = Some(simple_dns::rdata::OPT {
+            opt_codes: Vec::new(),
+            udp_packet_size: 1232,
+            version: 0,
+        });
+        let seeds = [
+            query("captive.apple.com", QTYPE::TYPE(TYPE::A)),
+            query_with_rd("www.msftconnecttest.com", QTYPE::TYPE(TYPE::AAAA), true),
+            opt_query.build_bytes_vec().unwrap(),
+        ];
+
+        for i in 0..200_000u32 {
+            let datagram: Vec<u8> = if i % 2 == 0 {
+                let len = (next() % 513) as usize;
+                (0..len).map(|_| next() as u8).collect()
+            } else {
+                let mut d = seeds[(i as usize / 2) % seeds.len()].clone();
+                for _ in 0..=(next() % 4) {
+                    let at = (next() as usize) % d.len();
+                    d[at] = next() as u8;
+                }
+                if next() % 4 == 0 {
+                    d.truncate((next() as usize) % (d.len() + 1));
+                }
+                d
+            };
+
+            if let Some(out) = respond(&datagram, GW) {
+                assert!(out.len() <= MAX_REPLY, "{} byte reply", out.len());
+                // One echoed question plus one compressed A record (2-byte
+                // pointer + 14) is the most we add on top of the query.
+                assert!(
+                    out.len() <= datagram.len() + 16,
+                    "reply {} for a {}-byte query",
+                    out.len(),
+                    datagram.len()
+                );
+                let reply = Packet::parse(&out).expect("our replies must parse");
+                assert!(reply.has_flags(PacketFlag::RESPONSE));
+                assert!(reply.questions.len() <= 1);
+                assert!(reply.answers.len() <= 1);
+            }
         }
     }
 }
