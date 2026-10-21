@@ -1,0 +1,41 @@
+# Dependabot version updates. Each ecosystem gets one grouped PR a week so
+# routine bumps land as a single reviewable change rather than a stream of
+# one-line PRs.
+#
+# No "docker" entry: the only versioned base image is rust:<x>-alpine in
+# Dockerfile.selfcontained, and it has to move in lockstep with the channel
+# pinned in rust-toolchain.toml. A toolchain bump is a deliberate change to
+# both files, not something to ride in on an automated PR that touches one.
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  # The portal UI. "bun", not "npm": the lockfile is ui/bun.lock, which the
+  # npm ecosystem does not read.
+  - package-ecosystem: "bun"
+    directory: "/ui"
+    schedule:
+      interval: "weekly"
+    groups:
+      bun:
+        patterns:
+          - "*"
+
+  # Actions are pinned by SHA with the tag in a trailing comment; Dependabot
+  # updates both.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
