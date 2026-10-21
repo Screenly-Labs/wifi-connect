@@ -88,7 +88,15 @@ sudo systemctl enable --now wifi-connect
    has saved WiFi profiles, wait up to 60s for one to come up first —
    associating plus DHCP plus a probe genuinely takes 15-30s from cold. If
    it has none, show the portal immediately rather than making a first-boot
-   user stare at nothing for a minute.
+   user stare at nothing for a minute. "Online" is NetworkManager's
+   connectivity check saying so — or, where that check is disabled (the
+   default on Debian, Raspberry Pi OS and Ubuntu Server, which ship no check
+   URI), NetworkManager reporting a connection with a default route, or the
+   WiFi device already being connected as a station. The access point is
+   never raised over a working WiFi connection on that basis; use `--force`
+   to override. A probe that positively reports no or limited connectivity
+   still brings the portal up, so a device stuck on a dead network can be
+   moved to another.
 3. **Scan, then raise the access point.** In that order: a radio in AP mode
    cannot scan.
 4. **Serve the portal.** DHCP hands out leases and advertises the portal via

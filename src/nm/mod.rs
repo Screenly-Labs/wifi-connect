@@ -161,7 +161,55 @@ pub enum Connectivity {
     /// Associated but behind someone else's captive portal, or no route out.
     Limited,
     None,
+    /// NetworkManager did not probe. Usually because connectivity checking
+    /// is disabled — the default on Debian, Raspberry Pi OS and Ubuntu
+    /// Server/Core, which ship no check URI. This is "we cannot tell", not
+    /// "offline", and is resolved against [`LinkState`] before anything
+    /// acts on it.
     Unknown,
+}
+
+/// `NM_STATE_CONNECTED_SITE`: a device is activated and has a default
+/// route, but NetworkManager does not believe it reaches the internet. The
+/// only state above it is 70, `NM_STATE_CONNECTED_GLOBAL`: a default route
+/// and full — or, with checking disabled, unprobed — connectivity.
+pub const NM_STATE_CONNECTED_SITE: u32 = 60;
+
+/// What NetworkManager knows about the links themselves, without probing.
+///
+/// The fallback for a [`Connectivity::Unknown`] verdict. Without it, a
+/// device on a distribution that disables connectivity checking reads as
+/// permanently offline: one online over ethernet raises the portal anyway,
+/// and one already connected over WiFi waits out the autoconnect budget
+/// and then raises the access point *on the same radio*, dropping the
+/// working connection it had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkState {
+    /// NetworkManager's global `State` (`NM_STATE_*`). Zero when it could
+    /// not be read.
+    pub nm_state: u32,
+    /// The WiFi device we would drive is ACTIVATED as a station
+    /// (infrastructure mode, not an access point).
+    pub station_activated: bool,
+}
+
+impl LinkState {
+    /// Whether, absent a probe, we should treat the device as online.
+    ///
+    /// `CONNECTED_SITE` counts as well as `CONNECTED_GLOBAL`. It means a
+    /// device is activated with a default route — the device is attached to
+    /// an upstream network — and NetworkManager merely cannot vouch for what
+    /// is beyond it. Of the two ways to be wrong, staying quiet on a device
+    /// that needed the portal costs an operator one `--force`; raising an
+    /// access point over a working link takes the device off its network
+    /// and, with no activity timeout, keeps it off.
+    ///
+    /// Independently of the global state, a radio that is already a
+    /// connected station is never taken over: the access point would have
+    /// to replace that very connection.
+    pub fn looks_online(&self) -> bool {
+        self.station_activated || self.nm_state >= NM_STATE_CONNECTED_SITE
+    }
 }
 
 /// How the access point should be raised.
@@ -221,6 +269,25 @@ pub trait NetworkControl: Send + Sync + 'static {
     /// Ask NetworkManager to re-check, rather than reading its cached
     /// property, which can be arbitrarily stale.
     async fn check_connectivity(&self) -> Result<Connectivity, NetworkError>;
+
+    /// NetworkManager's view of the links, read without probing. Only
+    /// consulted when the probe has no verdict; see [`LinkState`].
+    async fn link_state(&self, device: &DeviceInfo) -> Result<LinkState, NetworkError>;
+
+    /// The single "are we online?" decision, shared by the startup gate and
+    /// the autoconnect wait so the two cannot disagree.
+    ///
+    /// A definite verdict from the probe stands: `Limited` and `None` mean
+    /// the user may need the portal to pick a different network, even if
+    /// the radio is associated. Only `Unknown` — no probe ran — falls back
+    /// to the link state.
+    async fn is_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
+        match self.check_connectivity().await? {
+            Connectivity::Full => Ok(true),
+            Connectivity::Unknown => Ok(self.link_state(device).await?.looks_online()),
+            Connectivity::Limited | Connectivity::None => Ok(false),
+        }
+    }
 
     /// How many WiFi profiles are already saved.
     ///
@@ -292,6 +359,32 @@ mod tests {
         // Other capability bits must not be mistaken for AP support.
         d.capabilities = !WIFI_DEVICE_CAP_AP;
         assert!(!d.supports_ap_mode());
+    }
+
+    #[test]
+    fn an_unprobed_link_counts_as_online_from_site_upwards() {
+        let at = |nm_state| LinkState {
+            nm_state,
+            station_activated: false,
+        };
+        // Unread, ASLEEP, DISCONNECTED, DISCONNECTING, CONNECTING, LOCAL:
+        // nothing has a default route, so the portal is needed.
+        for s in [0, 10, 20, 30, 40, 50] {
+            assert!(!at(s).looks_online(), "NM_STATE {s} read as online");
+        }
+        assert!(at(NM_STATE_CONNECTED_SITE).looks_online());
+        assert!(at(70).looks_online());
+    }
+
+    #[test]
+    fn an_activated_station_counts_as_online_whatever_the_global_state() {
+        // Even if the global state could not be read, the radio is in use
+        // as a station, and raising the AP would have to replace it.
+        let link = LinkState {
+            nm_state: 0,
+            station_activated: true,
+        };
+        assert!(link.looks_online());
     }
 
     #[test]

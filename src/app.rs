@@ -36,8 +36,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::nm::{
-    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinOutcome, JoinRequest, NetworkControl,
-    NetworkError,
+    ApConfig, ApHandle, DeviceInfo, JoinOutcome, JoinRequest, NetworkControl, NetworkError,
 };
 
 use crate::state::{PortalState, Shared};
@@ -124,7 +123,11 @@ pub async fn preflight<N: NetworkControl>(
         return Ok(Some(device));
     }
 
-    if nm.check_connectivity().await? == Connectivity::Full {
+    // Not merely "connectivity is Full": where NetworkManager's checking is
+    // disabled (the Debian-family default) the verdict is always Unknown,
+    // and treating that as offline raised the portal on devices online over
+    // ethernet — or over WiFi, on the very radio the AP would replace.
+    if nm.is_online(&device).await? {
         info!("already online; the portal is not needed");
         return Ok(None);
     }
@@ -322,9 +325,15 @@ mod tests {
     use super::*;
     use crate::nm::fake::{Call, FakeNm};
     use crate::nm::security::Security;
-    use crate::nm::{ApSecurity, JoinFailure, WifiNetwork};
+    use crate::nm::{
+        ApSecurity, Connectivity, JoinFailure, LinkState, NM_STATE_CONNECTED_SITE, WifiNetwork,
+    };
     use crate::secret::Secret;
     use crate::ssid::Ssid;
+
+    /// `NM_STATE_CONNECTED_GLOBAL`. The program only ever compares against
+    /// the SITE threshold, so this lives with the tests.
+    const NM_STATE_CONNECTED_GLOBAL: u32 = 70;
 
     fn config() -> RunConfig {
         RunConfig {
@@ -367,6 +376,93 @@ mod tests {
             !nm.calls().iter().any(|c| matches!(c, Call::RaiseAp { .. })),
             "an online device must not broadcast a setup network"
         );
+    }
+
+    /// With connectivity checking disabled (Debian, Raspberry Pi OS, Ubuntu
+    /// Server) NM never says Full. A radio already connected as a station
+    /// must not be turned into an access point on that basis: doing so
+    /// drops the working connection, and with no activity timeout the
+    /// device never gets it back.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_over_a_connected_station_does_not_raise_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(1)
+            .with_link_state(LinkState {
+                nm_state: NM_STATE_CONNECTED_GLOBAL,
+                station_activated: true,
+            });
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+        assert!(
+            !nm.calls().contains(&Call::AwaitAutoconnect),
+            "already connected; there is nothing to wait for"
+        );
+    }
+
+    /// The station alone is enough: a global state that could not be read
+    /// must not override a radio that is visibly in use.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_defers_to_the_station_even_without_a_global_state() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_link_state(LinkState {
+                nm_state: 0,
+                station_activated: true,
+            });
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+    }
+
+    /// Online over ethernet, with no WiFi profiles and checking disabled:
+    /// NM's global state is the only signal, and it says connected.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_on_a_connected_wired_link_does_not_raise_the_portal() {
+        for nm_state in [NM_STATE_CONNECTED_SITE, NM_STATE_CONNECTED_GLOBAL] {
+            let nm = FakeNm::new()
+                .with_connectivity(Connectivity::Unknown)
+                .with_saved_profiles(0)
+                .with_link_state(LinkState {
+                    nm_state,
+                    station_activated: false,
+                });
+            assert!(
+                preflight(&nm, &config()).await.unwrap().is_none(),
+                "NM_STATE {nm_state} with an unprobed link raised the portal"
+            );
+        }
+    }
+
+    /// The fallback must not swallow the case the portal exists for.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_with_nothing_connected_raises_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(0)
+            .with_link_state(LinkState {
+                nm_state: 20, // NM_STATE_DISCONNECTED
+                station_activated: false,
+            });
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_some());
+        assert!(nm.calls().contains(&Call::LinkState));
+    }
+
+    /// A definite verdict from a probe stands. An associated station that
+    /// NM *knows* cannot reach the internet is exactly when the user may
+    /// need the portal to pick another network, so the link state is not
+    /// even consulted.
+    #[tokio::test(start_paused = true)]
+    async fn a_definite_offline_verdict_is_not_overridden_by_the_link_state() {
+        for verdict in [Connectivity::None, Connectivity::Limited] {
+            let nm = FakeNm::new()
+                .with_connectivity(verdict)
+                .with_link_state(LinkState {
+                    nm_state: NM_STATE_CONNECTED_SITE,
+                    station_activated: true,
+                });
+            assert!(preflight(&nm, &config()).await.unwrap().is_some());
+            assert!(!nm.calls().contains(&Call::LinkState));
+        }
     }
 
     /// Associating, DHCP and a probe take 15-30s from cold. Without this

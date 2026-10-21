@@ -64,8 +64,29 @@ pub trait Device {
     fn state(&self) -> zbus::Result<u32>;
 }
 
+/// `org.freedesktop.NetworkManager` itself. nmrs's own proxy for it is
+/// private and does not expose `State` anyway.
+#[zbus::proxy(
+    interface = "org.freedesktop.NetworkManager",
+    default_service = "org.freedesktop.NetworkManager",
+    default_path = "/org/freedesktop/NetworkManager"
+)]
+pub trait Manager {
+    /// `NM_STATE_*`. Read when connectivity checking is disabled, which is
+    /// the default on Debian-family distributions: it still says whether a
+    /// device is activated with a default route.
+    #[zbus(property)]
+    fn state(&self) -> zbus::Result<u32>;
+}
+
+/// `NM_802_11_MODE_INFRA`: a station, as opposed to an access point.
+pub const WIFI_MODE_INFRA: u32 = 2;
+
 /// `NM_802_11_MODE_AP`.
 pub const WIFI_MODE_AP: u32 = 3;
+
+/// `NM_DEVICE_STATE_ACTIVATED`.
+pub const DEVICE_STATE_ACTIVATED: u32 = 100;
 
 /// `true` while a device is mid-transition: `NM_DEVICE_STATE` in the
 /// activating band (40 PREPARE … 90 SECONDARIES) or 110 DEACTIVATING.

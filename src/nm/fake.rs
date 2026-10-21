@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::{
-    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinOutcome, JoinRequest, NetworkControl,
-    NetworkError, WIFI_DEVICE_CAP_AP, WifiNetwork,
+    ApConfig, ApHandle, Connectivity, DeviceInfo, JoinOutcome, JoinRequest, LinkState,
+    NetworkControl, NetworkError, WIFI_DEVICE_CAP_AP, WifiNetwork,
 };
 use crate::ssid::Ssid;
 
@@ -23,6 +23,7 @@ use crate::ssid::Ssid;
 pub enum Call {
     FindDevice,
     CheckConnectivity,
+    LinkState,
     SavedProfileCount,
     AwaitAutoconnect,
     Scan,
@@ -47,6 +48,7 @@ pub struct FakeNm {
     state: Arc<Mutex<State>>,
     pub device: DeviceInfo,
     pub connectivity: Connectivity,
+    pub link: LinkState,
     pub saved_profiles: usize,
     pub autoconnect_succeeds: bool,
     pub networks: Vec<WifiNetwork>,
@@ -68,6 +70,11 @@ impl FakeNm {
                 managed: true,
             },
             connectivity: Connectivity::None,
+            // Nothing connected: NM_STATE_DISCONNECTED, radio idle.
+            link: LinkState {
+                nm_state: 20,
+                station_activated: false,
+            },
             saved_profiles: 0,
             autoconnect_succeeds: false,
             networks: Vec::new(),
@@ -83,6 +90,11 @@ impl FakeNm {
 
     pub fn with_connectivity(mut self, c: Connectivity) -> Self {
         self.connectivity = c;
+        self
+    }
+
+    pub fn with_link_state(mut self, link: LinkState) -> Self {
+        self.link = link;
         self
     }
 
@@ -139,6 +151,11 @@ impl NetworkControl for FakeNm {
     async fn check_connectivity(&self) -> Result<Connectivity, NetworkError> {
         self.record(Call::CheckConnectivity);
         Ok(self.connectivity)
+    }
+
+    async fn link_state(&self, _device: &DeviceInfo) -> Result<LinkState, NetworkError> {
+        self.record(Call::LinkState);
+        Ok(self.link)
     }
 
     async fn saved_wifi_profile_count(&self) -> Result<usize, NetworkError> {
