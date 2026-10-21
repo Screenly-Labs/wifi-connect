@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::cli::ThemeMode;
 use crate::nm::{JoinFailure, JoinRequest, WifiNetwork};
@@ -48,6 +48,9 @@ pub struct Shared {
     /// a second submission while one is in flight is rejected rather than
     /// queued, so a double-tapped button cannot queue two joins.
     join_tx: mpsc::Sender<JoinRequest>,
+    /// Latched to `true` the first time the access point is up, which is
+    /// the first moment the gateway address exists to be bound.
+    ap_raised: Arc<watch::Sender<bool>>,
     /// The URL a client should be redirected to.
     pub portal_url: String,
     /// Everything an integrator can change about how the portal looks.
@@ -71,6 +74,13 @@ pub struct Branding {
     /// message instead of silently serving an unbranded portal to every
     /// client. `Arc<str>` because `Shared` is cloned into every handler.
     pub css: Option<Arc<str>>,
+    /// The integrator's logo, served at `/brand-logo`.
+    ///
+    /// A route rather than a data: URI inlined into the page: it keeps the
+    /// HTML small whether or not a logo is set, and a logo that fails to
+    /// load degrades to its alt text, where a stylesheet that fails to
+    /// load would leave the page unstyled.
+    pub logo: Option<BrandLogo>,
     /// Which theme the page starts in.
     ///
     /// `System` follows the phone and leaves the in-page toggle on;
@@ -81,12 +91,24 @@ pub struct Branding {
     pub theme: ThemeMode,
 }
 
+/// An image and the content type to serve it as.
+///
+/// Read at startup like the stylesheet, so a mistyped path stops the
+/// portal with the path in the message instead of serving a broken image
+/// to every client.
+#[derive(Clone)]
+pub struct BrandLogo {
+    pub bytes: Arc<[u8]>,
+    pub content_type: &'static str,
+}
+
 impl Branding {
-    /// Defaults: no stylesheet, and follow the phone's own setting.
+    /// Defaults: no stylesheet, no logo, and follow the phone's setting.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             css: None,
+            logo: None,
             theme: ThemeMode::System,
         }
     }
@@ -103,6 +125,7 @@ impl Shared {
                     attempts: 0,
                 })),
                 join_tx,
+                ap_raised: Arc::new(watch::Sender::new(false)),
                 portal_url,
                 branding,
             },
@@ -148,6 +171,25 @@ impl Shared {
         };
     }
 
+    /// Record that the access point is up. Idempotent: only the first call
+    /// after startup changes anything.
+    pub fn mark_ap_raised(&self) {
+        self.ap_raised.send_replace(true);
+    }
+
+    /// Resolve once the access point has been up at least once.
+    ///
+    /// DNS and HTTP bind the gateway address, which does not exist until
+    /// NetworkManager has activated the AP. Before that comes the scan and
+    /// the activation itself, together easily longer than any fixed bind
+    /// retry budget on a slow radio, so the servers wait for this instead
+    /// of guessing.
+    pub async fn ap_raised(&self) {
+        let mut rx = self.ap_raised.subscribe();
+        // Only fails if the sender is dropped, and `self` holds it.
+        let _ = rx.wait_for(|up| *up).await;
+    }
+
     /// Is a join already running? Used to answer 409 rather than start a
     /// second one.
     pub fn is_joining(&self) -> bool {
@@ -187,6 +229,7 @@ mod tests {
             ssid: Ssid::from(ssid),
             identity: None,
             passphrase: Some(crate::secret::Secret::new("abcdefgh")),
+            server_domain: None,
             hidden: false,
         }
     }
@@ -197,6 +240,21 @@ mod tests {
         assert_eq!(s.state(), PortalState::Portal);
         assert_eq!(s.attempts(), 0);
         assert!(s.networks().is_empty());
+    }
+
+    /// The servers bind the gateway address only after this resolves, so
+    /// it must not resolve early — and once raised, a later wait (a server
+    /// task scheduled after the AP came up) must not block.
+    #[tokio::test(start_paused = true)]
+    async fn ap_raised_waits_for_the_first_raise_and_then_stays_raised() {
+        let (s, _rx) = shared();
+        let early = tokio::time::timeout(std::time::Duration::from_secs(60), s.ap_raised()).await;
+        assert!(early.is_err(), "resolved before the AP was raised");
+
+        s.mark_ap_raised();
+        s.ap_raised().await;
+        s.mark_ap_raised();
+        s.ap_raised().await;
     }
 
     #[tokio::test]
