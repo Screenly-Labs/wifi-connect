@@ -176,6 +176,11 @@ That split is the whole point: a rebrand that sticks to roles keeps working
 when the portal's layout changes. `ui/dist/brand.example.css` is a worked
 example.
 
+That one block covers light and dark both: the portal's dark arms weigh no
+more than the `:root` that sets the light defaults, so a stylesheet loaded
+after them wins in either scheme. Use a `prefers-color-scheme` arm only to
+set a *different* value in dark.
+
 The file is read once at startup, so a path that does not exist stops the
 portal with a clear message rather than quietly serving an unbranded page.
 When the flag is unset the pages link nothing at all and stay a single

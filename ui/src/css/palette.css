@@ -10,6 +10,13 @@
  * through --brand-css and never touches these, so a rebrand cannot
  * accidentally depend on our particular blue.
  *
+ * For that to hold, two things have to stay true, and neither did until
+ * they were tested: every rule that paints a role has to be reachable from
+ * a later stylesheet (so nothing unlayered may sit on top of the bundle --
+ * see flattenCssLayers in build.ts), and the dark arms have to weigh no
+ * more than the `:root` that sets the light defaults, or a brand is
+ * honoured in light and ignored in dark.
+ *
  * Every value is hex or sRGB rgb(). Nothing here is oklch(), which matters
  * more than it looks: Tailwind v4's own palette is authored in oklch, and
  * oklch needs Safari 15.4+. Clearing that palette (see tailwind.css) and

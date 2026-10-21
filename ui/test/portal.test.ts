@@ -32,7 +32,9 @@ const connectingEff = effective(connecting)
 
 /** The content of a `<meta name="...">` tag, or '' if absent. */
 function meta(html: string, name: string): string {
-  const m = html.match(new RegExp(`<meta[^>]+name=["']${name}["'][^>]+content=["']([^"']*)["']`, 'i'))
+  const m = html.match(
+    new RegExp(`<meta[^>]+name=["']${name}["'][^>]+content=["']([^"']*)["']`, 'i'),
+  )
   return m?.[1] ?? ''
 }
 
@@ -75,16 +77,47 @@ describe('captive-portal browser compatibility', () => {
     }
   })
 
-  test('an unlayered fallback precedes the @layer block', () => {
+  test('the fallback comes first and nothing after it is wrapped in @layer', () => {
     // A browser that does not understand @layer DROPS it wholesale rather
-    // than degrading, so a plain stylesheet has to come first.
-    const firstLayer = indexEff.indexOf('@layer')
+    // than degrading, so a plain stylesheet has to come first and the
+    // bundle after it must not be wrapped in one.
     const bodyRule = indexEff.indexOf('body{')
     const bodyRuleSpaced = indexEff.indexOf('body {')
     const firstBody = [bodyRule, bodyRuleSpaced].filter((i) => i >= 0).sort((a, b) => a - b)[0]
 
     expect(firstBody).toBeGreaterThan(-1)
-    expect(firstBody, 'the unlayered skeleton must precede @layer').toBeLessThan(firstLayer)
+    expect(firstBody, 'the fallback must come first').toBeLessThan(indexEff.indexOf('.wrap'))
+    expect(indexEff, 'the bundle must be flattened out of @layer').not.toMatch(/@layer/)
+    expect(connectingEff).not.toMatch(/@layer/)
+  })
+
+  test('the fallback is a floor, not a ceiling', () => {
+    // Regression. skeleton.css is unlayered, and an unlayered normal
+    // declaration beats a layered one at ANY specificity — so while the
+    // bundle was wrapped in @layer, those forty lines were the last word on
+    // the primary button, the fields and the network rows on EVERY
+    // browser, not just the ancient ones they exist for.
+    //
+    // Nothing looked wrong, because the fallback's hardcoded #2563eb is
+    // exactly what --color-accent resolves to in light mode. It showed up
+    // only through --brand-css: an integrator could re-point every role
+    // token and watch the Connect button stay blue.
+    //
+    // Both rules still ship. What this pins is their order, which is now
+    // all that decides between them.
+    const fallbackButton = indexEff.search(/\bbutton\s*\{[^}]*background:\s*#2563eb/)
+    const themedButton = indexEff.search(/\.btn\s*\{[^}]*background:\s*var\(--color-accent\)/)
+    expect(fallbackButton, 'the fallback button rule').toBeGreaterThan(-1)
+    expect(themedButton, 'the themed button rule must come after it').toBeGreaterThan(
+      fallbackButton,
+    )
+
+    // Same shape, and the one the screenshot gave away first: a stacked
+    // row instead of name-and-signal on one line.
+    const fallbackRow = indexEff.search(/\.net\s*\{[^}]*display:\s*block/)
+    const themedRow = indexEff.search(/\.net\s*\{[^}]*display:\s*flex/)
+    expect(fallbackRow).toBeGreaterThan(-1)
+    expect(themedRow).toBeGreaterThan(fallbackRow)
   })
 
   test('layout uses flexbox, not grid or container queries', () => {
@@ -98,17 +131,24 @@ describe('theming', () => {
     // The media arm carries no-JS and no-storage webviews; the attribute
     // arm lets the in-page toggle win. Either alone leaves a gap.
     expect(indexEff).toMatch(/prefers-color-scheme:\s*dark/)
-    expect(indexEff).toMatch(/:root\[data-theme=["']?dark/)
+    expect(indexEff).toMatch(/:root:where\(\[data-theme=["']?dark/)
   })
 
-  test('the attribute arm outranks Tailwind’s :root', () => {
-    // Tailwind emits into `:root, :host` (0,1,0). A bare attribute
-    // selector would only tie and lose on source order.
-    expect(indexEff).toMatch(/:root\[data-theme=["']?dark["']?\]/)
+  test('the dark arms weigh no more than the roles they override', () => {
+    // Tailwind emits the light roles into `:root, :host` (0,1,0) and both
+    // dark arms follow it, so source order alone is enough for them to
+    // win. Any extra weight is not just unnecessary, it is harmful:
+    // `:root[data-theme="dark"]` is 0,2,0, which also puts the arm out of
+    // reach of a --brand-css stylesheet's `:root` block — the documented
+    // seam — and leaves an integrator branded in light and stock in dark.
+    // :where() keeps the match and drops the weight.
+    expect(indexEff, 'an arm heavier than :root').not.toMatch(/:root\[data-theme/)
+    expect(indexEff, 'an arm heavier than :root').not.toMatch(/:root:not\(/)
+    expect(indexEff).toMatch(/:root:where\(:not\(\[data-theme=["']?light/)
   })
 
   test('the media arm yields to an explicit light choice', () => {
-    expect(indexEff).toMatch(/:root:not\(\[data-theme=["']?light/)
+    expect(indexEff).toMatch(/:root:where\(:not\(\[data-theme=["']?light/)
   })
 })
 
