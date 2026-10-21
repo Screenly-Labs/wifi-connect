@@ -238,6 +238,17 @@ async fn run() -> ExitCode {
         let shared = shared.clone();
 
         tokio::spawn(async move {
+            // Not before the access point is up. DNS and HTTP bind the
+            // gateway address, which only exists once NetworkManager has
+            // activated the AP — after the scan and the activation, which
+            // on a slow radio together outlast the bind retry budget.
+            // Starting the clock here instead failed the portal with
+            // EADDRNOTAVAIL and crash-looped the daemon.
+            tokio::select! {
+                () = cancel.cancelled() => return None,
+                () = shared.ap_raised() => {}
+            }
+
             let leases = dhcp::lease::Leases::new(dhcp_range.first, dhcp_range.last);
             let dhcp_cfg = dhcp::reply::ServerConfig {
                 gateway,
