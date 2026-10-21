@@ -22,7 +22,7 @@ pub mod proxies;
 pub mod security;
 pub mod settings;
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::secret::Secret;
 use crate::ssid::Ssid;
@@ -102,6 +102,44 @@ pub struct JoinRequest {
     /// otherwise.
     pub eap_method: EapMethod,
     pub hidden: bool,
+    /// How the joined network addresses this device. The default is
+    /// automatic on both families, which is what every join did before
+    /// static addressing existed.
+    pub ip: IpSettings,
+}
+
+/// Addressing for the joined network, per address family.
+///
+/// `None` for a family means automatic: DHCP for IPv4, router
+/// advertisements (SLAAC, and DHCPv6 when the router asks for it) for IPv6.
+/// The families are independent, because real networks mix them: a static
+/// IPv4 address on a LAN whose router hands out IPv6 by SLAAC is ordinary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IpSettings {
+    pub ipv4: Option<StaticIp<Ipv4Addr>>,
+    pub ipv6: Option<StaticIp<Ipv6Addr>>,
+    /// DNS servers to use *instead of* whatever the network advertises.
+    /// Empty means "whatever the network advertises".
+    pub dns: Vec<IpAddr>,
+}
+
+impl IpSettings {
+    /// Nothing was configured by hand.
+    pub fn is_automatic(&self) -> bool {
+        self.ipv4.is_none() && self.ipv6.is_none() && self.dns.is_empty()
+    }
+}
+
+/// One statically assigned address, with the router to reach the rest of
+/// the world through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticIp<A> {
+    pub address: A,
+    pub prefix: u8,
+    /// Optional, as it is in NetworkManager: a device on an isolated LAN
+    /// has no router to name. Without one there is no default route on
+    /// this family.
+    pub gateway: Option<A>,
 }
 
 /// How an enterprise (802.1X) join proves the user's password, inside the

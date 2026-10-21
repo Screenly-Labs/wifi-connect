@@ -12,6 +12,7 @@ use crate::passphrase;
 use crate::secret::Secret;
 use crate::ssid::Ssid;
 use crate::state::{PortalState, Shared};
+use crate::static_ip;
 
 use super::{assets, captive};
 
@@ -190,6 +191,18 @@ pub struct ConnectForm {
     /// choice.
     #[serde(default)]
     pub eap_method: String,
+    /// Static addressing, all optional; blank means automatic. See
+    /// [`crate::static_ip`].
+    #[serde(default)]
+    pub ipv4_address: String,
+    #[serde(default)]
+    pub ipv4_gateway: String,
+    #[serde(default)]
+    pub ipv6_address: String,
+    #[serde(default)]
+    pub ipv6_gateway: String,
+    #[serde(default)]
+    pub dns: String,
 }
 
 /// Why a submission was rejected before we touched the radio.
@@ -201,13 +214,14 @@ pub enum FormError {
     BadEapMethod,
     /// TTLS/PAP while server verification is switched off.
     PlaintextPasswordToUnverifiedServer,
+    BadIp(String),
 }
 
 impl FormError {
     fn message(&self) -> String {
         match self {
             FormError::NoNetwork => "Choose a network, or enter its name.".into(),
-            FormError::BadPassphrase(m) => m.clone(),
+            FormError::BadPassphrase(m) | FormError::BadIp(m) => m.clone(),
             FormError::BadServerDomain => {
                 "The server domain must be a host name such as radius.example.com.".into()
             }
@@ -355,6 +369,15 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
         (None, EapMethod::default())
     };
 
+    let ip = static_ip::parse(static_ip::Fields {
+        ipv4_address: &form.ipv4_address,
+        ipv4_gateway: &form.ipv4_gateway,
+        ipv6_address: &form.ipv6_address,
+        ipv6_gateway: &form.ipv6_gateway,
+        dns: &form.dns,
+    })
+    .map_err(FormError::BadIp)?;
+
     Ok(JoinRequest {
         ssid,
         identity,
@@ -362,6 +385,7 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
         server_domain,
         eap_method,
         hidden,
+        ip,
     })
 }
 
@@ -1138,6 +1162,43 @@ mod tests {
         f.eap_method = "ttls-mschapv2".into();
         let r = validate(&f, &[]).unwrap();
         assert_eq!(check_policy(&r, false), Ok(()));
+    }
+
+    /// Blank addressing fields are automatic addressing, which is what
+    /// every join was before there were any.
+    #[test]
+    fn a_form_without_addressing_joins_automatically() {
+        let r = validate(&form("486f6d65", "", "abcdefgh"), &[]).unwrap();
+        assert!(r.ip.is_automatic());
+    }
+
+    #[test]
+    fn static_addressing_on_both_families_is_carried() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.ipv4_address = "192.168.1.50/24".into();
+        f.ipv4_gateway = "192.168.1.1".into();
+        f.ipv6_address = "2001:db8::50/64".into();
+        f.ipv6_gateway = "fe80::1".into();
+        f.dns = "192.168.1.1, 2001:db8::1".into();
+        let ip = validate(&f, &[]).unwrap().ip;
+        assert_eq!(ip.ipv4.unwrap().prefix, 24);
+        assert_eq!(ip.ipv6.unwrap().prefix, 64);
+        assert_eq!(ip.dns.len(), 2);
+    }
+
+    /// Caught here, before the access point goes down, rather than as a
+    /// device that joined and can reach nothing.
+    #[test]
+    fn bad_addressing_fails_the_submission_with_a_reason() {
+        let mut f = form("486f6d65", "", "abcdefgh");
+        f.ipv4_address = "192.168.1.50/24".into();
+        f.ipv4_gateway = "10.0.0.1".into();
+        f.dns = "1.1.1.1".into();
+        let e = validate(&f, &[]).unwrap_err();
+        assert!(
+            matches!(&e, FormError::BadIp(m) if m.contains("10.0.0.1")),
+            "{e:?}"
+        );
     }
 
     fn enterprise(passphrase: &str) -> ConnectForm {

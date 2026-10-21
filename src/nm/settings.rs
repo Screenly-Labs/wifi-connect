@@ -1,4 +1,5 @@
-//! Building the NetworkManager connection-settings map for the setup AP.
+//! Building NetworkManager connection-settings maps: the whole setup AP,
+//! and the IP sections of a station profile with static addressing.
 //!
 //! `nmrs`'s `WifiConnectionBuilder` covers most of this, but not
 //! `ipv4.method=manual` (it offers `auto` and `shared` only) and not
@@ -18,10 +19,11 @@
 //! L3 to us.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 use nmrs::raw::zvariant::Value;
 
-use crate::nm::ApSecurity;
+use crate::nm::{ApSecurity, IpSettings, StaticIp};
 use crate::secret::Secret;
 use crate::ssid::Ssid;
 
@@ -121,6 +123,81 @@ pub fn ap_settings(p: &ApProfile) -> Settings<'_> {
     settings.insert("ipv6", ipv6);
 
     settings
+}
+
+/// Replace the `ipv4` and `ipv6` sections of a station profile with `ip`.
+///
+/// nmrs's builder has `ipv4_manual`, but nothing for IPv6 addresses or an
+/// IPv6 gateway, and its DNS setter silently does nothing unless `ipv4` was
+/// set first. Both families are built here instead, in one place, so their
+/// exact D-Bus shapes can be asserted the same way the AP's are.
+///
+/// Every property used here dates from NetworkManager 1.0 or earlier, so
+/// it works on any target OS.
+pub fn apply_station_ip(settings: &mut Settings<'static>, ip: &IpSettings) {
+    let v4_dns: Vec<u32> = ip
+        .dns
+        .iter()
+        .filter_map(|a| match a {
+            // `in_addr_t`: the octets in network order, read as a native
+            // integer. `u32::from(Ipv4Addr)` is host order, and NM would
+            // read it back with the octets reversed on every Pi.
+            IpAddr::V4(v4) => Some(u32::from_ne_bytes(v4.octets())),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    let v6_dns: Vec<Vec<u8>> = ip
+        .dns
+        .iter()
+        .filter_map(|a| match a {
+            IpAddr::V6(v6) => Some(v6.octets().to_vec()),
+            IpAddr::V4(_) => None,
+        })
+        .collect();
+    // Servers typed by hand replace what the network advertises, on *both*
+    // families: "use these DNS servers" means these, not these as well as
+    // whatever a router advertises over the other family.
+    let custom_dns = !ip.dns.is_empty();
+
+    let mut ipv4 = family_section(ip.ipv4.as_ref());
+    if !v4_dns.is_empty() {
+        ipv4.insert("dns", Value::from(v4_dns));
+    }
+    if custom_dns {
+        ipv4.insert("ignore-auto-dns", Value::from(true));
+    }
+    settings.insert("ipv4", ipv4);
+
+    let mut ipv6 = family_section(ip.ipv6.as_ref());
+    if !v6_dns.is_empty() {
+        ipv6.insert("dns", Value::from(v6_dns));
+    }
+    if custom_dns {
+        ipv6.insert("ignore-auto-dns", Value::from(true));
+    }
+    settings.insert("ipv6", ipv6);
+}
+
+/// One family's section: `manual` with its address and gateway, or
+/// `auto` (DHCP, or SLAAC/DHCPv6) when nothing was configured.
+fn family_section<A: ToString>(
+    fixed: Option<&StaticIp<A>>,
+) -> HashMap<&'static str, Value<'static>> {
+    let mut section: HashMap<&str, Value<'_>> = HashMap::new();
+    let Some(fixed) = fixed else {
+        section.insert("method", Value::from("auto"));
+        return section;
+    };
+    section.insert("method", Value::from("manual"));
+    let mut address: HashMap<String, Value<'_>> = HashMap::new();
+    address.insert("address".into(), Value::from(fixed.address.to_string()));
+    // u32, as for the AP: NM rejects any other integer type here.
+    address.insert("prefix".into(), Value::from(u32::from(fixed.prefix)));
+    section.insert("address-data", Value::from(vec![address]));
+    if let Some(gateway) = &fixed.gateway {
+        section.insert("gateway", Value::from(gateway.to_string()));
+    }
+    section
 }
 
 #[cfg(test)]
@@ -324,5 +401,141 @@ mod tests {
             get(&s, "connection", "type"),
             &Value::from("802-11-wireless")
         );
+    }
+
+    fn static_ip() -> IpSettings {
+        IpSettings {
+            ipv4: Some(StaticIp {
+                address: Ipv4Addr::new(192, 168, 1, 50),
+                prefix: 24,
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            }),
+            ipv6: Some(StaticIp {
+                address: "2001:db8::50".parse().unwrap(),
+                prefix: 64,
+                gateway: Some("fe80::1".parse().unwrap()),
+            }),
+            dns: vec![
+                "1.1.1.1".parse().unwrap(),
+                "2001:4860:4860::8888".parse().unwrap(),
+                "9.9.9.9".parse().unwrap(),
+            ],
+        }
+    }
+
+    fn station_with(ip: &IpSettings) -> Settings<'static> {
+        let mut s: Settings<'static> = HashMap::new();
+        // What nmrs's builder leaves behind, to prove it is replaced.
+        let mut ipv4 = HashMap::new();
+        ipv4.insert("method", Value::from("auto"));
+        s.insert("ipv4", ipv4);
+        apply_station_ip(&mut s, ip);
+        s
+    }
+
+    /// The single `address-data` entry of a section, as (address, prefix).
+    fn only_address(s: &Settings<'_>, section: &str) -> (String, u32) {
+        match get(s, section, "address-data") {
+            Value::Array(a) => {
+                assert_eq!(a.len(), 1);
+                let Value::Dict(d) = a.iter().next().unwrap() else {
+                    panic!("address-data entries must be a{{sv}}");
+                };
+                (
+                    d.get(&"address").unwrap().unwrap(),
+                    d.get(&"prefix").unwrap().unwrap(),
+                )
+            }
+            other => panic!("address-data must be aa{{sv}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automatic_addressing_is_auto_on_both_families_and_nothing_else() {
+        let s = station_with(&IpSettings::default());
+        for family in ["ipv4", "ipv6"] {
+            let section = s.get(family).unwrap();
+            assert_eq!(section.get("method").unwrap(), &Value::from("auto"));
+            assert_eq!(section.len(), 1, "{family} carries more than its method");
+        }
+    }
+
+    #[test]
+    fn a_static_ipv4_address_is_manual_with_its_gateway() {
+        let s = station_with(&static_ip());
+        assert_eq!(get(&s, "ipv4", "method"), &Value::from("manual"));
+        assert_eq!(only_address(&s, "ipv4"), ("192.168.1.50".into(), 24));
+        assert_eq!(get(&s, "ipv4", "gateway"), &Value::from("192.168.1.1"));
+    }
+
+    #[test]
+    fn a_static_ipv6_address_is_manual_with_its_gateway() {
+        let s = station_with(&static_ip());
+        assert_eq!(get(&s, "ipv6", "method"), &Value::from("manual"));
+        assert_eq!(only_address(&s, "ipv6"), ("2001:db8::50".into(), 64));
+        assert_eq!(get(&s, "ipv6", "gateway"), &Value::from("fe80::1"));
+    }
+
+    #[test]
+    fn the_families_are_independent() {
+        let mut ip = static_ip();
+        ip.ipv6 = None;
+        ip.dns.clear();
+        let s = station_with(&ip);
+        assert_eq!(get(&s, "ipv4", "method"), &Value::from("manual"));
+        assert_eq!(get(&s, "ipv6", "method"), &Value::from("auto"));
+
+        let mut ip = static_ip();
+        ip.ipv4 = None;
+        let s = station_with(&ip);
+        assert_eq!(get(&s, "ipv4", "method"), &Value::from("auto"));
+        assert_eq!(get(&s, "ipv6", "method"), &Value::from("manual"));
+    }
+
+    #[test]
+    fn no_gateway_means_no_gateway_property() {
+        let mut ip = static_ip();
+        ip.ipv4.as_mut().unwrap().gateway = None;
+        ip.ipv6.as_mut().unwrap().gateway = None;
+        let s = station_with(&ip);
+        assert!(s.get("ipv4").unwrap().get("gateway").is_none());
+        assert!(s.get("ipv6").unwrap().get("gateway").is_none());
+    }
+
+    /// `ipv4.dns` is `au` of `in_addr_t`: network-order octets read as a
+    /// native integer. A host-order integer reaches NM byte-reversed.
+    #[test]
+    fn ipv4_dns_is_in_addr_t_in_the_order_given() {
+        let s = station_with(&static_ip());
+        let expected: Vec<u32> = [[1, 1, 1, 1], [9, 9, 9, 9]]
+            .into_iter()
+            .map(u32::from_ne_bytes)
+            .collect();
+        assert_eq!(get(&s, "ipv4", "dns"), &Value::from(expected));
+    }
+
+    #[test]
+    fn ipv6_dns_is_an_array_of_sixteen_byte_arrays() {
+        let s = station_with(&static_ip());
+        let want: std::net::Ipv6Addr = "2001:4860:4860::8888".parse().unwrap();
+        assert_eq!(
+            get(&s, "ipv6", "dns"),
+            &Value::from(vec![want.octets().to_vec()])
+        );
+    }
+
+    /// Typed DNS servers replace the advertised ones on both families, even
+    /// one with no server of its own and with automatic addressing.
+    #[test]
+    fn custom_dns_ignores_advertised_dns_on_both_families() {
+        let ip = IpSettings {
+            dns: vec!["1.1.1.1".parse().unwrap()],
+            ..IpSettings::default()
+        };
+        let s = station_with(&ip);
+        assert_eq!(get(&s, "ipv4", "method"), &Value::from("auto"));
+        assert_eq!(get(&s, "ipv4", "ignore-auto-dns"), &Value::from(true));
+        assert_eq!(get(&s, "ipv6", "ignore-auto-dns"), &Value::from(true));
+        assert!(s.get("ipv6").unwrap().get("dns").is_none());
     }
 }

@@ -33,6 +33,7 @@ things that bit us in production:
 | DHCP / DNS | spawns `dnsmasq` | in-process, no external binaries |
 | Runtime | needs a shell and helpers | one static binary, `FROM scratch`, ~4 MB |
 | Wrong password | frequently just hangs | the portal comes back and says so |
+| Static IP | not supported ([#110](https://github.com/balena-os/wifi-connect/issues/110), open since 2017) | IPv4 and IPv6, set from the portal |
 | Architectures | ARMv6 binary silently dropped in 4.4.6 | amd64, arm64, armv7 **and armv6**, each executed in CI |
 
 The encryption is the headline. A captive portal cannot use TLS — there is
@@ -361,6 +362,20 @@ failed unit.
   checking off for it, logs a warning, and lets anyone in radio range who
   copies the network's name capture the user's MSCHAPv2 exchange, which
   cracks offline to their password hash.
+- **Static addressing is per join, from the portal.** The collapsed *IP
+  settings* block takes an IPv4 address and gateway, an IPv6 address and
+  gateway, and DNS servers. Each family is independent and blank means
+  automatic (DHCP for IPv4; SLAAC/DHCPv6 for IPv6). Addresses need a prefix
+  length (`192.168.1.50/24`, or `/255.255.255.0`, or `2001:db8::50/64`).
+  A fixed IPv4 address needs at least one DNS server, since DHCP is where
+  the network would otherwise have supplied one; DNS servers entered here
+  replace the network's on both families. The portal refuses a gateway
+  outside the subnet before the access point goes down, because that
+  mistake joins fine and then reaches nothing. Once the join succeeds, the
+  device's older profiles for that network are removed, so the next boot
+  cannot bring the network back up with DHCP instead. A secured network
+  needs its password re-entered when setting a static address; the
+  password saved with the old profile is not reused.
 - **No rescan button.** A radio in AP mode cannot scan, so rescanning would
   mean dropping the access point and disconnecting the user mid-setup. Use
   the hidden-network field to enter an SSID that did not appear.
