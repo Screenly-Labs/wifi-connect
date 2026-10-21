@@ -314,6 +314,74 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// The page is only served in place where its form can be submitted.
+    /// GNOME's portal helper fetches `/` under
+    /// `connectivity-check.ubuntu.com`; serving the form there would post
+    /// back to a host `POST /connect` refuses, so it must be redirected.
+    #[tokio::test]
+    async fn the_page_is_redirected_to_the_portal_under_a_foreign_host() {
+        for (path, host) in [
+            ("/", "connectivity-check.ubuntu.com"),
+            ("/", "neverssl.com"),
+            ("/library/test/success.html", "www.appleiphonecell.com"),
+        ] {
+            let resp = app()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::HOST, host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(resp.status().is_redirection(), "{host}{path}");
+            assert_eq!(
+                resp.headers().get(header::LOCATION).unwrap(),
+                "http://192.168.42.1/"
+            );
+        }
+
+        for (path, host) in [
+            ("/", "192.168.42.1"),
+            ("/hotspot-detect.html", "captive.apple.com"),
+            ("/library/test/success.html", "www.apple.com"),
+        ] {
+            let resp = app()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::HOST, host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{host}{path}");
+        }
+    }
+
+    /// DNS rebinding end to end: the attacker's own name, now resolving to
+    /// the gateway, posting same-origin. Refused.
+    #[tokio::test]
+    async fn a_rebound_attacker_host_cannot_connect() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connect")
+                    .header(header::HOST, "rebind.evil.example")
+                    .header(header::ORIGIN, "http://rebind.evil.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("ssid_hex=&ssid="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
     /// The check is for state-changing requests only. Probes arrive with
     /// foreign Host headers and an Origin is meaningless on them; none of
     /// that may change how they are routed.

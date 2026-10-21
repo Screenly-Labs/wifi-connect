@@ -52,12 +52,57 @@ fn render_portal(shared: &Shared) -> String {
     assets::render_index(&shared.branding, &shared.networks(), &shared.state())
 }
 
-pub async fn index(State(shared): State<Shared>) -> Response {
+/// The `Host` header with the default port dropped, so `x:80` and `x` are
+/// the same authority, as they are to a browser serialising an origin.
+fn host_authority(headers: &HeaderMap) -> Option<&str> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    Some(host.strip_suffix(":80").unwrap_or(host))
+}
+
+/// `true` when `authority` names Apple's own domain, where the Captive
+/// Network Assistant probes and where we answer with the portal page in
+/// place. Nobody but Apple can point a name under `apple.com` at us from
+/// the outside, which is what makes it safe to treat as the portal's origin
+/// (see [`cross_site_reason`]).
+fn is_apple_probe_host(authority: &str) -> bool {
+    let name = authority.split(':').next().unwrap_or(authority);
+    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    name == "apple.com" || name.ends_with(".apple.com")
+}
+
+/// Whether a page carrying the form may be served under this request's
+/// `Host`, rather than redirected to the portal.
+///
+/// The form posts back to whatever host it was served under, and
+/// [`cross_site_reason`] only accepts the portal's own origin and Apple's.
+/// Serving it in place under any other name — `connectivity-check.ubuntu.com`
+/// fetching `/`, a user typing `neverssl.com` — would hand out a form whose
+/// every submission is refused. Those get the redirect instead, so the form
+/// they fill in is always one that can be submitted. No `Host` at all is an
+/// HTTP/1.0 client, not a browser; it gets the page.
+fn serves_page_in_place(headers: &HeaderMap, portal_url: &str) -> bool {
+    let Some(authority) = host_authority(headers) else {
+        return headers.get(header::HOST).is_none();
+    };
+    origin_of(portal_url)
+        .and_then(|o| o.strip_prefix("http://"))
+        .is_some_and(|p| p.eq_ignore_ascii_case(authority))
+        || is_apple_probe_host(authority)
+}
+
+pub async fn index(State(shared): State<Shared>, headers: HeaderMap) -> Response {
+    if !serves_page_in_place(&headers, &shared.portal_url) {
+        return captive::redirect_to_portal(&shared.portal_url);
+    }
     no_store(Html(render_portal(&shared)).into_response())
 }
 
-/// Apple's probe family: the portal page itself, served as HTML.
-pub async fn probe_html(State(shared): State<Shared>) -> Response {
+/// Apple's probe family: the portal page itself, served as HTML, when the
+/// probe is under Apple's own name; otherwise the ordinary redirect.
+pub async fn probe_html(State(shared): State<Shared>, headers: HeaderMap) -> Response {
+    if !serves_page_in_place(&headers, &shared.portal_url) {
+        return captive::redirect_to_portal(&shared.portal_url);
+    }
     captive::apple_probe_response(render_portal(&shared))
 }
 
@@ -204,13 +249,18 @@ fn origin_of(url: &str) -> Option<&str> {
 ///
 /// - **the portal's own** (`Shared::portal_url`), which is where every
 ///   redirect probe lands; and
-/// - **the one the request was addressed to** (`http://` + `Host`). Apple's
-///   Captive Network Assistant is answered with the portal page *in place*
-///   at `http://captive.apple.com/hotspot-detect.html` (see [`probe_html`]),
+/// - **the one the request was addressed to** (`http://` + `Host`), but only
+///   when that is a name under `apple.com`. Apple's Captive Network
+///   Assistant is answered with the portal page *in place* at
+///   `http://captive.apple.com/hotspot-detect.html` (see [`probe_html`]),
 ///   and the form's relative `action="/connect"` then posts back to that
 ///   same foreign host. Accepting only the portal origin would break setup
-///   on every iPhone. A page served from the very origin it posts to is
-///   same-origin by definition; that is not CSRF.
+///   on every iPhone. Any other `Host` is not accepted, however well its
+///   `Origin` matches: that pair is exactly what DNS rebinding produces — an
+///   attacker's page, loaded over cellular, re-resolving its own name to
+///   the gateway — and an attacker cannot rebind a name under `apple.com`.
+///   [`serves_page_in_place`] keeps the form off every other host, so a
+///   genuine submission never arrives from one.
 ///
 /// Evidence, in order of strength:
 ///
@@ -231,11 +281,9 @@ fn origin_of(url: &str) -> Option<&str> {
 ///
 /// Why headers rather than a hidden form token: a token stops exactly what
 /// this stops. A page on another origin cannot read ours, so it can neither
-/// learn a token nor forge the browser-set headers. The one attack that
-/// defeats the header check, DNS-rebinding an attacker's name onto the
-/// gateway, makes the attacker same-origin and so lets them read a token out
-/// of the page as well. A token would add state and a template field for no
-/// additional protection.
+/// learn a token nor forge the browser-set headers. DNS rebinding would make
+/// the attacker same-origin and so let them read a token out of the page as
+/// well; it is the `Host` allowlist above, not a token, that stops it.
 fn cross_site_reason(headers: &HeaderMap, portal_url: &str) -> Option<&'static str> {
     if let Some(site) = headers.get("sec-fetch-site") {
         let site = site.as_bytes();
@@ -246,9 +294,8 @@ fn cross_site_reason(headers: &HeaderMap, portal_url: &str) -> Option<&'static s
 
     let portal = origin_of(portal_url);
     // HTTP/1.1 makes Host mandatory, and HTTP/1 is the only listener we run.
-    let addressed = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
+    let addressed = host_authority(headers)
+        .filter(|h| is_apple_probe_host(h))
         .map(|h| format!("http://{h}"));
     let allowed = |origin: &str| {
         portal.is_some_and(|p| p.eq_ignore_ascii_case(origin))
@@ -499,6 +546,82 @@ mod tests {
             ("sec-fetch-site", "same-origin"),
         ]);
         assert_eq!(cross_site_reason(&h, PORTAL), None);
+    }
+
+    /// DNS rebinding: an attacker's page re-resolves its own name to the
+    /// gateway and posts to it, so Origin and Host agree perfectly. Only a
+    /// name under `apple.com` is trusted that way, and lookalikes are not.
+    #[test]
+    fn a_matching_origin_and_host_outside_apple_com_is_cross_site() {
+        for host in [
+            "evil.example",
+            "evilapple.com",
+            "apple.com.evil.example",
+            "captive.apple.com.evil.example",
+            "connectivity-check.ubuntu.com",
+        ] {
+            let h = headers(&[
+                ("host", host),
+                ("origin", &format!("http://{host}")),
+                ("sec-fetch-site", "same-origin"),
+            ]);
+            assert!(cross_site_reason(&h, PORTAL).is_some(), "{host} accepted");
+        }
+    }
+
+    /// A default port or a fully-qualified trailing dot in Host is still
+    /// the same Apple name the browser's Origin spells without them.
+    #[test]
+    fn an_apple_host_is_recognised_in_its_spellings() {
+        for (host, origin) in [
+            ("captive.apple.com:80", "http://captive.apple.com"),
+            ("captive.apple.com.", "http://captive.apple.com."),
+            ("WWW.Apple.COM", "http://www.apple.com"),
+        ] {
+            let h = headers(&[("host", host), ("origin", origin)]);
+            assert_eq!(cross_site_reason(&h, PORTAL), None, "{host}");
+        }
+        // A non-default port is a different origin, Apple or not.
+        let h = headers(&[
+            ("host", "captive.apple.com:8080"),
+            ("origin", "http://captive.apple.com"),
+        ]);
+        assert!(cross_site_reason(&h, PORTAL).is_some());
+    }
+
+    /// The form is only ever served under a host whose POST would be
+    /// accepted; everything else is sent to the portal first.
+    #[test]
+    fn the_page_is_served_in_place_only_where_its_form_can_be_submitted() {
+        for host in [
+            "192.168.42.1",
+            "192.168.42.1:80",
+            "captive.apple.com",
+            "www.apple.com",
+        ] {
+            let h = headers(&[("host", host)]);
+            assert!(serves_page_in_place(&h, PORTAL), "{host} redirected");
+        }
+        for host in [
+            "connectivity-check.ubuntu.com",
+            "neverssl.com",
+            "www.appleiphonecell.com",
+            "192.168.42.1:8080",
+        ] {
+            let h = headers(&[("host", host)]);
+            assert!(!serves_page_in_place(&h, PORTAL), "{host} served in place");
+        }
+        assert!(serves_page_in_place(&HeaderMap::new(), PORTAL));
+
+        let portal = "http://10.0.0.1:8080/";
+        assert!(serves_page_in_place(
+            &headers(&[("host", "10.0.0.1:8080")]),
+            portal
+        ));
+        assert!(!serves_page_in_place(
+            &headers(&[("host", "10.0.0.1")]),
+            portal
+        ));
     }
 
     #[test]
