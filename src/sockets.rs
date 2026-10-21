@@ -27,12 +27,21 @@
 //!    write and the address being usable. Rather than sleeping a guessed
 //!    amount, retry the bind.
 //!
-//! `SO_BINDTODEVICE` has been unprivileged since Linux 5.7 for a socket that
-//! has not yet been bound, so it needs no capability on any kernel we target
-//! — which is why the pin is always set *before* `bind`. On an older kernel
-//! it requires `CAP_NET_RAW`, which is why the systemd unit keeps that in its
-//! bounding set and the balena compose example carries a commented-out
-//! `NET_RAW`.
+//! Since Linux 5.7, `SO_BINDTODEVICE` needs no capability as long as the
+//! socket is not already pinned to a device (only *changing* an existing pin
+//! needs `CAP_NET_RAW`), so on any kernel we target it is unprivileged for
+//! UDP and TCP alike. On an older kernel it always requires `CAP_NET_RAW`,
+//! which is why the systemd unit keeps that in its bounding set and the
+//! balena compose example carries a commented-out `NET_RAW`. The pin is set
+//! *before* `bind` so that the socket is never bound and receiving without
+//! it, not because the capability check depends on the order.
+//!
+//! The pin is to the interface's index, resolved once at startup. It
+//! survives the access point going down and coming back up (the address
+//! disappears and reappears; the socket stays bound and starts receiving
+//! again), which is what a failed join does. It would not survive the
+//! interface being deleted and recreated under a new index (a driver reset,
+//! a USB dongle re-enumerating); the DHCP pin never did either.
 
 use std::io;
 use std::net::SocketAddr;
@@ -74,8 +83,9 @@ where
     }
 }
 
-/// Pin `socket` to `interface` with `SO_BINDTODEVICE`. Must be called before
-/// `bind` (see the module docs for the pre-5.7 `CAP_NET_RAW` caveat).
+/// Pin `socket` to `interface` with `SO_BINDTODEVICE`. Called before `bind`,
+/// so the socket never receives unpinned (see the module docs for the
+/// pre-5.7 `CAP_NET_RAW` caveat).
 ///
 /// The error names the interface: a bare "No such device" or "Operation not
 /// permitted" at startup says nothing about which knob to turn.
