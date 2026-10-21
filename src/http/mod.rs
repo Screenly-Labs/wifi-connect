@@ -14,8 +14,17 @@ pub mod api;
 pub mod assets;
 pub mod captive;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -43,7 +52,9 @@ pub fn router(shared: Shared) -> Router {
         app = app.route(path, get(api::probe_html));
     }
 
-    app.fallback(api::probe_redirect).with_state(shared)
+    app.fallback(api::probe_redirect)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
+        .with_state(shared)
 }
 
 /// Serve the portal on `addr` until `cancel` fires.
@@ -55,14 +66,138 @@ pub async fn serve(
     let listener = crate::sockets::bind_tcp_retrying(addr).await?;
     debug!(%addr, "portal listening");
 
-    let result = axum::serve(listener, router(shared))
-        .with_graceful_shutdown(async move { cancel.cancelled().await })
-        .await;
+    serve_on(listener, router(shared), Limits::PORTAL, cancel).await;
+    Ok(())
+}
 
-    if let Err(e) = &result {
-        warn!(error = %e, "portal server stopped with an error");
+/// The bounds that keep one client from holding the portal hostage.
+///
+/// Anyone who can associate with the access point can open TCP connections
+/// to us, and the passphrase on the AP is printed on a screen. `axum::serve`
+/// sets no hyper timer, so it has no header-read timeout and no connection
+/// cap: a client that opens connections and never finishes a request keeps
+/// each one — and its file descriptor — forever. A few hundred of those
+/// exhaust the default 1024-descriptor limit, and the real user's phone
+/// then cannot load the page at all.
+///
+/// None of this stops a determined client on the AP from competing for the
+/// connection slots; it turns "held forever" into "held for seconds", and
+/// keeps descriptors well short of the limit so DHCP and DNS keep working.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// From the moment we start waiting for a request head until the whole
+    /// head has arrived. A deadline, not an idle timer: trickling one byte
+    /// at a time does not extend it. It also applies between requests on a
+    /// kept-alive connection, which closes idle browser connections too.
+    header_read_timeout: Duration,
+    /// Total life of one connection. Covers what the header timeout cannot:
+    /// a request head followed by a body that never arrives, or a client
+    /// that stops reading our response. At the deadline the connection is
+    /// asked to finish what it is doing and close, then dropped after
+    /// `drain_grace`.
+    max_connection_age: Duration,
+    /// Connections served at once. Beyond this we stop accepting; the kernel
+    /// backlog holds new connections until a slot frees, rather than us
+    /// spending a descriptor on each.
+    max_connections: usize,
+    /// How long a connection gets to finish once asked to close, either at
+    /// `max_connection_age` or on shutdown. Bounds how long a stalled client
+    /// can delay the access point coming down.
+    drain_grace: Duration,
+}
+
+impl Limits {
+    /// A phone's captive-portal browser opens a handful of connections
+    /// (page, assets, status polling, OS probes); 64 is plenty for that and
+    /// for a second device, and leaves the descriptor limit far away. Ten
+    /// seconds for a request head is generous on a link a few metres long.
+    const PORTAL: Self = Self {
+        header_read_timeout: Duration::from_secs(10),
+        max_connection_age: Duration::from_secs(60),
+        max_connections: 64,
+        drain_grace: Duration::from_secs(5),
+    };
+}
+
+/// The form is an SSID, an identity and a passphrase: a few hundred bytes.
+/// axum's default limit is 2 MB, which only helps someone trying to make a
+/// small board buffer things.
+const MAX_REQUEST_BODY: usize = 16 * 1024;
+
+/// Accept and serve connections on `listener` until `cancel` fires, then
+/// stop accepting and give open connections `drain_grace` to finish.
+///
+/// Drives hyper's HTTP/1 connection directly instead of `axum::serve`,
+/// because that is the only way to give hyper a timer, and without a timer
+/// hyper silently ignores its header-read timeout.
+async fn serve_on(listener: TcpListener, app: Router, limits: Limits, cancel: CancellationToken) {
+    // Each connection holds a permit until its task ends. That is both the
+    // cap and, on shutdown, the way to wait for every connection: take all
+    // the permits back.
+    let slots = Arc::new(Semaphore::new(limits.max_connections));
+
+    let mut http = http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(limits.header_read_timeout);
+
+    loop {
+        // Take the slot before accepting, so at the cap the connection
+        // waits in the kernel backlog instead of costing us a descriptor.
+        let permit = tokio::select! {
+            _ = cancel.cancelled() => break,
+            p = slots.clone().acquire_owned() => p.expect("the semaphore is never closed"),
+        };
+        let stream = tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    // EMFILE and friends: the next accept fails the same
+                    // way at once, so back off rather than spin the one
+                    // thread this program has.
+                    warn!(error = %e, "portal accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+        };
+
+        let conn =
+            http.serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone()));
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let mut conn = std::pin::pin!(conn);
+            let finished = tokio::select! {
+                r = conn.as_mut() => Some(r),
+                _ = tokio::time::sleep(limits.max_connection_age) => None,
+                _ = cancel.cancelled() => None,
+            };
+            let result = match finished {
+                Some(r) => r,
+                None => {
+                    // Let an in-flight response complete (the answer to
+                    // POST /connect must reach the phone), then close.
+                    conn.as_mut().graceful_shutdown();
+                    match tokio::time::timeout(limits.drain_grace, conn).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            debug!("portal connection did not drain in time; dropped");
+                            return;
+                        }
+                    }
+                }
+            };
+            if let Err(e) = result {
+                // Header timeouts land here; routine, not a server fault.
+                debug!(error = %e, "portal connection ended with an error");
+            }
+        });
     }
-    result
+
+    // Stop accepting before waiting, so nothing new starts during drain.
+    drop(listener);
+    let _ = slots.acquire_many(limits.max_connections as u32).await;
 }
 
 #[cfg(test)]
@@ -262,6 +397,239 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array());
+    }
+
+    /// The form is a few hundred bytes; anything near axum's 2 MB default
+    /// is not a form submission.
+    #[tokio::test]
+    async fn an_oversized_form_is_refused_before_it_is_buffered() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/connect")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "ssid=x&passphrase={}",
+                        "a".repeat(MAX_REQUEST_BODY)
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // The tests below run the real accept loop on a loopback socket, with
+    // the limits shrunk to fractions of a second so they finish quickly.
+    // Real time rather than paused time: hyper's timer and the kernel's
+    // sockets have to agree on what "now" is.
+
+    use std::net::SocketAddr;
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// Long enough that a test which expects it never to fire cannot be
+    /// rescued by it.
+    const NEVER: Duration = Duration::from_secs(30);
+
+    /// Upper bound on waiting for something that should happen in a fraction
+    /// of a second, so a regression fails the test instead of hanging it.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    struct Running {
+        addr: SocketAddr,
+        cancel: CancellationToken,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    async fn start(limits: Limits) -> Running {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(serve_on(listener, app(), limits, cancel.clone()));
+        Running {
+            addr,
+            cancel,
+            server,
+        }
+    }
+
+    /// Read until the server closes the connection. Panics if it does not
+    /// within `PATIENCE`.
+    async fn read_until_closed(stream: &mut TcpStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        tokio::time::timeout(PATIENCE, stream.read_to_end(&mut out))
+            .await
+            .expect("the server never closed the connection")
+            .ok();
+        out
+    }
+
+    const STATUS_REQUEST: &[u8] =
+        b"GET /api/status HTTP/1.1\r\nHost: 192.168.42.1\r\nConnection: close\r\n\r\n";
+
+    #[tokio::test]
+    async fn the_accept_loop_serves_an_ordinary_request() {
+        let server = start(Limits::PORTAL).await;
+
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        client.write_all(STATUS_REQUEST).await.unwrap();
+        let response = read_until_closed(&mut client).await;
+
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    /// The slowloris case: connect and say nothing. Before this fix the
+    /// connection, and its descriptor, lived until the client gave up.
+    #[tokio::test]
+    async fn a_connection_that_never_sends_a_request_is_closed_after_the_header_timeout() {
+        let server = start(Limits {
+            header_read_timeout: Duration::from_millis(200),
+            max_connection_age: NEVER,
+            ..Limits::PORTAL
+        })
+        .await;
+
+        let started = Instant::now();
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        read_until_closed(&mut client).await;
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "closed after {:?}, before the timeout could have fired",
+            started.elapsed()
+        );
+    }
+
+    /// The timeout is a deadline for the whole head, not an idle timer: a
+    /// client sending one header line every 50 ms must not keep it alive.
+    #[tokio::test]
+    async fn trickling_header_lines_does_not_extend_the_header_deadline() {
+        let server = start(Limits {
+            header_read_timeout: Duration::from_millis(300),
+            max_connection_age: NEVER,
+            ..Limits::PORTAL
+        })
+        .await;
+
+        let client = TcpStream::connect(server.addr).await.unwrap();
+        let (mut rx, mut tx) = client.into_split();
+        let trickle = tokio::spawn(async move {
+            tx.write_all(b"GET / HTTP/1.1\r\n").await?;
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                tx.write_all(b"X-Slow: 1\r\n").await?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), std::io::Error>(())
+        });
+
+        let started = Instant::now();
+        let mut out = Vec::new();
+        tokio::time::timeout(PATIENCE, rx.read_to_end(&mut out))
+            .await
+            .expect("a trickling client kept the connection open")
+            .ok();
+        trickle.abort();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The header timeout cannot see a client that sends a complete head
+    /// and then never sends the body it promised; the connection age can.
+    #[tokio::test]
+    async fn a_body_that_never_arrives_is_dropped_at_the_connection_age() {
+        let server = start(Limits {
+            header_read_timeout: NEVER,
+            max_connection_age: Duration::from_millis(200),
+            drain_grace: Duration::from_millis(100),
+            ..Limits::PORTAL
+        })
+        .await;
+
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        client
+            .write_all(
+                b"POST /connect HTTP/1.1\r\nHost: 192.168.42.1\r\n\
+                  Content-Type: application/x-www-form-urlencoded\r\n\
+                  Content-Length: 100\r\n\r\nssid=",
+            )
+            .await
+            .unwrap();
+
+        read_until_closed(&mut client).await;
+    }
+
+    /// At the cap the server stops accepting; the next connection sits in
+    /// the kernel backlog, costing us nothing, and is served as soon as a
+    /// slot frees.
+    #[tokio::test]
+    async fn connections_beyond_the_cap_wait_until_a_slot_frees() {
+        let server = start(Limits {
+            header_read_timeout: NEVER,
+            max_connection_age: NEVER,
+            max_connections: 1,
+            ..Limits::PORTAL
+        })
+        .await;
+
+        // Connected first, so first in the accept queue: it takes the slot.
+        let hog = TcpStream::connect(server.addr).await.unwrap();
+
+        let mut waiting = TcpStream::connect(server.addr).await.unwrap();
+        waiting.write_all(STATUS_REQUEST).await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let early = tokio::time::timeout(Duration::from_millis(300), waiting.read(&mut buf)).await;
+        assert!(
+            early.is_err(),
+            "a connection beyond the cap was served while the slot was held"
+        );
+
+        drop(hog);
+        let response = read_until_closed(&mut waiting).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+    }
+
+    /// Shutdown is what brings the access point down and lets the join
+    /// start. A stalled client mid-request must not hold that up beyond
+    /// the drain grace.
+    #[tokio::test]
+    async fn shutdown_is_not_held_up_by_a_stalled_client() {
+        let server = start(Limits {
+            header_read_timeout: NEVER,
+            max_connection_age: NEVER,
+            drain_grace: Duration::from_millis(200),
+            ..Limits::PORTAL
+        })
+        .await;
+
+        let mut stalled = TcpStream::connect(server.addr).await.unwrap();
+        stalled.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        // Let the server accept it and start reading the head.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        server.cancel.cancel();
+        tokio::time::timeout(PATIENCE, server.server)
+            .await
+            .expect("shutdown waited on a stalled client")
+            .unwrap();
+
+        read_until_closed(&mut stalled).await;
+        assert!(
+            TcpStream::connect(server.addr).await.is_err(),
+            "the listener is still accepting after shutdown"
+        );
     }
 
     #[tokio::test]

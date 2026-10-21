@@ -1940,6 +1940,8 @@ dependencies = [
  "dhcproto",
  "hex",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "ipnet",
  "mime_guess",
  "nmrs",
