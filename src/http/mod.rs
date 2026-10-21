@@ -63,11 +63,18 @@ pub fn router(shared: Shared) -> Router {
 /// may still have a cellular connection, so a page from the internet could
 /// otherwise frame the password form and dress it up as something else.
 async fn security_headers(mut resp: Response) -> Response {
+    let is_svg = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("image/svg+xml"));
+    let csp = if is_svg {
+        HeaderValue::from_static(assets::SVG_CONTENT_SECURITY_POLICY)
+    } else {
+        assets::content_security_policy()
+    };
     let headers = resp.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        assets::content_security_policy(),
-    );
+    headers.insert(header::CONTENT_SECURITY_POLICY, csp);
     // frame-ancestors supersedes this where it is understood; the header is
     // for the captive-portal webviews old enough not to.
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
@@ -75,11 +82,15 @@ async fn security_headers(mut resp: Response) -> Response {
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    // The portal URL is not secret, but there is no reason for a page that
-    // asks for a WiFi password to tell anything where the user came from.
+    // Nothing off the portal learns where the user came from, but our own
+    // requests keep their provenance. NOT `no-referrer`: under that policy
+    // a browser sends `Origin: null` on the form's POST (Fetch, "append a
+    // request `Origin` header") and drops `Referer`, which is exactly the
+    // evidence a cross-site-POST check on /connect relies on. `same-origin`
+    // sends both, unchanged, to ourselves and nothing to anyone else.
     headers.insert(
         header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
+        HeaderValue::from_static("same-origin"),
     );
     resp
 }
@@ -372,7 +383,7 @@ mod tests {
         };
         assert_eq!(get(header::X_CONTENT_TYPE_OPTIONS), "nosniff", "{what}");
         assert_eq!(get(header::X_FRAME_OPTIONS), "DENY", "{what}");
-        assert_eq!(get(header::REFERRER_POLICY), "no-referrer", "{what}");
+        assert_eq!(get(header::REFERRER_POLICY), "same-origin", "{what}");
 
         let csp = get(header::CONTENT_SECURITY_POLICY);
         for directive in [
@@ -384,9 +395,52 @@ mod tests {
             assert!(csp.contains(directive), "{what}: CSP lacks {directive}");
         }
         // The point of the hashes: inline script must never be allowed
-        // wholesale, or the policy is no backstop for an escaping bug.
-        assert!(!csp.contains("unsafe-inline"), "{what}: {csp}");
-        assert!(csp.contains("script-src 'sha256-"), "{what}: {csp}");
+        // wholesale, or the policy is no backstop for an escaping bug. The
+        // 'unsafe-inline' kept for CSP 1.0 browsers is ignored by every
+        // later one only because a hash sits beside it.
+        assert!(
+            csp.contains("script-src 'unsafe-inline' 'sha256-"),
+            "{what}: {csp}"
+        );
+        assert!(
+            csp.contains("style-src 'self' 'unsafe-inline' 'sha256-"),
+            "{what}: {csp}"
+        );
+    }
+
+    /// An SVG logo gets its own policy: its inline styling survives, and
+    /// nothing in it can run or be framed.
+    #[tokio::test]
+    async fn an_svg_logo_keeps_its_styles_but_cannot_run_script() {
+        let (shared, _rx) = Shared::new(
+            "http://192.168.42.1/".into(),
+            Branding {
+                logo: Some(crate::state::BrandLogo {
+                    bytes: std::sync::Arc::from(&b"<svg/>"[..]),
+                    content_type: "image/svg+xml",
+                }),
+                ..Branding::new("Anthias")
+            },
+        );
+        let resp = router(shared)
+            .oneshot(
+                Request::builder()
+                    .uri("/brand-logo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let csp = resp.headers()[header::CONTENT_SECURITY_POLICY]
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        assert!(csp.contains("style-src 'unsafe-inline'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(!csp.contains("script-src"), "{csp}");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(resp.headers()[header::X_FRAME_OPTIONS], "DENY");
     }
 
     #[tokio::test]

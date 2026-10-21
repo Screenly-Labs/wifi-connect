@@ -263,8 +263,9 @@ fn is_sha256_source(source: &str) -> bool {
 
 /// Build the policy from the embedded hashes.
 ///
-/// Inline script and style are allowed by hash and by nothing else, so the
-/// only script that runs is the script we built. That is the backstop for
+/// Inline script and style are allowed by hash (the `'unsafe-inline'` next
+/// to them is a CSP 1.0 fallback that any hash switches off), so the only
+/// script that runs is the script we built. That is the backstop for
 /// the token substitution above: if an SSID ever did slip through
 /// unescaped, the `<script>` it injected would not match a hash.
 ///
@@ -295,7 +296,21 @@ fn build_content_security_policy() -> String {
             .map(|s| format!(" {s}"))
             .collect()
     };
-    let script = match sources(&hashes.script) {
+    // `'unsafe-inline'` rides along with the hashes, never without them.
+    // CSP Level 2 and later ignore it whenever a hash is present, so every
+    // current browser enforces the hashes alone. A CSP 1.0 engine (iOS 9
+    // and older, the Chromium 30-33 WebView of Android 4.4) does not know
+    // hash sources: without the fallback it would see a directive with no
+    // source it understands, block the stylesheet and both scripts, and
+    // show an unstyled portal. With no hashes nothing would neutralise it,
+    // so then it is left out.
+    let with_fallback = |list: &[String]| -> String {
+        match sources(list) {
+            s if s.is_empty() => s,
+            s => format!(" 'unsafe-inline'{s}"),
+        }
+    };
+    let script = match with_fallback(&hashes.script) {
         s if s.is_empty() => String::from(" 'none'"),
         s => s,
     };
@@ -310,9 +325,25 @@ fn build_content_security_policy() -> String {
          form-action 'self'; \
          frame-ancestors 'none'; \
          base-uri 'none'",
-        style = sources(&hashes.style),
+        style = with_fallback(&hashes.style),
     )
 }
+
+/// The `Content-Security-Policy` for an SVG response (`/brand-logo`).
+///
+/// An SVG is a document, so it gets a policy of its own: no script, no
+/// network, no framing, but its own inline styling allowed. Exported logos
+/// colour themselves with `style="…"` attributes and `<style>` blocks; the
+/// page policy, which allows exactly one stylesheet by hash, would strip
+/// those and render the mark unstyled wherever it is applied to the SVG —
+/// opened directly, or by an engine that honours an image response's
+/// policy.
+pub const SVG_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; \
+     style-src 'unsafe-inline'; \
+     img-src data:; \
+     font-src data:; \
+     frame-ancestors 'none'; \
+     base-uri 'none'";
 
 /// The `Content-Security-Policy` header value for every portal response.
 ///
@@ -793,10 +824,23 @@ mod tests {
         let csp = content_security_policy().to_str().unwrap().to_owned();
         let script = directive(&csp, "script-src");
         assert!(
-            !script.is_empty() && script.iter().all(|s| is_sha256_source(s)),
-            "script-src must be hashes only: {script:?}"
+            script
+                .iter()
+                .all(|s| is_sha256_source(s) || *s == "'unsafe-inline'"),
+            "script-src must be hashes (plus the CSP 1.0 fallback): {script:?}"
         );
-        assert!(!csp.contains("unsafe-"), "{csp}");
+        // 'unsafe-inline' is inert only because hashes sit beside it.
+        for name in ["script-src", "style-src"] {
+            let sources = directive(&csp, name);
+            assert!(
+                sources.iter().any(|s| is_sha256_source(s)),
+                "{name} has no hashes, so 'unsafe-inline' would be live: {sources:?}"
+            );
+        }
+        assert!(
+            !csp.contains("unsafe-eval") && !csp.contains("unsafe-hashes"),
+            "{csp}"
+        );
     }
 
     /// The hash file is ours, but it is still spliced into a header.
