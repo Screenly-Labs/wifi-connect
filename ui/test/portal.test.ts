@@ -181,6 +181,18 @@ describe('works without JavaScript', () => {
     expect(block?.[1]).toMatch(/<label[^>]+for="server-domain"/)
   })
 
+  test('static addressing is posted from a collapsed block that opens without JS', () => {
+    // A <details> opens with no script at all; the names are what /connect
+    // reads. Blank means automatic, so none of them may be required.
+    const block = indexEff.match(/<details[^>]+class="ip-settings"[^>]*>([\s\S]*?)<\/details>/)
+    expect(block, 'the IP settings block').not.toBeNull()
+    expect(block?.[0]).not.toMatch(/<details[^>]+\bopen\b/)
+    for (const name of ['ipv4_address', 'ipv4_gateway', 'ipv6_address', 'ipv6_gateway', 'dns']) {
+      expect(block?.[1]).toMatch(new RegExp(`<input[^>]+name="${name}"`))
+    }
+    expect(block?.[1]).not.toMatch(/\brequired\b/)
+  })
+
   test('enhancement-only controls start hidden', () => {
     // Show/hide does nothing without JS, so it must not be visible to a
     // user who has none. The theme toggle is the same, but it is emitted

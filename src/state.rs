@@ -245,6 +245,7 @@ mod tests {
             server_domain: None,
             eap_method: Default::default(),
             hidden: false,
+            ip: Default::default(),
         }
     }
 

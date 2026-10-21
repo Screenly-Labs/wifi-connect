@@ -29,7 +29,7 @@ use super::proxies::{
     is_device_busy,
 };
 use super::security;
-use super::settings::{ApProfile, ap_settings};
+use super::settings::{ApProfile, ap_settings, apply_station_ip};
 use super::{
     ApConfig, ApHandle, Connectivity, DeviceInfo, EapMethod, JoinFailure, JoinOutcome, JoinRequest,
     NetworkControl, NetworkError, WifiNetwork,
@@ -181,6 +181,7 @@ impl NmrsControl {
         if let Some(connection) = settings.get_mut("connection") {
             connection.insert("uuid", zbus::zvariant::Value::from(uuid.clone()));
         }
+        apply_station_ip(&mut settings, &request.ip);
 
         // nmrs waits for activation here under its own 30 s timeout, which
         // knows nothing of our budget; cap it, so a fallback attempt given
@@ -199,7 +200,12 @@ impl NmrsControl {
         )
         .await;
         let failure = match activated {
-            Ok(Ok(_)) => return Ok(JoinOutcome::Joined),
+            Ok(Ok(_)) => {
+                if !request.ip.is_automatic() {
+                    self.replace_older_profiles(&request.ssid, &uuid).await;
+                }
+                return Ok(JoinOutcome::Joined);
+            }
             Ok(Err(e)) => {
                 debug!(error = %e, "activating our own station profile failed");
                 classify_failure(&e)
@@ -212,6 +218,27 @@ impl NmrsControl {
         // not rely on the caller to do it.
         self.delete_profile_quietly(&uuid).await;
         Ok(JoinOutcome::Failed(failure))
+    }
+
+    /// Delete every other saved station profile for `ssid`, now that `keep`
+    /// has come up.
+    ///
+    /// What nmrs does for a credentialed join (`replaces`), done here for a
+    /// static-IP join, which has to build its own profile. Without it the
+    /// device's previous profile for the network, with its DHCP addressing,
+    /// stays saved alongside the new one, and NetworkManager may pick it on
+    /// the next boot: the static address would hold until the first reboot
+    /// and then quietly not. Only after success, so a failed attempt costs
+    /// the device nothing it had.
+    async fn replace_older_profiles(&self, ssid: &Ssid, keep: &str) {
+        match self.station_profile_uuids(ssid).await {
+            Ok(uuids) => {
+                for uuid in uuids.iter().filter(|u| u.as_str() != keep) {
+                    self.delete_profile_quietly(uuid).await;
+                }
+            }
+            Err(e) => warn!(error = %e, "could not list profiles to replace"),
+        }
     }
 
     /// Delete a saved connection by UUID, swallowing "nothing to delete".
@@ -475,7 +502,14 @@ enum JoinRoute {
 /// With credentials (PSK or EAP), nmrs is safe and stays in charge: it
 /// builds a *new* profile, deletes that new one itself if activation fails,
 /// and removes the old one (`replaces`) only once the new one has come up.
+///
+/// Hand-configured addressing always builds its own profile: nmrs's
+/// `try_connect` has no way to carry it, and reusing a saved profile would
+/// silently keep that profile's addressing instead.
 fn route_join(request: &JoinRequest, saved: Option<&[String]>) -> JoinRoute {
+    if !request.ip.is_automatic() {
+        return JoinRoute::OwnProfile;
+    }
     if !matches!(classify_credentials(request), Credential::Open) {
         return JoinRoute::Nmrs;
     }
@@ -895,7 +929,9 @@ impl NetworkControl for NmrsControl {
         // An open join must not be handed to nmrs when a profile for this
         // SSID is already saved: on failure nmrs deletes that profile. Only
         // looked up when it can change the answer.
-        let saved = if matches!(classify_credentials(request), Credential::Open) {
+        let saved = if request.ip.is_automatic()
+            && matches!(classify_credentials(request), Credential::Open)
+        {
             match self.station_profile_uuids(&request.ssid).await {
                 Ok(uuids) => Some(uuids),
                 Err(e) => {
@@ -1234,6 +1270,7 @@ mod tests {
             server_domain: server_domain.map(str::to_string),
             eap_method: Default::default(),
             hidden: false,
+            ip: Default::default(),
         }
     }
 
@@ -1389,6 +1426,7 @@ mod tests {
             hidden,
             server_domain: None,
             eap_method: Default::default(),
+            ip: Default::default(),
         }
     }
 
@@ -1433,6 +1471,32 @@ mod tests {
             route_join(&join("Cafe", None, false), Some(&[])),
             JoinRoute::Nmrs
         );
+    }
+
+    /// nmrs's `try_connect` cannot carry static addressing, and a saved
+    /// profile would bring its own, so a hand-configured join builds its own
+    /// profile whatever the credentials and whatever is saved.
+    #[test]
+    fn a_join_with_static_addressing_always_builds_its_own_profile() {
+        let saved = ["home-uuid".to_string()];
+        let ip = crate::nm::IpSettings {
+            ipv6: Some(crate::nm::StaticIp {
+                address: "2001:db8::50".parse().unwrap(),
+                prefix: 64,
+                gateway: None,
+            }),
+            ..Default::default()
+        };
+        for (passphrase, saved) in [
+            (Some("abcdefgh"), Some(&saved[..])),
+            (None, Some(&saved[..])),
+            (None, Some(&[][..])),
+            (None, None),
+        ] {
+            let mut request = join("Home", passphrase, false);
+            request.ip = ip.clone();
+            assert_eq!(route_join(&request, saved), JoinRoute::OwnProfile);
+        }
     }
 
     /// Only station WiFi profiles for this exact network count. A wired or

@@ -130,6 +130,78 @@
           <p class="hint" id="pw-hint">8 to 63 characters. Leave blank for an open network.</p>
         </div>
 
+        <!-- Static addressing. Collapsed, and blank means automatic, so a
+             network with DHCP needs nothing here. A <details> rather than a
+             checkbox: it opens with JavaScript disabled. The server checks
+             every value again; see src/static_ip.rs. -->
+        <details class="ip-settings">
+          <summary>IP settings (optional)</summary>
+          <p class="hint" id="ip-hint">
+            Leave blank to get addresses from the network. Enter an address with its prefix length;
+            either family can be set on its own. DNS servers are separated by commas.
+          </p>
+          <label for="ipv4-address">IPv4 address</label>
+          <input
+            id="ipv4-address"
+            name="ipv4_address"
+            type="text"
+            autocapitalize="none"
+            autocorrect="off"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="192.168.1.50/24"
+            aria-describedby="ip-hint"
+          />
+          <label for="ipv4-gateway">IPv4 gateway</label>
+          <input
+            id="ipv4-gateway"
+            name="ipv4_gateway"
+            type="text"
+            autocapitalize="none"
+            autocorrect="off"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="192.168.1.1"
+            aria-describedby="ip-hint"
+          />
+          <label for="ipv6-address">IPv6 address</label>
+          <input
+            id="ipv6-address"
+            name="ipv6_address"
+            type="text"
+            autocapitalize="none"
+            autocorrect="off"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="2001:db8::50/64"
+            aria-describedby="ip-hint"
+          />
+          <label for="ipv6-gateway">IPv6 gateway</label>
+          <input
+            id="ipv6-gateway"
+            name="ipv6_gateway"
+            type="text"
+            autocapitalize="none"
+            autocorrect="off"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="fe80::1"
+            aria-describedby="ip-hint"
+          />
+          <label for="dns">DNS servers</label>
+          <input
+            id="dns"
+            name="dns"
+            type="text"
+            autocapitalize="none"
+            autocorrect="off"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="192.168.1.1, 2001:db8::1"
+            aria-describedby="ip-hint"
+          />
+        </details>
+
         <div class="field">
           <button class="btn" type="submit">Connect</button>
         </div>

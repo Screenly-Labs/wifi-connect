@@ -23,6 +23,7 @@ mod secret;
 mod sockets;
 mod ssid;
 mod state;
+mod static_ip;
 
 use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddr};
