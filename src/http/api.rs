@@ -32,7 +32,7 @@ fn no_store(mut resp: Response) -> Response {
 /// round trip on a link where the client is attached to this very device,
 /// and it keeps 404s in the log meaningful.
 pub async fn brand_css(State(shared): State<Shared>) -> Response {
-    let css = shared.brand_css.as_deref().unwrap_or("");
+    let css = shared.branding.css.as_deref().unwrap_or("");
     no_store(
         (
             StatusCode::OK,
@@ -48,12 +48,7 @@ pub async fn brand_css(State(shared): State<Shared>) -> Response {
 
 /// Render the portal page with the current networks and any pending error.
 fn render_portal(shared: &Shared) -> String {
-    assets::render_index(
-        &shared.brand_name,
-        &shared.networks(),
-        &shared.state(),
-        shared.brand_css.is_some(),
-    )
+    assets::render_index(&shared.branding, &shared.networks(), &shared.state())
 }
 
 pub async fn index(State(shared): State<Shared>) -> Response {
@@ -100,14 +95,7 @@ pub async fn connecting(State(shared): State<Shared>) -> Response {
         PortalState::Joining { ssid } | PortalState::Connected { ssid } => ssid,
         _ => String::new(),
     };
-    no_store(
-        Html(assets::render_connecting(
-            &shared.brand_name,
-            &ssid,
-            shared.brand_css.is_some(),
-        ))
-        .into_response(),
-    )
+    no_store(Html(assets::render_connecting(&shared.branding, &ssid)).into_response())
 }
 
 /// The form `POST /connect` accepts.
@@ -196,10 +184,9 @@ pub async fn connect(State(shared): State<Shared>, Form(form): Form<ConnectForm>
                 (
                     StatusCode::BAD_REQUEST,
                     Html(assets::render_index_with_error(
-                        &shared.brand_name,
+                        &shared.branding,
                         &shared.networks(),
                         &e.message(),
-                        shared.brand_css.is_some(),
                     )),
                 )
                     .into_response(),
@@ -213,11 +200,7 @@ pub async fn connect(State(shared): State<Shared>, Form(form): Form<ConnectForm>
         return no_store(
             (
                 StatusCode::CONFLICT,
-                Html(assets::render_connecting(
-                    &shared.brand_name,
-                    &ssid,
-                    shared.brand_css.is_some(),
-                )),
+                Html(assets::render_connecting(&shared.branding, &ssid)),
             )
                 .into_response(),
         );
@@ -228,11 +211,7 @@ pub async fn connect(State(shared): State<Shared>, Form(form): Form<ConnectForm>
     no_store(
         (
             StatusCode::ACCEPTED,
-            Html(assets::render_connecting(
-                &shared.brand_name,
-                &ssid,
-                shared.brand_css.is_some(),
-            )),
+            Html(assets::render_connecting(&shared.branding, &ssid)),
         )
             .into_response(),
     )

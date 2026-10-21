@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 
+use crate::cli::ThemeMode;
 use crate::nm::{JoinFailure, JoinRequest, WifiNetwork};
 
 /// What the portal is doing, as the browser sees it.
@@ -49,8 +50,19 @@ pub struct Shared {
     join_tx: mpsc::Sender<JoinRequest>,
     /// The URL a client should be redirected to.
     pub portal_url: String,
-    /// The product name shown in the page, for white-labelling.
-    pub brand_name: String,
+    /// Everything an integrator can change about how the portal looks.
+    pub branding: Branding,
+}
+
+/// The white-labelling surface, resolved at startup.
+///
+/// One struct rather than four parameters because it keeps growing, and
+/// because every field is settled before the first request and never
+/// changes afterwards.
+#[derive(Clone)]
+pub struct Branding {
+    /// The product name shown in the page.
+    pub name: String,
     /// The integrator's stylesheet, served at `/brand.css`.
     ///
     /// Read once at startup rather than per request: it is a handful of
@@ -58,15 +70,30 @@ pub struct Shared {
     /// eagerly means a typo in `--brand-css` fails at boot with a clear
     /// message instead of silently serving an unbranded portal to every
     /// client. `Arc<str>` because `Shared` is cloned into every handler.
-    pub brand_css: Option<Arc<str>>,
+    pub css: Option<Arc<str>>,
+    /// Which theme the page starts in.
+    ///
+    /// `System` follows the phone and leaves the in-page toggle on;
+    /// anything else pins the page and takes the toggle away. A captive
+    /// portal is open for a minute to get a device onto WiFi, and which
+    /// of two colour schemes it uses is the integrator's decision, not
+    /// something to ask the person holding the phone.
+    pub theme: ThemeMode,
+}
+
+impl Branding {
+    /// Defaults: no stylesheet, and follow the phone's own setting.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            css: None,
+            theme: ThemeMode::System,
+        }
+    }
 }
 
 impl Shared {
-    pub fn new(
-        portal_url: String,
-        brand_name: String,
-        brand_css: Option<Arc<str>>,
-    ) -> (Self, mpsc::Receiver<JoinRequest>) {
+    pub fn new(portal_url: String, branding: Branding) -> (Self, mpsc::Receiver<JoinRequest>) {
         let (join_tx, join_rx) = mpsc::channel(1);
         (
             Self {
@@ -77,8 +104,7 @@ impl Shared {
                 })),
                 join_tx,
                 portal_url,
-                brand_name,
-                brand_css,
+                branding,
             },
             join_rx,
         )
@@ -153,7 +179,7 @@ mod tests {
     use crate::ssid::Ssid;
 
     fn shared() -> (Shared, mpsc::Receiver<JoinRequest>) {
-        Shared::new("http://192.168.42.1/".into(), "WiFi Connect".into(), None)
+        Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"))
     }
 
     fn request(ssid: &str) -> JoinRequest {

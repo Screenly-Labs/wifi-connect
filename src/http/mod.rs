@@ -68,13 +68,15 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Branding;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     fn app() -> Router {
-        let (shared, _rx) = Shared::new("http://192.168.42.1/".into(), "WiFi Connect".into(), None);
+        let (shared, _rx) =
+            Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"));
         router(shared)
     }
 
@@ -88,8 +90,10 @@ mod tests {
     async fn get_path_branded(path: &str) -> axum::response::Response {
         let (shared, _rx) = Shared::new(
             "http://192.168.42.1/".into(),
-            "WiFi Connect".into(),
-            Some(std::sync::Arc::from(":root{--color-accent:#ffe11a}")),
+            Branding {
+                css: Some(std::sync::Arc::from(":root{--color-accent:#ffe11a}")),
+                ..Branding::new("WiFi Connect")
+            },
         );
         router(shared)
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
