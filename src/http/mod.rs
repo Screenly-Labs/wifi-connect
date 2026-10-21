@@ -31,6 +31,7 @@ pub fn router(shared: Shared) -> Router {
         .route("/api/status", get(api::status))
         .route("/api/captive-portal", get(api::captive_portal_api))
         .route("/brand.css", get(api::brand_css))
+        .route("/brand-logo", get(api::brand_logo))
         .route("/assets/{*path}", get(assets::serve));
 
     // OS probe endpoints. Registered explicitly so they are covered by
@@ -68,13 +69,15 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Branding;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
     fn app() -> Router {
-        let (shared, _rx) = Shared::new("http://192.168.42.1/".into(), "WiFi Connect".into(), None);
+        let (shared, _rx) =
+            Shared::new("http://192.168.42.1/".into(), Branding::new("WiFi Connect"));
         router(shared)
     }
 
@@ -88,8 +91,10 @@ mod tests {
     async fn get_path_branded(path: &str) -> axum::response::Response {
         let (shared, _rx) = Shared::new(
             "http://192.168.42.1/".into(),
-            "WiFi Connect".into(),
-            Some(std::sync::Arc::from(":root{--color-accent:#ffe11a}")),
+            Branding {
+                css: Some(std::sync::Arc::from(":root{--color-accent:#ffe11a}")),
+                ..Branding::new("WiFi Connect")
+            },
         );
         router(shared)
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -120,6 +125,50 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_logo_route_serves_the_bytes_with_its_own_content_type() {
+        let (shared, _rx) = Shared::new(
+            "http://192.168.42.1/".into(),
+            Branding {
+                logo: Some(crate::state::BrandLogo {
+                    bytes: std::sync::Arc::from(
+                        &b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"[..],
+                    ),
+                    content_type: "image/svg+xml",
+                }),
+                ..Branding::new("Anthias")
+            },
+        );
+        let resp = router(shared)
+            .oneshot(
+                Request::builder()
+                    .uri("/brand-logo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/svg+xml"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"<svg"));
+    }
+
+    /// 404, not the empty 200 that `/brand.css` returns: the page only
+    /// references the logo when one is set, so a request without one is a
+    /// stale cache or a prober, and an empty body would render as a broken
+    /// image rather than falling back to the alt text.
+    #[tokio::test]
+    async fn the_logo_route_is_404_when_no_logo_is_configured() {
+        let resp = get_path("/brand-logo").await;
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// The single most important assertion in the HTTP layer. A 204 here

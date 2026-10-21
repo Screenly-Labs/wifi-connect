@@ -613,7 +613,7 @@ impl NetworkControl for NmrsControl {
             .await
             .map_err(|e| NetworkError::Other(e.to_string()))?;
 
-        let mut out: Vec<WifiNetwork> = aps
+        let out: Vec<WifiNetwork> = aps
             .iter()
             // Drop other hotspots (including our own, if a previous run
             // left one up) and hidden networks, whose SSID comes back
@@ -629,11 +629,7 @@ impl NetworkControl for NmrsControl {
             })
             .collect();
 
-        // Strongest first, then one row per SSID: several access points on
-        // one network would otherwise fill the list with duplicates.
-        out.sort_by_key(|a| std::cmp::Reverse(a.strength));
-        out.dedup_by(|a, b| a.ssid_hex == b.ssid_hex);
-        Ok(out)
+        Ok(strongest_per_ssid(out))
     }
 
     async fn raise_ap(
@@ -837,10 +833,90 @@ impl NetworkControl for NmrsControl {
     }
 }
 
+/// One row per SSID, strongest first.
+///
+/// Several access points on one network — the 2.4 and 5 GHz radios of the
+/// same box, or a mesh — otherwise fill the list with rows that are
+/// indistinguishable to the person reading it, and asking someone to
+/// choose between two identical names is asking them to guess.
+///
+/// Sorting by strength and calling `dedup_by` is the obvious way to write
+/// this and does not work: `dedup_by` only collapses runs of ADJACENT
+/// equal elements, and two radios of one network are adjacent only when no
+/// third network's strength happens to fall between them. On a real site
+/// that is the exception, not the rule — three networks with two radios
+/// each typically interleave, and every duplicate survives. Group by SSID
+/// first, keep the strongest of each, then order the result.
+fn strongest_per_ssid(mut networks: Vec<WifiNetwork>) -> Vec<WifiNetwork> {
+    networks.sort_by(|a, b| {
+        a.ssid_hex
+            .cmp(&b.ssid_hex)
+            .then(b.strength.cmp(&a.strength))
+    });
+    networks.dedup_by(|a, b| a.ssid_hex == b.ssid_hex);
+    // Stable, so equal strengths keep the SSID order above rather than
+    // shuffling between scans and moving a row under a tapping finger.
+    networks.sort_by_key(|a| std::cmp::Reverse(a.strength));
+    networks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nm::security::Security;
+
+    /// Regression: the list showed one row per radio, not one per network.
+    ///
+    /// These strengths interleave, which is what a real site looks like and
+    /// what defeats a plain `dedup_by` on a strength-sorted list.
+    #[test]
+    fn one_row_per_ssid_even_when_strengths_interleave() {
+        let net = |ssid: &str, strength: u8| {
+            WifiNetwork::new(
+                Ssid::new(ssid.as_bytes().to_vec()),
+                strength,
+                Security::WpaPsk,
+                Some(2412),
+            )
+        };
+        let scanned = vec![
+            net("lab", 90),
+            net("iot", 85),
+            net("wifi", 80),
+            net("lab", 70),
+            net("iot", 65),
+            net("wifi", 60),
+        ];
+
+        let shown = strongest_per_ssid(scanned);
+
+        let names: Vec<&str> = shown.iter().map(|n| n.ssid.as_str()).collect();
+        assert_eq!(names, vec!["lab", "iot", "wifi"]);
+        // And the row kept is the one the phone can actually hear best.
+        assert_eq!(
+            shown.iter().map(|n| n.strength).collect::<Vec<_>>(),
+            vec![90, 85, 80]
+        );
+    }
+
+    #[test]
+    fn two_networks_sharing_a_name_are_still_one_row() {
+        // Same SSID bytes is the same network as far as joining goes: the
+        // profile is built from the SSID and the strongest BSS wins.
+        let net = |strength: u8| {
+            WifiNetwork::new(
+                Ssid::new(b"cafe".to_vec()),
+                strength,
+                Security::WpaPsk,
+                Some(5180),
+            )
+        };
+
+        let shown = strongest_per_ssid(vec![net(40), net(95), net(10)]);
+
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].strength, 95);
+    }
 
     /// These three map to genuinely different things a user must do, so
     /// collapsing any of them into "connection failed" loses real

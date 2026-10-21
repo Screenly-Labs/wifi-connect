@@ -353,7 +353,15 @@ pub fn report(result: &Result<Outcome, NetworkError>) -> i32 {
                 | NetworkError::Unmanaged(_)
                 | NetworkError::RadioBlocked => 4,
                 NetworkError::Unreachable(_) => 5,
-                NetworkError::PortalUnavailable(_) => 6,
+                // NOT 6. That is Outcome::TimedOut, which is an ordinary
+                // ending — the portal ran, nobody joined, we gave up — and
+                // an integrator's systemd unit lists it in
+                // SuccessExitStatus for exactly that reason. Sharing the
+                // code made a bind failure (something else on the port,
+                // every single time) indistinguishable from it, so the one
+                // misconfiguration that can never fix itself was reported
+                // as a clean exit and retried silently forever.
+                NetworkError::PortalUnavailable(_) => 7,
                 _ => 1,
             }
         }
@@ -368,6 +376,7 @@ mod tests {
     use crate::nm::{ApSecurity, JoinFailure, WifiNetwork};
     use crate::secret::Secret;
     use crate::ssid::Ssid;
+    use crate::state::Branding;
 
     fn config() -> RunConfig {
         RunConfig {
@@ -388,7 +397,7 @@ mod tests {
     }
 
     fn shared() -> (Shared, mpsc::Receiver<JoinRequest>) {
-        Shared::new("http://192.168.42.1/".into(), "Test".into(), None)
+        Shared::new("http://192.168.42.1/".into(), Branding::new("Test"))
     }
 
     fn request(ssid: &str) -> JoinRequest {
@@ -861,5 +870,24 @@ mod tests {
         assert_eq!(report(&Err(NetworkError::NoWifiDevice)), 3);
         assert_eq!(report(&Err(NetworkError::RadioBlocked)), 4);
         assert_eq!(report(&Err(NetworkError::Unreachable("bus".into()))), 5);
+        assert_eq!(
+            report(&Err(NetworkError::PortalUnavailable("in use".into()))),
+            7
+        );
+    }
+
+    /// The distinction an integrator's unit file is built on.
+    ///
+    /// A timeout is a normal ending and belongs in SuccessExitStatus; a
+    /// portal that could not bind is a misconfiguration that will recur on
+    /// every run until someone changes something. Sharing one code means
+    /// either the timeout shows up as a failed unit on every offline
+    /// device, or the bind failure never shows up at all.
+    #[test]
+    fn a_timeout_and_a_failed_bind_are_not_the_same_ending() {
+        let timed_out = report(&Ok(Outcome::TimedOut));
+        let unavailable = report(&Err(NetworkError::PortalUnavailable("in use".into())));
+
+        assert_ne!(timed_out, unavailable);
     }
 }
