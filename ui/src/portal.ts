@@ -93,17 +93,28 @@ function initSecurityAwareness(): void {
     // The 8-character floor is a WPA-PSK rule; EAP passwords have no such
     // minimum, and on a disabled/empty field it would block submission of an
     // open network. Apply it only to PSK networks.
+    // Likewise the 63-character ceiling: directory passwords behind an
+    // 802.1X network are routinely longer, and maxlength silently truncates
+    // what a password manager pastes.
     if (needsPassphrase) {
       password.setAttribute('minlength', '8')
+      password.setAttribute('maxlength', '63')
     } else {
       password.removeAttribute('minlength')
+      password.removeAttribute('maxlength')
     }
     if (identityField instanceof HTMLElement) identityField.hidden = !needsIdentity
-    // The server domain shares the enterprise block. A hidden field still
-    // submits, so clear it when the block hides: a domain typed for one
-    // network must not ride along with a join to another.
-    const serverDomain = document.getElementById('server-domain')
-    if (!needsIdentity && serverDomain instanceof HTMLInputElement) serverDomain.value = ''
+    // A hidden input still submits, and a username is what makes the server
+    // join over 802.1X. So when the enterprise block hides, clear AND
+    // disable its inputs (disabled inputs are not submitted): a username
+    // typed for one network must not turn a PSK join into an EAP one. The
+    // server drops it for a scanned non-enterprise network too.
+    for (const id of ['identity', 'server-domain']) {
+      const input = document.getElementById(id)
+      if (!(input instanceof HTMLInputElement)) continue
+      input.disabled = !needsIdentity
+      if (!needsIdentity) input.value = ''
+    }
   }
 
   for (const el of document.querySelectorAll('input[name="ssid_hex"]')) {
