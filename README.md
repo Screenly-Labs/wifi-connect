@@ -377,6 +377,7 @@ wifi-connect --state-file /data/hotspot/state.json
   "qr_payload": "WIFI:T:WPA;S:Anthias Setup-G4VV;P:brave-plum-42;H:false;;",
   "portal_url": "http://192.168.42.1:8000/",
   "gateway": "192.168.42.1",
+  "interface": "wlan0",
   "port": 8000,
   "started_at_unix": 1761048000,
   "heartbeat_unix": 1761048345,
@@ -409,6 +410,16 @@ Notes for consumers:
 - `qr_payload` is the same string the QR encodes, so you can render the
   code at whatever size your screen wants without re-deriving the
   `WIFI:` escaping rules.
+- **Do not hardcode the setup address.** `--portal-gateway` is
+  configurable; `gateway` and `port` in this file are the authority for
+  where the portal actually is.
+- **Match on `gateway` *and* `interface` when identifying the portal's
+  address among the host's own.** A host application that lists "you can
+  reach this device at ..." has to leave the setup address out of it,
+  and the number alone is ambiguous — `192.168.42.1` is an ordinary LAN
+  address too, and a device whose ethernet happens to hold it would
+  otherwise hide its real address from its own operator. `interface` is
+  the device the portal is on, resolved rather than taken from the flag.
 - Parse leniently: new fields may appear without `schema` changing. It
   is bumped only when a field is removed or changes meaning.
 - **Check the heartbeat, not just the file.** `heartbeat_unix` is

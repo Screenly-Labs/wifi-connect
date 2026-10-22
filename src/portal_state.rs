@@ -102,7 +102,22 @@ pub struct PortalState {
     /// Where the portal answers, for the "or open this address" line that
     /// every setup screen ends up needing.
     pub portal_url: String,
+    /// The address the portal is reachable on, which is `--portal-gateway`
+    /// — configurable, so a consumer that hardcodes the default will be
+    /// wrong on any deployment that moved it.
     pub gateway: String,
+    /// The interface that address is on.
+    ///
+    /// Published because `gateway` alone does not identify the portal.
+    /// A host application showing "you can reach this device at ..."
+    /// has to drop the setup address from that list, and an address
+    /// matched by number alone is ambiguous: 192.168.42.1 is also a
+    /// perfectly ordinary LAN address, and a device whose own ethernet
+    /// holds it would hide its real address from its own operator. The
+    /// pair is unambiguous, because this is the device the portal is
+    /// actually on — auto-detected or `--portal-interface`, resolved,
+    /// not the flag's raw value.
+    pub interface: String,
     pub port: u16,
     /// Unix seconds, fixed for the run.
     pub started_at_unix: u64,
@@ -129,6 +144,7 @@ impl PortalState {
         passphrase: Option<&Secret>,
         portal_url: String,
         gateway: std::net::Ipv4Addr,
+        interface: &str,
         port: u16,
     ) -> Self {
         let (security, secret, payload) = match passphrase {
@@ -149,6 +165,7 @@ impl PortalState {
             qr_payload: payload,
             portal_url,
             gateway: gateway.to_string(),
+            interface: interface.to_owned(),
             port,
             started_at_unix: now_unix(),
             heartbeat_unix: now_unix(),
@@ -304,6 +321,7 @@ mod tests {
             Some(&Secret::new("brave-plum-42")),
             "http://192.168.42.1:8000/".to_owned(),
             Ipv4Addr::new(192, 168, 42, 1),
+            "wlan0",
             8000,
         )
     }
@@ -329,6 +347,7 @@ mod tests {
         assert_eq!(v["passphrase"], "brave-plum-42");
         assert_eq!(v["portal_url"], "http://192.168.42.1:8000/");
         assert_eq!(v["gateway"], "192.168.42.1");
+        assert_eq!(v["interface"], "wlan0");
         assert_eq!(v["port"], 8000);
         assert!(v["started_at_unix"].as_u64().unwrap() > 1_700_000_000);
         assert_eq!(v["heartbeat_unix"], v["started_at_unix"]);
@@ -342,6 +361,31 @@ mod tests {
         );
 
         drop(guard);
+    }
+
+    /// A deployment that moved the portal off the default address must
+    /// not be described with the default. The whole point of publishing
+    /// these is that a consumer never has to assume them.
+    #[test]
+    fn a_relocated_portal_reports_where_it_actually_is() {
+        let dir = Scratch::new("relocated");
+        let path = dir.join("state.json");
+
+        let _guard = PortalState::new(
+            &Ssid::from("Anthias Setup-G4VV"),
+            Some(&Secret::new("brave-plum-42")),
+            "http://10.77.0.1:9000/".to_owned(),
+            Ipv4Addr::new(10, 77, 0, 1),
+            "wlan1",
+            9000,
+        )
+        .publish(&path);
+
+        let v = read_json(&path);
+        assert_eq!(v["gateway"], "10.77.0.1");
+        assert_eq!(v["interface"], "wlan1");
+        assert_eq!(v["port"], 9000);
+        assert_eq!(v["portal_url"], "http://10.77.0.1:9000/");
     }
 
     /// The SSID written is the one on the air, suffix and all — a consumer
@@ -358,6 +402,7 @@ mod tests {
             Some(&Secret::new("x".repeat(14))),
             "http://192.168.42.1:8000/".to_owned(),
             Ipv4Addr::new(192, 168, 42, 1),
+            "wlan0",
             8000,
         )
         .publish(&path);
@@ -380,6 +425,7 @@ mod tests {
             None,
             "http://192.168.42.1:8000/".to_owned(),
             Ipv4Addr::new(192, 168, 42, 1),
+            "wlan0",
             8000,
         )
         .publish(&path);

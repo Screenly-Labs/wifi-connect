@@ -333,6 +333,11 @@ async fn run() -> ExitCode {
                 passphrase.as_ref(),
                 args.portal_url(),
                 args.portal_gateway,
+                // The device preflight actually resolved, not the flag:
+                // with --portal-interface unset this is the auto-detected
+                // radio, and a consumer disambiguating addresses needs the
+                // real name.
+                &device.interface,
                 args.portal_listening_port,
             )
             .publish(path)
