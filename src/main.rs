@@ -180,16 +180,29 @@ async fn run() -> ExitCode {
     // would pass every boot on the bench and surface only in the field, on
     // the day the WiFi goes and the portal it breaks is the way back.
     //
-    // Read eagerly. A mistyped --brand-css should stop the portal here,
-    // with the path in the message, rather than quietly serving an
-    // unbranded page that looks like the flag was ignored.
+    // Read eagerly. A mistyped --brand-css is reported here,
+    // Loudly, with the path in the message, rather than quietly serving
+    // an unbranded page that looks like the flag was ignored -- but NOT
+    // fatally. These are cosmetics, and the page they decorate is the
+    // only way a stranded device gets back onto a network. Refusing to
+    // start over a missing stylesheet would mean an integrator that
+    // stages its branding on a shared volume races its own portal: the
+    // file arrives a second late and the device stays offline until
+    // someone drives to it.
+    //
+    // An operator who passed the flag still finds out, at WARN, on the
+    // first line that matters.
     let brand_css = match &args.brand_css {
         None => None,
         Some(path) => match std::fs::read_to_string(path) {
             Ok(css) => Some(std::sync::Arc::from(css.as_str())),
             Err(e) => {
-                error!(error = %e, path = %path.display(), "could not read --brand-css");
-                return ExitCode::from(2);
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not read --brand-css; serving the portal unbranded"
+                );
+                None
             }
         },
     };
@@ -199,8 +212,12 @@ async fn run() -> ExitCode {
         Some(path) => match read_brand_logo(path) {
             Ok(logo) => Some(logo),
             Err(e) => {
-                error!(error = %e, path = %path.display(), "could not read --brand-logo");
-                return ExitCode::from(2);
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not read --brand-logo; serving the portal without it"
+                );
+                None
             }
         },
     };
