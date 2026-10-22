@@ -136,6 +136,8 @@ Every flag has an environment variable. Flags win.
 | `--portal-ssid` | `-s` | `PORTAL_SSID` | `WiFi Connect` |
 | `--portal-ssid-suffix` | | `PORTAL_SSID_SUFFIX` | `4` |
 | `--state-file` | | `WIFI_CONNECT_STATE_FILE` | |
+| `--recheck-interval` | | `WIFI_CONNECT_RECHECK_INTERVAL` | `0` |
+| `--retry-after` | | `WIFI_CONNECT_RETRY_AFTER` | `--recheck-interval` |
 | `--portal-passphrase` | `-p` | `PORTAL_PASSPHRASE` | *generated per run* |
 | `--portal-security` | | `WIFI_CONNECT_PORTAL_SECURITY` | `auto` |
 | `--portal-gateway` | `-g` | `PORTAL_GATEWAY` | `192.168.42.1` |
@@ -378,6 +380,49 @@ through it.
 
 `--force` raises the portal regardless, for deliberately reconfiguring
 a device that is online.
+
+## Running without an init system
+
+This daemon does one pass and exits — the right shape when a systemd
+timer, a cron entry or a supervisor decides when it runs. On a platform
+that has none of those, the container runtime's restart policy is the
+only scheduler available, and it has no notion of "in five minutes": it
+restarts as soon as the process is gone.
+
+So `restart: always` plus an immediate exit is a spin. Measured on a
+wired Raspberry Pi 5, where the daemon correctly decides within twenty
+seconds that it is not needed:
+
+```
+13 container starts in 240 seconds  ->  4,680 per device per day
+53 log lines in 240 seconds         ->  19,000 per device per day
+```
+
+Forever, on every healthy screen, which on a fleet with cloud log
+shipping is a bill as well as a nuisance.
+
+`--recheck-interval` fixes that without any new machinery: the daemon
+waits before exiting, so the restart policy becomes a schedule. The
+exit is still clean, it just happens later.
+
+```bash
+wifi-connect --recheck-interval 300 --retry-after 21600
+```
+
+- **`--recheck-interval`** — how long to wait once the device is online.
+  Five minutes is a reasonable screen refresh; the check costs one
+  D-Bus round trip.
+- **`--retry-after`** — how long to wait after a portal session nobody
+  completed. Longer, because that session just held the display for a
+  quarter of an hour: an unjoinable site with a five-minute retry never
+  shows content again.
+
+Both default to 0, which exits immediately — keep it that way wherever
+something else owns the schedule, or the next tick will land while the
+last run is still waiting.
+
+`SIGTERM` cuts the wait short, so a release apply or a reboot never has
+to sit out a six-hour window.
 
 ## When the portal stands down
 
