@@ -98,6 +98,9 @@ pub struct FakeNm {
     /// Whether some interface other than the radio is up -- a wired
     /// link, a second radio, a modem.
     pub another_device_online: bool,
+    /// Whether NetworkManager's verdict is a measurement. Defaults to
+    /// true so existing tests keep asserting what they always did.
+    pub connectivity_is_measured: bool,
     pub station_activated: bool,
     pub saved_profiles: usize,
     pub autoconnect_succeeds: bool,
@@ -125,6 +128,7 @@ impl FakeNm {
             },
             connectivity: Connectivity::None,
             another_device_online: false,
+            connectivity_is_measured: true,
             station_activated: false,
             saved_profiles: 0,
             autoconnect_succeeds: false,
@@ -164,6 +168,11 @@ impl FakeNm {
     /// Script the outcome of each successive join attempt, in order.
     pub fn with_join_results(self, results: Vec<JoinOutcome>) -> Self {
         self.state.lock().unwrap().join_results = results;
+        self
+    }
+
+    pub fn with_connectivity_measured(mut self, measured: bool) -> Self {
+        self.connectivity_is_measured = measured;
         self
     }
 
@@ -240,6 +249,10 @@ impl NetworkControl for FakeNm {
     async fn station_activated(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {
         self.record(Call::StationActivated);
         Ok(self.station_activated)
+    }
+
+    async fn connectivity_is_measured(&self) -> Result<bool, NetworkError> {
+        Ok(self.connectivity_is_measured)
     }
 
     async fn another_device_online(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {

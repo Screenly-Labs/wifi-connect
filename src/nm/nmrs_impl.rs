@@ -755,6 +755,26 @@ impl NetworkControl for NmrsControl {
         Ok(activated)
     }
 
+    async fn connectivity_is_measured(&self) -> Result<bool, NetworkError> {
+        // Best-effort, and false on any failure: that falls through to
+        // the device checks, which look at what is actually up rather
+        // than at anyone's opinion of it.
+        let root = match NetworkManagerRootProxy::builder(self.bus()).build().await {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, "could not reach NetworkManager for ConnectivityCheckAvailable");
+                return Ok(false);
+            }
+        };
+        Ok(root
+            .connectivity_check_available()
+            .await
+            .unwrap_or_else(|e| {
+                debug!(error = %e, "could not read ConnectivityCheckAvailable");
+                false
+            }))
+    }
+
     async fn another_device_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
         // Best-effort, like station_activated: every failed read answers
         // "no other network", which is the behaviour from before this

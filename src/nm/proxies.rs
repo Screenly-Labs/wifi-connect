@@ -81,6 +81,15 @@ pub trait Device {
 )]
 pub trait NetworkManagerRoot {
     fn get_devices(&self) -> zbus::Result<Vec<zbus::zvariant::OwnedObjectPath>>;
+
+    /// Whether NetworkManager was built with connectivity checking at all.
+    ///
+    /// When this is false, `Connectivity` is not a measurement — it is
+    /// NetworkManager's guess from the routing table, and it is
+    /// confident about it. Measured on balenaOS: `full` with a cable in,
+    /// `limited` with it out, with no probe behind either.
+    #[zbus(property)]
+    fn connectivity_check_available(&self) -> zbus::Result<bool>;
 }
 
 /// The device types that count as "this host has a network".

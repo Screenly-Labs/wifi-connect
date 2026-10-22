@@ -344,7 +344,7 @@ online, and treats three things as "yes, leave it alone":
 
 | | |
 | --- | --- |
-| NetworkManager reports full connectivity | the probe ran and passed |
+| NetworkManager reports full connectivity, *and a probe actually ran* | measured, so it stands |
 | The radio is already an associated station | raising the AP would replace that very connection |
 | Another interface is up — wired, a second radio, a modem | the device has a network; taking the radio down to offer it one is backwards |
 
@@ -360,6 +360,14 @@ any platform with no init system to gate it with. On balenaOS the
 supervisor starts every service in the compose file on every boot and
 every release apply, and there is no `ExecCondition` to hang a
 host-side gate on; the decision has to be sound from in here.
+
+A verdict only counts when `ConnectivityCheckAvailable` is true. Where
+it is false NetworkManager still answers — confidently — from the
+routing table: measured on balenaOS, `full` with a cable in and
+`limited` with it out, having probed nothing. Taking `limited` at face
+value there raises an access point at a wired screen on an isolated
+LAN, so an unmeasured verdict of any kind falls through to the device
+checks above.
 
 Deliberately *not* consulted: NetworkManager's global `State`. With
 checking disabled it reads `CONNECTED_GLOBAL` for any link with a
