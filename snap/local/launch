@@ -42,5 +42,7 @@ pass brand-logo WIFI_CONNECT_BRAND_LOGO
 pass default-theme WIFI_CONNECT_DEFAULT_THEME
 pass log-format WIFI_CONNECT_LOG_FORMAT
 pass log-level WIFI_CONNECT_LOG_LEVEL
+pass no-sentry WIFI_CONNECT_NO_SENTRY
+pass sentry-dsn WIFI_CONNECT_SENTRY_DSN
 
 exec "${SNAP}/bin/wifi-connect" "$@"
