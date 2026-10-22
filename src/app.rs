@@ -471,19 +471,74 @@ mod tests {
         );
     }
 
-    /// The fallback must not swallow the case the portal exists for. This
-    /// also covers a device online only over ethernet: with checking
-    /// disabled nothing distinguishes a LAN with internet from one without,
-    /// so the portal comes up as it always did.
+    /// The fallback must not swallow the case the portal exists for: no
+    /// station, no other interface, nothing to join — raise it.
     #[tokio::test(start_paused = true)]
-    async fn unknown_connectivity_without_a_connected_station_raises_the_portal() {
+    async fn unknown_connectivity_with_nothing_up_at_all_raises_the_portal() {
         let nm = FakeNm::new()
             .with_connectivity(Connectivity::Unknown)
             .with_saved_profiles(0)
-            .with_station_activated(false);
+            .with_station_activated(false)
+            .with_another_device_online(false);
 
         assert!(preflight(&nm, &config()).await.unwrap().is_some());
         assert!(nm.calls().contains(&Call::StationActivated));
+    }
+
+    /// A wired screen. It never associates, so the station check says no
+    /// forever, and raising the access point would tear the radio down to
+    /// offer to configure a network the device is plainly already on.
+    ///
+    /// This is also what makes the daemon safe to run on a platform with
+    /// no init system to gate it: whatever starts it there starts it on
+    /// every boot and every deploy, so the decision has to be sound from
+    /// inside. Anthias on balenaOS is the case in hand -- the supervisor
+    /// starts every service in the compose file, with no ExecCondition to
+    /// hang a host-side gate on.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_connectivity_on_a_wired_device_does_not_raise_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_saved_profiles(0)
+            .with_station_activated(false)
+            .with_another_device_online(true);
+
+        assert!(
+            preflight(&nm, &config()).await.unwrap().is_none(),
+            "raised an access point on a device that already has a network"
+        );
+    }
+
+    /// ...and --force is still the way to reconfigure one deliberately.
+    #[tokio::test(start_paused = true)]
+    async fn force_still_raises_the_portal_on_a_wired_device() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_station_activated(false)
+            .with_another_device_online(true);
+
+        let mut cfg = config();
+        cfg.force = true;
+
+        assert!(preflight(&nm, &cfg).await.unwrap().is_some());
+    }
+
+    /// A definite verdict from NetworkManager still wins. `Limited` means
+    /// the probe ran and failed, so the user may well need the portal to
+    /// pick a different network -- an interface being up is not a reason
+    /// to refuse them that.
+    #[tokio::test(start_paused = true)]
+    async fn a_definite_offline_verdict_beats_an_interface_being_up() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Limited)
+            .with_saved_profiles(0)
+            .with_another_device_online(true);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_some());
+        assert!(
+            !nm.calls().contains(&Call::AnotherDeviceOnline),
+            "asked about other interfaces despite a definite verdict"
+        );
     }
 
     /// Saved profiles, nothing up yet, checking disabled: the autoconnect

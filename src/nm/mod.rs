@@ -315,6 +315,15 @@ pub trait NetworkControl: Send + Sync + 'static {
     /// this fallback existed, and the portal comes up.
     async fn station_activated(&self, device: &DeviceInfo) -> Result<bool, NetworkError>;
 
+    /// Is this host on a network through some interface other than ours?
+    ///
+    /// Asked only when NetworkManager cannot tell us whether we are
+    /// online. A wired screen is the case that matters: it never
+    /// associates, so `station_activated` says no forever, and raising
+    /// an access point on it means tearing down the radio to offer to
+    /// configure a network the device already has.
+    async fn another_device_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError>;
+
     /// The single "are we online?" decision, shared by the startup gate and
     /// the autoconnect wait so the two cannot disagree.
     ///
@@ -323,18 +332,42 @@ pub trait NetworkControl: Send + Sync + 'static {
     /// the radio is associated.
     ///
     /// `Unknown` — no probe ran, usually because checking is disabled —
-    /// counts as online only when the radio is already a connected station.
-    /// That is the one case where raising the access point does damage: it
-    /// would replace that very connection, and with no activity timeout the
-    /// device would never get it back. NetworkManager's global `State` is
-    /// deliberately *not* consulted: with checking disabled it reads
-    /// `CONNECTED_GLOBAL` for any link with a default route, including an
-    /// ethernet LAN with no internet, and trusting it there would stop the
-    /// portal from ever appearing on a device that needs it.
+    /// is where most of this daemon's deployments actually live:
+    /// NetworkManager is built without connectivity-check support on
+    /// Debian and Raspberry Pi OS, so it answers "unknown" forever.
+    ///
+    /// There, two things count as online, and both are about not taking
+    /// away a network the device already has:
+    ///
+    /// * The radio is already a connected station. Raising the access
+    ///   point would replace that very connection, and with no activity
+    ///   timeout the device would never get it back.
+    ///
+    /// * Some other interface is up — a wired link, a second radio, a
+    ///   modem. A wired screen never associates, so the station check
+    ///   alone says "not online" forever, and the portal would tear the
+    ///   radio down to offer to configure a network the device is
+    ///   plainly already on. An integrator cannot paper over this from
+    ///   outside: on a platform with no init system to gate us with,
+    ///   whatever starts this daemon starts it on every boot.
+    ///
+    /// NetworkManager's global `State` is deliberately still *not*
+    /// consulted: with checking disabled it reads `CONNECTED_GLOBAL` for
+    /// any link with a default route, including an ethernet LAN with no
+    /// internet, and trusting it would stop the portal appearing on a
+    /// device that needs it. The device-level questions above are
+    /// narrower on purpose — they ask whether an interface is up, not
+    /// whether the internet is reachable through it.
+    ///
+    /// `--force` is the escape hatch for deliberately reconfiguring a
+    /// device that is online.
     async fn is_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
         match self.check_connectivity().await? {
             Connectivity::Full => Ok(true),
-            Connectivity::Unknown => self.station_activated(device).await,
+            Connectivity::Unknown => {
+                Ok(self.station_activated(device).await?
+                    || self.another_device_online(device).await?)
+            }
             Connectivity::Limited | Connectivity::None => Ok(false),
         }
     }
