@@ -336,6 +336,41 @@ wifi-connect --ui-directory /etc/wifi-connect/ui
   blocks both, so both are logged as a warning at startup. Inline event
   handlers (`onclick="…"`) and `style="…"` attributes are blocked too.
 
+## When the portal comes up
+
+The portal is for a device with no network. Before raising an access
+point, wifi-connect asks NetworkManager whether this host is already
+online, and treats three things as "yes, leave it alone":
+
+| | |
+| --- | --- |
+| NetworkManager reports full connectivity | the probe ran and passed |
+| The radio is already an associated station | raising the AP would replace that very connection |
+| Another interface is up — wired, a second radio, a modem | the device has a network; taking the radio down to offer it one is backwards |
+
+The last two matter because **connectivity checking is unavailable on
+most of the platforms this runs on**: Debian and Raspberry Pi OS build
+NetworkManager without it, so it answers "unknown" forever and the
+probe tells you nothing. A wired screen never associates, so without
+the interface check it would be offered WiFi setup on every single
+start, for as long as it is deployed.
+
+That makes the daemon safe to start unconditionally — which matters on
+any platform with no init system to gate it with. On balenaOS the
+supervisor starts every service in the compose file on every boot and
+every release apply, and there is no `ExecCondition` to hang a
+host-side gate on; the decision has to be sound from in here.
+
+Deliberately *not* consulted: NetworkManager's global `State`. With
+checking disabled it reads `CONNECTED_GLOBAL` for any link with a
+default route, including an airgapped LAN, so trusting it would stop
+the portal appearing on a device that needs it. The checks above ask
+whether an interface is **up**, not whether the internet is reachable
+through it.
+
+`--force` raises the portal regardless, for deliberately reconfiguring
+a device that is online.
+
 ## When the portal stands down
 
 `--activity-timeout` is an **idle** timeout, not a cap on the session.
