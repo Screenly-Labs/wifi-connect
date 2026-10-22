@@ -332,9 +332,24 @@ async fn run() -> ExitCode {
 
     // Decide whether the portal is needed at all before binding a socket.
     let device = match app::preflight(&nm, &run_config).await {
-        Ok(None) => return ExitCode::from(0),
+        Ok(None) => {
+            wait_before_exit(
+                args.wait_before_exit(cli::ExitKind::Online),
+                "already online",
+            )
+            .await;
+            return ExitCode::from(0);
+        }
         Ok(Some(d)) => d,
-        Err(e) => return ExitCode::from(app::report(&Err(e)) as u8),
+        Err(e) => {
+            let code = app::report(&Err(e)) as u8;
+            wait_before_exit(
+                args.wait_before_exit(cli::ExitKind::Unproductive),
+                "the portal could not start",
+            )
+            .await;
+            return ExitCode::from(code);
+        }
     };
 
     // The portal is going to come up: preflight said so, and the file is
@@ -498,7 +513,60 @@ async fn run() -> ExitCode {
         _ => result,
     };
 
-    ExitCode::from(app::report(&result) as u8)
+    let code = app::report(&result) as u8;
+
+    // A session that got the device online is the good ending and is
+    // re-checked on the online cadence. Anything else held the display
+    // for a quarter of an hour and achieved nothing, and should wait
+    // longer before taking it again.
+    let kind = match &result {
+        Ok(app::Outcome::Online) => cli::ExitKind::Online,
+        _ => cli::ExitKind::Unproductive,
+    };
+    wait_before_exit(args.wait_before_exit(kind), "the portal session ended").await;
+
+    ExitCode::from(code)
+}
+
+/// Wait before exiting, so that a restart policy can be a schedule.
+///
+/// On a platform with no init system the container runtime is the only
+/// scheduler there is, and its restart policy has no notion of "in five
+/// minutes" — it restarts as soon as the process is gone. A daemon that
+/// exits the instant it finds the device online therefore spins:
+/// measured on a wired Pi 5 under `restart: always`, a container start
+/// every eighteen seconds, 4,680 a day, for the life of a healthy
+/// screen.
+///
+/// Waiting here turns the same loop into a periodic check. The exit is
+/// still a clean one — it just happens later.
+///
+/// SIGTERM cuts the wait short, because a release apply or a reboot
+/// should not have to wait out a six-hour retry window.
+async fn wait_before_exit(duration: std::time::Duration, why: &str) {
+    if duration.is_zero() {
+        return;
+    }
+
+    info!(
+        seconds = duration.as_secs(),
+        reason = why,
+        "waiting before exit, so a restart policy can act as a schedule"
+    );
+
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    tokio::select! {
+        () = tokio::time::sleep(duration) => {}
+        _ = tokio::signal::ctrl_c() => info!("interrupted while waiting"),
+        _ = async {
+            match term.as_mut() {
+                Some(signal) => {
+                    signal.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => info!("terminated while waiting"),
+    }
 }
 
 /// The largest logo worth serving over a setup hotspot.
