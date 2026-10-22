@@ -324,6 +324,14 @@ pub trait NetworkControl: Send + Sync + 'static {
     /// configure a network the device already has.
     async fn another_device_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError>;
 
+    /// Is NetworkManager's connectivity verdict a measurement at all?
+    ///
+    /// False where NetworkManager was built without connectivity
+    /// checking, or has no check URI configured — which is most places
+    /// this runs. There, `Connectivity` is a guess from the routing
+    /// table rather than a probe result.
+    async fn connectivity_is_measured(&self) -> Result<bool, NetworkError>;
+
     /// The single "are we online?" decision, shared by the startup gate and
     /// the autoconnect wait so the two cannot disagree.
     ///
@@ -362,14 +370,24 @@ pub trait NetworkControl: Send + Sync + 'static {
     /// `--force` is the escape hatch for deliberately reconfiguring a
     /// device that is online.
     async fn is_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
-        match self.check_connectivity().await? {
-            Connectivity::Full => Ok(true),
-            Connectivity::Unknown => {
-                Ok(self.station_activated(device).await?
-                    || self.another_device_online(device).await?)
+        let verdict = self.check_connectivity().await?;
+
+        // A verdict is only a verdict if something measured it. Where
+        // connectivity checking is unavailable NetworkManager still
+        // answers, confidently, from the routing table — on balenaOS it
+        // says `full` with a cable in and `limited` with it out, having
+        // probed nothing. Taking `limited` at face value there raises an
+        // access point at a wired screen on an isolated LAN: a network
+        // the operator chose, and a screen that was working.
+        if self.connectivity_is_measured().await? {
+            match verdict {
+                Connectivity::Full => return Ok(true),
+                Connectivity::Limited | Connectivity::None => return Ok(false),
+                Connectivity::Unknown => {}
             }
-            Connectivity::Limited | Connectivity::None => Ok(false),
         }
+
+        Ok(self.station_activated(device).await? || self.another_device_online(device).await?)
     }
 
     /// How many WiFi profiles are already saved.

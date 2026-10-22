@@ -523,6 +523,62 @@ mod tests {
         assert!(preflight(&nm, &cfg).await.unwrap().is_some());
     }
 
+    /// The case a colleague found on balenaOS: NetworkManager has no
+    /// connectivity check configured, so it GUESSES from the routing
+    /// table — `full` with a cable in, `limited` with it out — and
+    /// sounds just as certain either way.
+    ///
+    /// A wired screen on an isolated LAN, with no default route, is
+    /// guessed `limited`. Treating that as a measurement raises an
+    /// access point at a working screen on a network the operator
+    /// chose, and on a platform with no init system there is nothing
+    /// outside this process to overrule it.
+    #[tokio::test(start_paused = true)]
+    async fn a_guessed_limited_verdict_does_not_override_a_live_interface() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Limited)
+            .with_connectivity_measured(false)
+            .with_saved_profiles(0)
+            .with_station_activated(false)
+            .with_another_device_online(true);
+
+        assert!(
+            preflight(&nm, &config()).await.unwrap().is_none(),
+            "raised an access point on a guess"
+        );
+    }
+
+    /// ...and the same guess with nothing actually up still raises it.
+    #[tokio::test(start_paused = true)]
+    async fn a_guessed_verdict_with_nothing_up_still_raises_the_portal() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Limited)
+            .with_connectivity_measured(false)
+            .with_saved_profiles(0)
+            .with_station_activated(false)
+            .with_another_device_online(false);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_some());
+    }
+
+    /// A guessed `full` is not evidence either. It happens to agree
+    /// with the device checks on a wired box, but the device checks are
+    /// what should decide it.
+    #[tokio::test(start_paused = true)]
+    async fn a_guessed_full_verdict_is_checked_against_the_devices() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Full)
+            .with_connectivity_measured(false)
+            .with_saved_profiles(0)
+            .with_station_activated(false)
+            .with_another_device_online(false);
+
+        assert!(
+            preflight(&nm, &config()).await.unwrap().is_some(),
+            "trusted a guessed `full` on a device with nothing up"
+        );
+    }
+
     /// A definite verdict from NetworkManager still wins. `Limited` means
     /// the probe ran and failed, so the user may well need the portal to
     /// pick a different network -- an interface being up is not a reason
