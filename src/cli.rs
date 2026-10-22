@@ -286,7 +286,29 @@ pub struct Cli {
     /// Log level. `RUST_LOG` overrides this when set.
     #[arg(long, env = "WIFI_CONNECT_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
+
+    /// Turn off crash and error reporting to Sentry.
+    ///
+    /// On by default: panics and ERROR log lines are reported, with WARN
+    /// lines as context. INFO and below, where `--log-passphrase` writes,
+    /// are never sent.
+    #[arg(long, env = "WIFI_CONNECT_NO_SENTRY", default_value_t = false)]
+    pub no_sentry: bool,
+
+    /// Sentry DSN to report to, for a fork or a self-hosted Sentry.
+    #[arg(
+        long,
+        env = "WIFI_CONNECT_SENTRY_DSN",
+        default_value = DEFAULT_SENTRY_DSN,
+        hide_default_value = true
+    )]
+    pub sentry_dsn: String,
 }
+
+/// Where this project's own builds report.
+///
+/// A DSN is a write-only ingestion key, meant to ship inside the client.
+pub const DEFAULT_SENTRY_DSN: &str = "https://dccda39f7888b5d1c3c5974d9ad3ba3f@o4512299107287040.ingest.us.sentry.io/4512299111088128";
 
 /// A DHCP pool, parsed from `first,last`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +341,8 @@ pub enum ConfigError {
     SsidLength(usize),
     #[error("--portal-passphrase: {0}")]
     Passphrase(String),
+    #[error("--sentry-dsn: {0}")]
+    SentryDsn(String),
 }
 
 /// The access point is always configured as a /24 on the gateway (the NM
@@ -450,7 +474,22 @@ impl Cli {
         if let Some(p) = &self.portal_passphrase {
             crate::passphrase::validate(p).map_err(|e| ConfigError::Passphrase(e.to_string()))?;
         }
+        self.sentry_dsn()?;
         parse_dhcp_range(&self.portal_dhcp_range, self.portal_gateway)
+    }
+
+    /// The DSN to report to, or `None` when reporting is off.
+    ///
+    /// An empty `--sentry-dsn` also turns it off, which is what an
+    /// integrator reaching for "unset the DSN" will try first.
+    pub fn sentry_dsn(&self) -> Result<Option<sentry::types::Dsn>, ConfigError> {
+        if self.no_sentry || self.sentry_dsn.is_empty() {
+            return Ok(None);
+        }
+        self.sentry_dsn
+            .parse()
+            .map(Some)
+            .map_err(|e: sentry::types::ParseDsnError| ConfigError::SentryDsn(e.to_string()))
     }
 
     pub fn portal_url(&self) -> String {
@@ -774,6 +813,33 @@ mod tests {
         assert_eq!(
             cli(&["--state-file", "/data/hotspot/state.json"]).state_file,
             Some(std::path::PathBuf::from("/data/hotspot/state.json"))
+        );
+    }
+
+    #[test]
+    fn sentry_is_on_by_default_and_can_be_turned_off() {
+        assert!(cli(&[]).sentry_dsn().unwrap().is_some());
+        assert_eq!(cli(&["--no-sentry"]).sentry_dsn(), Ok(None));
+        assert_eq!(cli(&["--sentry-dsn", ""]).sentry_dsn(), Ok(None));
+        // Off wins over a DSN, so a fleet-wide opt-out cannot be undone by
+        // a DSN set somewhere else.
+        assert_eq!(
+            cli(&["--no-sentry", "--sentry-dsn", "https://key@example.com/1"]).sentry_dsn(),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_malformed_sentry_dsn_is_rejected_at_startup() {
+        let c = cli(&["--sentry-dsn", "not a dsn"]);
+        assert!(matches!(c.sentry_dsn(), Err(ConfigError::SentryDsn(_))));
+        assert!(matches!(c.validate(), Err(ConfigError::SentryDsn(_))));
+        assert_eq!(
+            cli(&["--sentry-dsn", "https://key@example.com/1"])
+                .sentry_dsn()
+                .unwrap()
+                .map(|d| d.host().to_string()),
+            Some("example.com".to_string())
         );
     }
 

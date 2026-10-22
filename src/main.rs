@@ -25,6 +25,7 @@ mod sockets;
 mod ssid;
 mod state;
 mod static_ip;
+mod telemetry;
 
 use std::io::IsTerminal;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -32,7 +33,9 @@ use std::process::ExitCode;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 use cli::{Cli, LogFormat};
 use nm::nmrs_impl::{EapServerCheck, NmrsControl};
@@ -47,15 +50,21 @@ fn init_logging(args: &Cli) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(args.log_level.clone()));
 
-    let builder = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt = tracing_subscriber::fmt::layer()
         // Colour escapes in journald or a balena log stream are noise.
         .with_ansi(std::io::stdout().is_terminal());
+    let fmt = match args.log_format {
+        LogFormat::Json => fmt.json().boxed(),
+        LogFormat::Text => fmt.boxed(),
+    };
 
-    match args.log_format {
-        LogFormat::Json => builder.json().init(),
-        LogFormat::Text => builder.init(),
-    }
+    // The filter applies to both layers: what is not logged is not
+    // reported either.
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt)
+        .with(telemetry::layer())
+        .init();
 }
 
 /// Publish the join QR: to disk for the host application to display, and to
@@ -162,18 +171,7 @@ fn broadcast_for(gateway: Ipv4Addr) -> Ipv4Addr {
     Ipv4Addr::new(o[0], o[1], o[2], 255)
 }
 
-async fn run() -> ExitCode {
-    let args = Cli::parse_with_legacy_env();
-    init_logging(&args);
-
-    let dhcp_range = match args.validate() {
-        Ok(r) => r,
-        Err(e) => {
-            error!("{e}");
-            return ExitCode::from(2);
-        }
-    };
-
+async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
     // The files the portal serves are read here, with the flags, and not
     // after preflight decides whether a portal is needed: on a device that
     // is already online preflight exits 0, so a typo checked any later
@@ -536,11 +534,39 @@ fn read_brand_logo(path: &std::path::Path) -> std::io::Result<state::BrandLogo> 
     })
 }
 
-// current_thread: there is no CPU work in this program, and one thread
-// keeps resident memory down on a Pi Zero-class board.
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> ExitCode {
-    run().await
+fn main() -> ExitCode {
+    let args = Cli::parse_with_legacy_env();
+    init_logging(&args);
+
+    let dhcp_range = match args.validate() {
+        Ok(r) => r,
+        Err(e) => {
+            error!("{e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Before the runtime, so that every thread it starts inherits the
+    // client. Dropped at the end of main, which is what flushes an error
+    // reported on the way out.
+    let sentry_guard = telemetry::init(&args);
+    if sentry_guard.is_none() {
+        info!("error reporting is off");
+    }
+
+    // current_thread: there is no CPU work in this program, and one thread
+    // keeps resident memory down on a Pi Zero-class board.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!(error = %e, "could not start the async runtime");
+            return ExitCode::from(1);
+        }
+    };
+    runtime.block_on(run(args, dhcp_range))
 }
 
 #[cfg(test)]

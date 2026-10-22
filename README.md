@@ -155,6 +155,8 @@ Every flag has an environment variable. Flags win.
 | `--connection-timeout` | | `WIFI_CONNECT_CONNECTION_TIMEOUT` | `45` |
 | `--wait-for-connection` | | `WIFI_CONNECT_WAIT_FOR_CONNECTION` | `60` |
 | `--insecure-eap-skip-server-verification` | | `WIFI_CONNECT_INSECURE_EAP` | `false` |
+| `--no-sentry` | | `WIFI_CONNECT_NO_SENTRY` | `false` (see [Error reporting](#error-reporting)) |
+| `--sentry-dsn` | | `WIFI_CONNECT_SENTRY_DSN` | this project's DSN |
 
 `--portal-security` takes `auto`, `wpa2` or `wpa3`. `auto` is currently
 WPA2-PSK (CCMP), identical to `wpa2`; the name is reserved for picking the
@@ -487,6 +489,39 @@ failed unit.
 | 5 | NetworkManager is unreachable over the bus | yes |
 | 6 | the activity timeout elapsed with no join | no — the ordinary "nobody came" ending |
 | 7 | the portal could not bind its address or port | yes — it will recur until something changes |
+
+## Error reporting
+
+Panics and errors are reported to Sentry, because a portal that fails
+does so on a device nobody is watching. It is on by default. To turn it
+off, pass `--no-sentry` or set any one of these:
+
+- `WIFI_CONNECT_NO_SENTRY=true` in the environment, `/etc/default/wifi-connect`
+  or the container's `environment:`;
+- `sudo snap set wifi-connect no-sentry=true` on Ubuntu Core.
+
+An empty `--sentry-dsn` turns it off too. A different DSN sends the reports
+to your own Sentry instead.
+
+What is sent:
+
+- a panic, with its message and source location;
+- each `ERROR` log line, as an event;
+- the `WARN` lines before it, as breadcrumbs;
+- the release version, plus the OS, kernel and hostname Sentry collects
+  from the device.
+
+A run with no panic and no error sends nothing: there are no sessions,
+traces or heartbeats. `INFO` and lower are never sent, at any `--log-level`. That is the level
+`--log-passphrase` writes at. The setup passphrase is redacted from every
+log line, and so from every report. Some error and warning lines name the
+network the user tried to join. `send_default_pii` is off.
+
+Reports go to the device's uplink over HTTPS. The release binary includes
+its own TLS stack and root certificates (rustls with ring, and the Mozilla
+root store), so the `FROM scratch` image still needs no CA bundle. A device
+with no uplink cannot send anything. On the way out it waits up to two
+seconds for queued reports to send, and then exits.
 
 ## Requirements and limitations
 

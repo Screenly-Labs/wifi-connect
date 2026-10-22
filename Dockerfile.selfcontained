@@ -10,8 +10,9 @@
 # today. The tag is kept for readability; bump both together.
 FROM rust:1.99-alpine@sha256:557a94c82b485a14b569120e00867267108c734efe33f10cc31ca0cd5dd1eca9 AS builder
 
-# musl-dev provides the libc headers the linker wants; there is no C in the
-# dependency tree, but the linker driver still needs a sysroot.
+# musl-dev provides the libc headers the linker wants and the headers ring
+# (rustls's crypto, for error reporting) compiles its C against. The image
+# already has gcc.
 RUN apk add --no-cache musl-dev
 
 WORKDIR /src
