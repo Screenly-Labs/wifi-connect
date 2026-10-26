@@ -25,8 +25,8 @@ use nmrs::{ConnectionError, NetworkManager, WifiSecurity};
 use tracing::{debug, info, warn};
 
 use super::proxies::{
-    DEVICE_STATE_ACTIVATED, DeviceProxy, DeviceWirelessProxy, WIFI_MODE_AP, WIFI_MODE_INFRA,
-    is_device_busy,
+    DEVICE_STATE_ACTIVATED, DeviceProxy, DeviceWirelessProxy, NetworkManagerRootProxy,
+    WIFI_MODE_AP, WIFI_MODE_INFRA, counts_as_online, is_device_busy,
 };
 use super::security;
 use super::settings::{ApProfile, ap_settings, apply_station_ip};
@@ -753,6 +753,80 @@ impl NetworkControl for NmrsControl {
             "connectivity unknown; checking whether the radio is a connected station"
         );
         Ok(activated)
+    }
+
+    async fn connectivity_is_measured(&self) -> Result<bool, NetworkError> {
+        // Best-effort, and false on any failure: that falls through to
+        // the device checks, which look at what is actually up rather
+        // than at anyone's opinion of it.
+        let root = match NetworkManagerRootProxy::builder(self.bus()).build().await {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, "could not reach NetworkManager for ConnectivityCheckAvailable");
+                return Ok(false);
+            }
+        };
+        Ok(root
+            .connectivity_check_available()
+            .await
+            .unwrap_or_else(|e| {
+                debug!(error = %e, "could not read ConnectivityCheckAvailable");
+                false
+            }))
+    }
+
+    async fn another_device_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
+        // Best-effort, like station_activated: every failed read answers
+        // "no other network", which is the behaviour from before this
+        // existed -- the portal comes up.
+        let root = match NetworkManagerRootProxy::builder(self.bus()).build().await {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, "could not reach NetworkManager to list devices");
+                return Ok(false);
+            }
+        };
+        let paths = match root.get_devices().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                debug!(error = %e, "could not list NetworkManager's devices");
+                return Ok(false);
+            }
+        };
+
+        for path in paths {
+            let Ok(builder) = DeviceProxy::builder(self.bus()).path(path) else {
+                continue;
+            };
+            let Ok(proxy) = builder.build().await else {
+                continue;
+            };
+
+            // Our own radio is not evidence that the host has a network:
+            // it is the thing we are about to take over.
+            match proxy.interface().await {
+                Ok(name) if name == device.interface => continue,
+                Ok(_) => {}
+                Err(_) => continue,
+            }
+
+            let managed = proxy.managed().await.unwrap_or(false);
+            let state = proxy.state().await.unwrap_or(0);
+            let device_type = proxy.device_type().await.unwrap_or(0);
+
+            if counts_as_online(device_type, managed, state) {
+                let interface = proxy.interface().await.unwrap_or_default();
+                debug!(
+                    %interface,
+                    device_type,
+                    "connectivity unknown; another interface is up, so the \
+                     portal is not needed"
+                );
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     async fn saved_wifi_profile_count(&self) -> Result<usize, NetworkError> {

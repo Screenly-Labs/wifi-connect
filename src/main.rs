@@ -178,16 +178,29 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
     // would pass every boot on the bench and surface only in the field, on
     // the day the WiFi goes and the portal it breaks is the way back.
     //
-    // Read eagerly. A mistyped --brand-css should stop the portal here,
-    // with the path in the message, rather than quietly serving an
-    // unbranded page that looks like the flag was ignored.
+    // Read eagerly. A mistyped --brand-css is reported here,
+    // Loudly, with the path in the message, rather than quietly serving
+    // an unbranded page that looks like the flag was ignored -- but NOT
+    // fatally. These are cosmetics, and the page they decorate is the
+    // only way a stranded device gets back onto a network. Refusing to
+    // start over a missing stylesheet would mean an integrator that
+    // stages its branding on a shared volume races its own portal: the
+    // file arrives a second late and the device stays offline until
+    // someone drives to it.
+    //
+    // An operator who passed the flag still finds out, at WARN, on the
+    // first line that matters.
     let brand_css = match &args.brand_css {
         None => None,
         Some(path) => match std::fs::read_to_string(path) {
             Ok(css) => Some(std::sync::Arc::from(css.as_str())),
             Err(e) => {
-                error!(error = %e, path = %path.display(), "could not read --brand-css");
-                return ExitCode::from(2);
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not read --brand-css; serving the portal unbranded"
+                );
+                None
             }
         },
     };
@@ -197,8 +210,12 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
         Some(path) => match read_brand_logo(path) {
             Ok(logo) => Some(logo),
             Err(e) => {
-                error!(error = %e, path = %path.display(), "could not read --brand-logo");
-                return ExitCode::from(2);
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "could not read --brand-logo; serving the portal without it"
+                );
+                None
             }
         },
     };
@@ -313,9 +330,24 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
 
     // Decide whether the portal is needed at all before binding a socket.
     let device = match app::preflight(&nm, &run_config).await {
-        Ok(None) => return ExitCode::from(0),
+        Ok(None) => {
+            wait_before_exit(
+                args.wait_before_exit(cli::ExitKind::Online),
+                "already online",
+            )
+            .await;
+            return ExitCode::from(0);
+        }
         Ok(Some(d)) => d,
-        Err(e) => return ExitCode::from(app::report(&Err(e)) as u8),
+        Err(e) => {
+            let code = app::report(&Err(e)) as u8;
+            wait_before_exit(
+                args.wait_before_exit(cli::ExitKind::Unproductive),
+                "the portal could not start",
+            )
+            .await;
+            return ExitCode::from(code);
+        }
     };
 
     // The portal is going to come up: preflight said so, and the file is
@@ -479,7 +511,60 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
         _ => result,
     };
 
-    ExitCode::from(app::report(&result) as u8)
+    let code = app::report(&result) as u8;
+
+    // A session that got the device online is the good ending and is
+    // re-checked on the online cadence. Anything else held the display
+    // for a quarter of an hour and achieved nothing, and should wait
+    // longer before taking it again.
+    let kind = match &result {
+        Ok(app::Outcome::Online) => cli::ExitKind::Online,
+        _ => cli::ExitKind::Unproductive,
+    };
+    wait_before_exit(args.wait_before_exit(kind), "the portal session ended").await;
+
+    ExitCode::from(code)
+}
+
+/// Wait before exiting, so that a restart policy can be a schedule.
+///
+/// On a platform with no init system the container runtime is the only
+/// scheduler there is, and its restart policy has no notion of "in five
+/// minutes" — it restarts as soon as the process is gone. A daemon that
+/// exits the instant it finds the device online therefore spins:
+/// measured on a wired Pi 5 under `restart: always`, a container start
+/// every eighteen seconds, 4,680 a day, for the life of a healthy
+/// screen.
+///
+/// Waiting here turns the same loop into a periodic check. The exit is
+/// still a clean one — it just happens later.
+///
+/// SIGTERM cuts the wait short, because a release apply or a reboot
+/// should not have to wait out a six-hour retry window.
+async fn wait_before_exit(duration: std::time::Duration, why: &str) {
+    if duration.is_zero() {
+        return;
+    }
+
+    info!(
+        seconds = duration.as_secs(),
+        reason = why,
+        "waiting before exit, so a restart policy can act as a schedule"
+    );
+
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    tokio::select! {
+        () = tokio::time::sleep(duration) => {}
+        _ = tokio::signal::ctrl_c() => info!("interrupted while waiting"),
+        _ = async {
+            match term.as_mut() {
+                Some(signal) => {
+                    signal.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => info!("terminated while waiting"),
+    }
 }
 
 /// The largest logo worth serving over a setup hotspot.

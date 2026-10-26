@@ -136,6 +136,8 @@ Every flag has an environment variable. Flags win.
 | `--portal-ssid` | `-s` | `PORTAL_SSID` | `WiFi Connect` |
 | `--portal-ssid-suffix` | | `PORTAL_SSID_SUFFIX` | `4` |
 | `--state-file` | | `WIFI_CONNECT_STATE_FILE` | |
+| `--recheck-interval` | | `WIFI_CONNECT_RECHECK_INTERVAL` | `0` |
+| `--retry-after` | | `WIFI_CONNECT_RETRY_AFTER` | `--recheck-interval` |
 | `--portal-passphrase` | `-p` | `PORTAL_PASSPHRASE` | *generated per run* |
 | `--portal-security` | | `WIFI_CONNECT_PORTAL_SECURITY` | `auto` |
 | `--portal-gateway` | `-g` | `PORTAL_GATEWAY` | `192.168.42.1` |
@@ -337,6 +339,92 @@ wifi-connect --ui-directory /etc/wifi-connect/ui
   `{{TOKEN}}` inside a block changes its bytes per request; the browser
   blocks both, so both are logged as a warning at startup. Inline event
   handlers (`onclick="…"`) and `style="…"` attributes are blocked too.
+
+## When the portal comes up
+
+The portal is for a device with no network. Before raising an access
+point, wifi-connect asks NetworkManager whether this host is already
+online, and treats three things as "yes, leave it alone":
+
+| | |
+| --- | --- |
+| NetworkManager reports full connectivity, *and a probe actually ran* | measured, so it stands |
+| The radio is already an associated station | raising the AP would replace that very connection |
+| Another interface is up — wired, a second radio, a modem | the device has a network; taking the radio down to offer it one is backwards |
+
+The last two matter because **connectivity checking is unavailable on
+most of the platforms this runs on**: Debian and Raspberry Pi OS build
+NetworkManager without it, so it answers "unknown" forever and the
+probe tells you nothing. A wired screen never associates, so without
+the interface check it would be offered WiFi setup on every single
+start, for as long as it is deployed.
+
+That makes the daemon safe to start unconditionally — which matters on
+any platform with no init system to gate it with. On balenaOS the
+supervisor starts every service in the compose file on every boot and
+every release apply, and there is no `ExecCondition` to hang a
+host-side gate on; the decision has to be sound from in here.
+
+A verdict only counts when `ConnectivityCheckAvailable` is true. Where
+it is false NetworkManager still answers — confidently — from the
+routing table: measured on balenaOS, `full` with a cable in and
+`limited` with it out, having probed nothing. Taking `limited` at face
+value there raises an access point at a wired screen on an isolated
+LAN, so an unmeasured verdict of any kind falls through to the device
+checks above.
+
+Deliberately *not* consulted: NetworkManager's global `State`. With
+checking disabled it reads `CONNECTED_GLOBAL` for any link with a
+default route, including an airgapped LAN, so trusting it would stop
+the portal appearing on a device that needs it. The checks above ask
+whether an interface is **up**, not whether the internet is reachable
+through it.
+
+`--force` raises the portal regardless, for deliberately reconfiguring
+a device that is online.
+
+## Running without an init system
+
+This daemon does one pass and exits — the right shape when a systemd
+timer, a cron entry or a supervisor decides when it runs. On a platform
+that has none of those, the container runtime's restart policy is the
+only scheduler available, and it has no notion of "in five minutes": it
+restarts as soon as the process is gone.
+
+So `restart: always` plus an immediate exit is a spin. Measured on a
+wired Raspberry Pi 5, where the daemon correctly decides within twenty
+seconds that it is not needed:
+
+```
+13 container starts in 240 seconds  ->  4,680 per device per day
+53 log lines in 240 seconds         ->  19,000 per device per day
+```
+
+Forever, on every healthy screen, which on a fleet with cloud log
+shipping is a bill as well as a nuisance.
+
+`--recheck-interval` fixes that without any new machinery: the daemon
+waits before exiting, so the restart policy becomes a schedule. The
+exit is still clean, it just happens later.
+
+```bash
+wifi-connect --recheck-interval 300 --retry-after 21600
+```
+
+- **`--recheck-interval`** — how long to wait once the device is online.
+  Five minutes is a reasonable screen refresh; the check costs one
+  D-Bus round trip.
+- **`--retry-after`** — how long to wait after a portal session nobody
+  completed. Longer, because that session just held the display for a
+  quarter of an hour: an unjoinable site with a five-minute retry never
+  shows content again.
+
+Both default to 0, which exits immediately — keep it that way wherever
+something else owns the schedule, or the next tick will land while the
+last run is still waiting.
+
+`SIGTERM` cuts the wait short, so a release apply or a reboot never has
+to sit out a six-hour window.
 
 ## When the portal stands down
 

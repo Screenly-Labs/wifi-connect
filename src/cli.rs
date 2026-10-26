@@ -44,6 +44,17 @@ pub enum LogFormat {
     Json,
 }
 
+/// How a run ended, for the purposes of deciding how long to wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    /// The device has a network — it already had one, or the portal got
+    /// it one.
+    Online,
+    /// A portal session nobody completed, or a run that could not raise
+    /// one at all.
+    Unproductive,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "wifi-connect",
@@ -207,6 +218,34 @@ pub struct Cli {
     /// the network cannot.
     #[arg(long, env = "WIFI_CONNECT_STATE_FILE")]
     pub state_file: Option<PathBuf>,
+
+    /// Wait this many seconds before exiting once the device is online.
+    /// 0 (the default) exits immediately.
+    ///
+    /// For platforms with no init system, where the container runtime's
+    /// restart policy is the only scheduler available. Exiting the
+    /// instant the device turns out to be online, under
+    /// `restart: always`, is a container start every twenty seconds for
+    /// the life of a healthy screen — 4,680 a day, measured on a Pi 5.
+    /// Waiting here makes the same loop a periodic check at whatever
+    /// cadence you choose.
+    ///
+    /// Leave it at 0 where something else owns the schedule, such as a
+    /// systemd timer.
+    #[arg(long, env = "WIFI_CONNECT_RECHECK_INTERVAL", default_value_t = 0)]
+    pub recheck_interval: u64,
+
+    /// Wait this many seconds before exiting after a portal session
+    /// nobody completed, or a run that could not start one. Defaults to
+    /// `--recheck-interval`.
+    ///
+    /// Separate because the two deserve different numbers. A screen
+    /// that is online can be re-checked often and cheaply; a screen
+    /// that just showed a setup page for fifteen minutes and was
+    /// ignored should wait a good deal longer before taking the display
+    /// again, or an unjoinable site never shows content.
+    #[arg(long, env = "WIFI_CONNECT_RETRY_AFTER")]
+    pub retry_after: Option<u64>,
 
     /// Never print the QR code to stdout. Wins over `--qr-stdout`.
     ///
@@ -490,6 +529,20 @@ impl Cli {
             .parse()
             .map(Some)
             .map_err(|e: sentry::types::ParseDsnError| ConfigError::SentryDsn(e.to_string()))
+    }
+
+    /// How long to wait before exiting, given how the run ended.
+    ///
+    /// Pure so the policy can be read in one place and tested without a
+    /// radio: every path through the daemon ends here, including the
+    /// failures, and a path that forgot to wait is a container that
+    /// spins.
+    pub fn wait_before_exit(&self, outcome: ExitKind) -> Duration {
+        let seconds = match outcome {
+            ExitKind::Online => self.recheck_interval,
+            ExitKind::Unproductive => self.retry_after.unwrap_or(self.recheck_interval),
+        };
+        Duration::from_secs(seconds)
     }
 
     pub fn portal_url(&self) -> String {
@@ -803,6 +856,47 @@ mod tests {
         let r = parse_dhcp_range("10.0.0.1,10.0.0.253", Ipv4Addr::new(10, 0, 0, 254)).unwrap();
         assert_eq!(r.first, Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(r.last, Ipv4Addr::new(10, 0, 0, 253));
+    }
+
+    /// Nothing waits unless asked to: a deployment with a timer in
+    /// front of it must keep exiting straight away, or the timer's next
+    /// tick lands while the last run is still sitting there.
+    #[test]
+    fn waiting_before_exit_is_off_by_default() {
+        let c = cli(&[]);
+
+        assert_eq!(c.wait_before_exit(ExitKind::Online), Duration::ZERO);
+        assert_eq!(c.wait_before_exit(ExitKind::Unproductive), Duration::ZERO);
+    }
+
+    /// The two endings deserve different numbers. A screen that is
+    /// online can be re-checked cheaply and often; one that just showed
+    /// a setup page for fifteen minutes and was ignored should wait
+    /// longer before taking the display again.
+    #[test]
+    fn an_ignored_portal_waits_longer_than_a_healthy_screen() {
+        let c = cli(&["--recheck-interval", "300", "--retry-after", "21600"]);
+
+        assert_eq!(
+            c.wait_before_exit(ExitKind::Online),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            c.wait_before_exit(ExitKind::Unproductive),
+            Duration::from_secs(21600)
+        );
+    }
+
+    /// One number is enough for anyone who does not want to think about
+    /// the distinction.
+    #[test]
+    fn the_retry_wait_falls_back_to_the_recheck_interval() {
+        let c = cli(&["--recheck-interval", "300"]);
+
+        assert_eq!(
+            c.wait_before_exit(ExitKind::Unproductive),
+            Duration::from_secs(300)
+        );
     }
 
     /// The state file is opt-in: an integrator who does not ask for one
