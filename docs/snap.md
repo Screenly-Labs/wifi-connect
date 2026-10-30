@@ -59,6 +59,8 @@ sudo snap restart wifi-connect
 | `default-theme` | `system` (`system`, `light`, `dark`) |
 | `log-format` | `text` (`text`, `json`) |
 | `log-level` | `info` |
+| `no-sentry` | `false` (`true` turns error reporting off) |
+| `sentry-dsn` | this project's DSN |
 
 `sudo snap unset wifi-connect <key>` restores a default.
 

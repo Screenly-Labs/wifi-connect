@@ -64,8 +64,8 @@ jobs:
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-deny
-      # Enforces the HTTP-only design: no TLS stack may enter the tree.
-      # See deny.toml for why.
+      # Enforces the HTTP-only design: no TLS stack may enter the tree
+      # beyond rustls for error reporting. See deny.toml for why.
       - run: cargo deny check bans advisories licenses sources
 
   test:

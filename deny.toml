@@ -6,12 +6,20 @@
 # comes from the access point itself being WPA2/WPA3-encrypted, which protects
 # DHCP and DNS too — not just an HTTPS credential POST.
 #
-# So no TLS stack belongs in this tree. The realistic way one sneaks in is
+# So no TLS stack belongs in the portal. The realistic way one sneaks in is
 # somebody adding `reqwest` for a connectivity check; `NetworkManager`'s own
 # CheckConnectivity() over D-Bus is both lighter and more correct.
 #
-# aws-lc-rs and ring additionally build C and assembly, which would break the
-# "no C toolchain" premise that makes the musl cross-builds painless.
+# The one exception is error reporting (src/telemetry.rs), which has to
+# reach Sentry over HTTPS. That is a client, outbound, on the device's
+# uplink, and it uses rustls on ring: the stack with no system library to
+# link, which is what keeps the musl binaries static. ring is allowed only
+# as rustls's backend, so it cannot arrive any other way.
+#
+# ring does build C and assembly, so the release targets now need a C
+# cross-compiler. The `cross` images ship one; a bare `cargo build
+# --target <musl>` on a host without it fails in ring's build script.
+# aws-lc-rs would also need cmake and bindgen, and stays banned.
 
 [bans]
 multiple-versions = "warn"
@@ -19,11 +27,12 @@ wildcards = "deny"
 
 [[bans.deny]]
 name = "openssl-sys"
-reason = "the portal is HTTP-only by design; no TLS stack belongs here"
+reason = "a system TLS library would end the static musl build"
 
 [[bans.deny]]
 name = "ring"
-reason = "no TLS stack, and it would add C/asm to the cross-build"
+reason = "only as rustls's crypto backend, for error reporting; see above"
+wrappers = ["rustls", "rustls-webpki"]
 
 [[bans.deny]]
 name = "aws-lc-sys"
@@ -35,7 +44,7 @@ reason = "no TLS stack, and it needs cmake/bindgen in every cross image"
 
 [[bans.deny]]
 name = "native-tls"
-reason = "no TLS stack belongs here"
+reason = "a system TLS library would end the static musl build"
 
 [advisories]
 version = 2
@@ -75,6 +84,11 @@ allow = [
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
   "BSD-3-Clause",
+  # webpki-roots: the Mozilla root store, compiled in for error reporting.
+  # The release image is FROM scratch and has no CA bundle to read.
+  "CDLA-Permissive-2.0",
+  # ring, rustls-webpki, untrusted.
+  "ISC",
   "MIT",
   "Unicode-3.0",
   "Zlib",

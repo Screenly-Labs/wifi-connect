@@ -64,6 +64,14 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "tracing-log"] }
 uuid = { version = "1.28.0", features = ["v4"] }
 mime_guess = "2.0.5"
+# Crash and error reporting; see src/telemetry.rs. Without the defaults,
+# which would bring native-tls (OpenSSL, so no static musl build) and
+# reqwest. ureq is a small blocking client on the transport's own thread,
+# and rustls on ring is the TLS stack with no system library to link.
+# No backtrace or debug-images: the release binary is stripped, so frames
+# would be bare addresses, and the panic message already carries the
+# source location.
+sentry = { version = "0.49.3", default-features = false, features = ["contexts", "panic", "rustls", "tracing", "ureq"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
