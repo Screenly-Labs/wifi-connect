@@ -43,6 +43,7 @@ pub enum Call {
     DeleteProfile { uuid: String },
     Restore,
     SweepStaleAps,
+    SetRadioEnabled { enabled: bool },
 }
 
 /// A saved NetworkManager profile, reduced to what deletion decisions
@@ -125,6 +126,7 @@ impl FakeNm {
                 driver: "brcmfmac".into(),
                 capabilities: WIFI_DEVICE_CAP_AP,
                 managed: true,
+                radio_enabled_by_us: false,
             },
             connectivity: Connectivity::None,
             another_device_online: false,
@@ -186,6 +188,14 @@ impl FakeNm {
         self
     }
 
+    /// Report the device as one whose soft-blocked radio we had to turn
+    /// on to find it — what `NmrsControl::find_device` records after
+    /// clearing an rfkill block.
+    pub fn with_radio_enabled_by_us(mut self, enabled_by_us: bool) -> Self {
+        self.device.radio_enabled_by_us = enabled_by_us;
+        self
+    }
+
     pub fn with_station_activated(mut self, activated: bool) -> Self {
         self.station_activated = activated;
         self
@@ -244,6 +254,11 @@ impl NetworkControl for FakeNm {
     async fn check_connectivity(&self) -> Result<Connectivity, NetworkError> {
         self.record(Call::CheckConnectivity);
         Ok(self.connectivity)
+    }
+
+    async fn set_radio_enabled(&self, enabled: bool) -> Result<(), NetworkError> {
+        self.record(Call::SetRadioEnabled { enabled });
+        Ok(())
     }
 
     async fn station_activated(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {
