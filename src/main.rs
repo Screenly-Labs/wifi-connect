@@ -64,13 +64,19 @@ fn init_logging(args: &Cli) {
 /// This is the primary way the generated passphrase reaches the user. It is
 /// rendered locally because it is what gets you *onto* the network — it
 /// cannot be served over that network.
-fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
+///
+/// The returned guard removes the files again when it is dropped, so the
+/// passphrase does not outlive the access point it belongs to. Hold it for
+/// as long as the run.
+fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) -> qr::QrFiles {
+    let mut qr_files = qr::QrFiles::new();
+
     let Some(passphrase) = passphrase else {
         warn!(
             "the access point is OPEN: everything typed into the portal crosses \
              the air in clear"
         );
-        return;
+        return qr_files;
     };
 
     let payload = qr::wifi_payload(ssid, passphrase, false);
@@ -78,11 +84,10 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
         Ok(c) => c,
         Err(e) => {
             error!(error = %e, "could not encode the join QR code");
-            return;
+            return qr_files;
         }
     };
 
-    let mut wrote_qr_files = false;
     if let Some(dir) = &args.qr_output {
         // Both files carry the passphrase (the .txt in plain text), so they
         // are written like a credential: not world-readable, and never
@@ -94,7 +99,7 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
             match private_file::write(&svg, code.to_svg(512).as_bytes()) {
                 Ok(()) => {
                     info!(path = %svg.display(), "wrote the join QR code");
-                    wrote_qr_files = true;
+                    qr_files.published(svg);
                 }
                 Err(e) => error!(error = %e, path = %svg.display(), "could not write the QR code"),
             }
@@ -102,7 +107,7 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
             // code itself at whatever size its screen wants.
             let txt = dir.join("wifi-connect-qr.txt");
             match private_file::write(&txt, payload.as_bytes()) {
-                Ok(()) => wrote_qr_files = true,
+                Ok(()) => qr_files.published(txt),
                 Err(e) => {
                     error!(error = %e, path = %txt.display(), "could not write the QR payload")
                 }
@@ -110,6 +115,7 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
         }
     }
 
+    let wrote_qr_files = !qr_files.is_empty();
     let to_stdout = args.print_qr_to_stdout(std::io::stdout().is_terminal(), wrote_qr_files);
     if to_stdout {
         // Printed, not logged: a log formatter would mangle the block
@@ -154,6 +160,8 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) {
             );
         }
     }
+
+    qr_files
 }
 
 /// The /24 broadcast address for a gateway.
@@ -288,7 +296,12 @@ async fn run() -> ExitCode {
     // user.
     let portal_ssid = ssid::with_random_suffix(&args.portal_ssid, args.portal_ssid_suffix);
     let ssid = Ssid::from(portal_ssid.as_str());
-    publish_qr(&args, &ssid, passphrase.as_ref());
+    // Held for the rest of the run: dropping it removes the files, so the
+    // passphrase does not outlive the access point. That includes the
+    // exits below which never raise one — the QR is published before
+    // preflight, so a device that turns out to be online already has
+    // written a credential for an access point it will not bring up.
+    let _qr_files = publish_qr(&args, &ssid, passphrase.as_ref());
 
     let eap_server_check = if args.insecure_eap_skip_server_verification {
         warn!(

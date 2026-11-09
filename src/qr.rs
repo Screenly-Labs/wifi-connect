@@ -17,7 +17,10 @@
 //!   the log, for anyone whose scanner refuses. Off by default, because logs
 //!   are shipped and kept far beyond the device's screen.
 
+use std::path::{Path, PathBuf};
+
 use qrcode::{Color, EcLevel, QrCode, render::svg};
+use tracing::{info, warn};
 
 use crate::secret::Secret;
 use crate::ssid::Ssid;
@@ -120,9 +123,101 @@ impl JoinQr {
     }
 }
 
+/// Removes the QR files a run wrote, when that run ends.
+///
+/// `wifi-connect-qr.txt` holds the setup passphrase in clear, and
+/// `wifi-connect-qr.svg` encodes the same payload. Both are written for
+/// one access point, with one passphrase, generated per run — so once
+/// the run is over they are a credential for a network that no longer
+/// exists, and nothing else is tracking them.
+///
+/// `portal_state::StateFile` already does this for `state.json`, which
+/// is written beside these and carries the same passphrase. Without the
+/// guard below the two halves of one session's output have different
+/// lifetimes: the state file goes, the credential stays.
+///
+/// A guard rather than a call at the end of `run()` for the same reason
+/// as the state file: the run has several exits, including the one taken
+/// before the portal is ever raised — the QR files are written *before*
+/// preflight decides a device is already online, so that path publishes
+/// a passphrase for an access point that never goes up.
+///
+/// Only the paths actually written are recorded, so a failed write or a
+/// file left by someone else is never removed.
+#[derive(Debug, Default)]
+pub struct QrFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl QrFiles {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a file this run wrote, to be removed when the run ends.
+    pub fn published(&mut self, path: PathBuf) {
+        self.paths.push(path);
+    }
+
+    /// Whether anything reached disk. This is what decides the stdout
+    /// fallback: a run that could not publish the QR to a file has to
+    /// print it, or the passphrase reaches nobody.
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+}
+
+impl Drop for QrFiles {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            remove_published(path);
+        }
+    }
+}
+
+fn remove_published(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => info!(path = %path.display(), "removed the join QR file"),
+        // Already gone is the normal outcome of an operator clearing the
+        // directory, and nothing to report.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            error = %e,
+            path = %path.display(),
+            "could not remove the join QR file; the setup passphrase for a \
+             closed session stays readable on disk"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    /// A scratch directory unique to one test, removed on drop. Matches
+    /// private_file's and portal_state's, rather than pulling in a crate.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(test: &str) -> Self {
+            let p =
+                std::env::temp_dir().join(format!("wifi-connect-qr-{}-{test}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Scratch(p)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn payload_has_the_expected_shape() {
@@ -188,5 +283,78 @@ mod tests {
         let pass = Secret::new("x".repeat(63));
         let payload = wifi_payload(&Ssid::from("A rather long network name"), &pass, false);
         assert!(JoinQr::encode(&payload).is_ok());
+    }
+
+    /// The point of the guard. `wifi-connect-qr.txt` is the setup
+    /// passphrase in clear, and a run that has ended is a passphrase for
+    /// an access point that no longer exists.
+    #[test]
+    fn the_published_files_go_away_when_the_run_ends() {
+        let dir = Scratch::new("drop");
+        let svg = dir.join("wifi-connect-qr.svg");
+        let txt = dir.join("wifi-connect-qr.txt");
+        fs::write(&svg, b"<svg/>").unwrap();
+        fs::write(&txt, b"WIFI:T:WPA;S:Setup;P:brave-plum-42;H:false;;").unwrap();
+
+        let mut files = QrFiles::new();
+        files.published(svg.clone());
+        files.published(txt.clone());
+        assert!(!files.is_empty());
+
+        drop(files);
+
+        assert!(!svg.exists(), "the QR image outlived the portal run");
+        assert!(
+            !txt.exists(),
+            "the setup passphrase outlived the portal run"
+        );
+    }
+
+    /// Only what this run wrote. A failed write records nothing, and a
+    /// file that happens to sit in the same directory is the operator's.
+    #[test]
+    fn nothing_unpublished_is_removed() {
+        let dir = Scratch::new("unpublished");
+        let theirs = dir.join("something-else.txt");
+        fs::write(&theirs, b"not ours").unwrap();
+
+        let files = QrFiles::new();
+        assert!(files.is_empty());
+        drop(files);
+
+        assert!(theirs.exists(), "removed a file this run never wrote");
+        assert_eq!(fs::read(&theirs).unwrap(), b"not ours");
+    }
+
+    /// An operator clearing the directory, or a tmpfs that went with a
+    /// reboot. Not an error worth reporting — and must not panic in a
+    /// `Drop`.
+    #[test]
+    fn removing_a_file_that_is_already_gone_is_quiet() {
+        let dir = Scratch::new("gone");
+        let txt = dir.join("wifi-connect-qr.txt");
+        fs::write(&txt, b"payload").unwrap();
+
+        let mut files = QrFiles::new();
+        files.published(txt.clone());
+        fs::remove_file(&txt).unwrap();
+
+        drop(files);
+    }
+
+    /// A directory where the file should be cannot be unlinked, and the
+    /// guard runs in a `Drop` on every exit path including the error
+    /// ones. It has to survive that rather than abort the process.
+    #[test]
+    fn a_file_that_cannot_be_removed_is_survivable() {
+        let dir = Scratch::new("stubborn");
+        let blocker = dir.join("wifi-connect-qr.txt");
+        fs::create_dir(&blocker).unwrap();
+
+        let mut files = QrFiles::new();
+        files.published(blocker.clone());
+        drop(files);
+
+        assert!(blocker.exists());
     }
 }
