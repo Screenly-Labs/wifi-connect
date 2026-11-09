@@ -97,6 +97,46 @@ pub async fn preflight<N: NetworkControl>(
         "found a WiFi device"
     );
 
+    let radio_enabled_by_us = device.radio_enabled_by_us;
+    let outcome = decide(nm, config, device).await;
+
+    // Finding the device is not free of side effects: a soft-blocked radio
+    // has to be turned on before NetworkManager will say anything useful
+    // about it. Leaving it on is right when we go on to raise the portal,
+    // and wrong on every other path — an operator who disabled WiFi on a
+    // wired screen would find it switched back on by a run that then
+    // decided it had nothing to do, and switched on again at the next
+    // check, and the one after that. On balena, where there is no init
+    // system to gate us and the daemon runs on its own schedule, that is
+    // every five minutes for the life of the device.
+    //
+    // Only undone where we are the ones who turned it on: a radio the
+    // operator left enabled stays enabled.
+    if radio_enabled_by_us && !matches!(outcome, Ok(Some(_))) {
+        restore_radio(nm).await;
+    }
+
+    outcome
+}
+
+/// Put the radio back the way we found it, best-effort.
+///
+/// A failure here is worth saying out loud — the operator's setting has
+/// not been honoured — but it is not worth failing the run over: nothing
+/// else depended on it, and the next check will try again.
+async fn restore_radio<N: NetworkControl>(nm: &N) {
+    match nm.set_radio_enabled(false).await {
+        Ok(()) => info!("the portal was not needed; turned the WiFi radio back off"),
+        Err(e) => warn!(error = %e, "could not turn the WiFi radio back off"),
+    }
+}
+
+/// Everything after the device is in hand: is the portal needed?
+async fn decide<N: NetworkControl>(
+    nm: &N,
+    config: &RunConfig,
+    device: DeviceInfo,
+) -> Result<Option<DeviceInfo>, NetworkError> {
     if !device.managed {
         return Err(NetworkError::Unmanaged(device.interface.clone()));
     }
@@ -438,6 +478,80 @@ mod tests {
             hidden: false,
             ip: Default::default(),
         }
+    }
+
+    // ---- the radio we turned on ------------------------------------------
+
+    /// The bug this guards: finding the device turns a soft-blocked radio
+    /// on, and a run that then decides the portal is unnecessary used to
+    /// walk away leaving it on. Reproduced on a wired Pi 3 A+ with the
+    /// radio rfkill-blocked: two runs out of two cleared the block and
+    /// exited "already online", so the operator's setting was undone by a
+    /// daemon that did nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_we_turned_on_goes_back_off_when_the_portal_is_not_needed() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Full)
+            .with_radio_enabled_by_us(true);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+        assert!(
+            nm.calls()
+                .contains(&Call::SetRadioEnabled { enabled: false }),
+            "a radio we enabled ourselves must be put back when we find we had nothing to do"
+        );
+    }
+
+    /// The other half: we only undo our own change. A radio the operator
+    /// left on must still be on afterwards, or the daemon starts disabling
+    /// WiFi on devices that never asked it to.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_the_operator_left_on_is_not_turned_off() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Full)
+            .with_radio_enabled_by_us(false);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+        assert!(
+            !nm.calls()
+                .iter()
+                .any(|c| matches!(c, Call::SetRadioEnabled { .. })),
+            "we did not turn this radio on, so it is not ours to turn off"
+        );
+    }
+
+    /// And when the portal *is* going up, the radio has to stay on — it is
+    /// the thing the access point is raised on.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_we_turned_on_stays_on_when_the_portal_is_needed() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::None)
+            .with_saved_profiles(0)
+            .with_radio_enabled_by_us(true);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_some());
+        assert!(
+            !nm.calls()
+                .iter()
+                .any(|c| matches!(c, Call::SetRadioEnabled { enabled: false })),
+            "turning the radio off here would tear down the portal we are about to raise"
+        );
+    }
+
+    /// A device we cannot use is still a device whose radio we switched on.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_we_turned_on_goes_back_off_when_preflight_fails() {
+        let mut nm = FakeNm::new()
+            .with_connectivity(Connectivity::None)
+            .with_radio_enabled_by_us(true);
+        nm.device.capabilities = 0; // no AP mode
+
+        assert!(preflight(&nm, &config()).await.is_err());
+        assert!(
+            nm.calls()
+                .contains(&Call::SetRadioEnabled { enabled: false }),
+            "bailing out is not a reason to leave the operator's radio switched on"
+        );
     }
 
     // ---- the connectivity gate -------------------------------------------
