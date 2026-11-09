@@ -72,6 +72,7 @@ one_of log-format text json
 one_of insecure-open-portal true false
 one_of no-qr-stdout true false
 one_of force true false
+one_of no-sentry true false
 
 whole_number activity-timeout
 whole_number wait-for-connection

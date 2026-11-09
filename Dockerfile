@@ -27,8 +27,10 @@ ARG TARGETVARIANT
 COPY --chmod=0755 dist/wifi-connect-${TARGETARCH}${TARGETVARIANT} /wifi-connect
 
 # scratch has no shell, no CA bundle, no /etc/passwd and no tzdata. The
-# binary is static musl, serves plain HTTP by design, and never resolves a
-# hostname, so it needs none of them.
+# binary is static musl and serves plain HTTP by design, so it needs none of
+# them. The one hostname it resolves is Sentry's, for error reporting, and
+# that uses the /etc/resolv.conf Docker mounts in and the root certificates
+# compiled into the binary. --no-sentry turns it off.
 ENV WIFI_CONNECT_LOG_FORMAT=json \
     TZ=UTC
 

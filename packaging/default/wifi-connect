@@ -62,3 +62,12 @@
 
 #WIFI_CONNECT_LOG_LEVEL=info
 #WIFI_CONNECT_LOG_FORMAT=text
+
+# Panics and ERROR log lines are reported to Sentry, with WARN lines as
+# context. INFO and below, where the passphrase is logged when
+# WIFI_CONNECT_LOG_PASSPHRASE is on, are never sent. Set this to turn
+# reporting off entirely.
+#WIFI_CONNECT_NO_SENTRY=true
+#
+# Or report to your own Sentry instead. An empty value also turns it off.
+#WIFI_CONNECT_SENTRY_DSN=https://<key>@<host>/<project>
