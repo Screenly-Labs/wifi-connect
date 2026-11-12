@@ -53,7 +53,7 @@ rust-embed = { version = "8.13.0", features = ["mime-guess", "debug-embed"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11"
-simple-dns = "0.12.0"
+simple-dns = "0.13.0"
 socket2 = { version = "0.6.5", features = ["all"] }
 thiserror = "2.0.21"
 # current_thread flavour is enough: there is no CPU work here and a single
