@@ -6,8 +6,10 @@
 # Raspberry Pi OS Buster through Trixie, whose glibc versions span 2.28 to
 # 2.41.
 #
-# This is viable only because there is no C in the dependency tree: zbus is
-# pure Rust over an AF_UNIX socket, and deny.toml keeps every TLS stack out.
+# This is viable only because nothing links a system library: zbus is pure
+# Rust over an AF_UNIX socket, and the one TLS stack (rustls on ring, for
+# error reporting) is compiled in. ring's C and assembly are built by the
+# `cross` images' compilers; deny.toml keeps every system TLS library out.
 
 [target.'cfg(target_env = "musl")']
 rustflags = ["-C", "target-feature=+crt-static"]

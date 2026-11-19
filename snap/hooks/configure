@@ -53,6 +53,20 @@ confined_path() {
 	esac
 }
 
+# The binary refuses a DSN it cannot parse (exit 2), which as a daemon is a
+# restart loop and no portal. This is a shape check, not a full parse:
+# http(s), a key, a host and a project id. Empty is allowed and turns
+# reporting off.
+sentry_dsn() {
+	value="$(get sentry-dsn)"
+	[ -z "${value}" ] && return 0
+	case "${value}" in
+		*[[:space:]]*) ;;
+		http://?*@?*/?* | https://?*@?*/?*) return 0 ;;
+	esac
+	fail "sentry-dsn must look like https://<key>@<host>/<project-id>, or be empty to turn reporting off (got '${value}')"
+}
+
 passphrase="$(get portal-passphrase)"
 if [ -n "${passphrase}" ]; then
 	length="$(printf '%s' "${passphrase}" | wc -c)"
@@ -72,6 +86,8 @@ one_of log-format text json
 one_of insecure-open-portal true false
 one_of no-qr-stdout true false
 one_of force true false
+one_of no-sentry true false
+sentry_dsn
 
 whole_number activity-timeout
 whole_number wait-for-connection
