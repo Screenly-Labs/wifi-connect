@@ -658,6 +658,7 @@ impl NetworkControl for NmrsControl {
         // so this has to be its own message: "no access point could be
         // raised" sends someone hunting a driver bug when the real answer
         // is a physical switch or a stuck rfkill soft-block.
+        let mut radio_enabled_by_us = false;
         match self.nm.wifi_state().await {
             Ok(radio) if !radio.hardware_enabled => return Err(NetworkError::RadioBlocked),
             Ok(radio) if !radio.enabled => {
@@ -683,6 +684,7 @@ impl NetworkControl for NmrsControl {
                         _ => tokio::time::sleep(Duration::from_millis(150)).await,
                     }
                 }
+                radio_enabled_by_us = true;
             }
             Ok(_) => {}
             Err(e) => debug!(error = %e, "could not read the radio state"),
@@ -693,6 +695,7 @@ impl NetworkControl for NmrsControl {
             driver: device.driver.unwrap_or(driver_extra),
             capabilities,
             managed: device.managed,
+            radio_enabled_by_us,
         })
     }
 
@@ -1080,6 +1083,13 @@ impl NetworkControl for NmrsControl {
             Err(ConnectionError::SavedConnectionNotFound(_)) => Ok(()),
             Err(e) => Err(NetworkError::Other(e.to_string())),
         }
+    }
+
+    async fn set_radio_enabled(&self, enabled: bool) -> Result<(), NetworkError> {
+        self.nm
+            .set_wireless_enabled(enabled)
+            .await
+            .map_err(|e| NetworkError::Other(e.to_string()))
     }
 
     async fn restore(&self, device: &DeviceInfo) -> Result<(), NetworkError> {

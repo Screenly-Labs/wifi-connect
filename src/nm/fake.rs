@@ -43,6 +43,7 @@ pub enum Call {
     DeleteProfile { uuid: String },
     Restore,
     SweepStaleAps,
+    SetRadioEnabled { enabled: bool },
 }
 
 /// A saved NetworkManager profile, reduced to what deletion decisions
@@ -102,6 +103,8 @@ pub struct FakeNm {
     /// true so existing tests keep asserting what they always did.
     pub connectivity_is_measured: bool,
     pub station_activated: bool,
+    /// Make `station_activated` fail, as a D-Bus error would.
+    pub station_unreadable: bool,
     pub saved_profiles: usize,
     pub autoconnect_succeeds: bool,
     pub networks: Vec<WifiNetwork>,
@@ -125,11 +128,13 @@ impl FakeNm {
                 driver: "brcmfmac".into(),
                 capabilities: WIFI_DEVICE_CAP_AP,
                 managed: true,
+                radio_enabled_by_us: false,
             },
             connectivity: Connectivity::None,
             another_device_online: false,
             connectivity_is_measured: true,
             station_activated: false,
+            station_unreadable: false,
             saved_profiles: 0,
             autoconnect_succeeds: false,
             networks: Vec::new(),
@@ -186,8 +191,21 @@ impl FakeNm {
         self
     }
 
+    /// Report the device as one whose soft-blocked radio we had to turn
+    /// on to find it — what `NmrsControl::find_device` records after
+    /// clearing an rfkill block.
+    pub fn with_radio_enabled_by_us(mut self, enabled_by_us: bool) -> Self {
+        self.device.radio_enabled_by_us = enabled_by_us;
+        self
+    }
+
     pub fn with_station_activated(mut self, activated: bool) -> Self {
         self.station_activated = activated;
+        self
+    }
+
+    pub fn with_unreadable_station(mut self) -> Self {
+        self.station_unreadable = true;
         self
     }
 
@@ -246,8 +264,16 @@ impl NetworkControl for FakeNm {
         Ok(self.connectivity)
     }
 
+    async fn set_radio_enabled(&self, enabled: bool) -> Result<(), NetworkError> {
+        self.record(Call::SetRadioEnabled { enabled });
+        Ok(())
+    }
+
     async fn station_activated(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {
         self.record(Call::StationActivated);
+        if self.station_unreadable {
+            return Err(NetworkError::Other("scripted D-Bus failure".into()));
+        }
         Ok(self.station_activated)
     }
 

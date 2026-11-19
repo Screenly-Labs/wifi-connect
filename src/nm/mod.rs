@@ -78,6 +78,16 @@ pub struct DeviceInfo {
     /// is unavailable rather than just that it is.
     pub capabilities: u32,
     pub managed: bool,
+    /// We found the radio soft-blocked and turned it on to get this far.
+    ///
+    /// Finding the device is not free of side effects: a disabled radio
+    /// has to be enabled before NetworkManager will tell us anything
+    /// about it. That is fine when we go on to raise the portal, and not
+    /// fine when we then decide the portal was not needed — the operator
+    /// who turned the radio off gets it switched back on by a daemon
+    /// that did nothing else. Recording it here is what lets the caller
+    /// put it back; see `preflight`.
+    pub radio_enabled_by_us: bool,
 }
 
 /// `NM_WIFI_DEVICE_CAP_AP`.
@@ -390,6 +400,13 @@ pub trait NetworkControl: Send + Sync + 'static {
         Ok(self.station_activated(device).await? || self.another_device_online(device).await?)
     }
 
+    /// Turn the WiFi radio's software block on or off.
+    ///
+    /// Needed as its own operation because `find_device` may have had to
+    /// clear a soft-block to see the device at all, and a run that then
+    /// decides the portal is unnecessary has to undo that.
+    async fn set_radio_enabled(&self, enabled: bool) -> Result<(), NetworkError>;
+
     /// How many WiFi profiles are already saved.
     ///
     /// Drives the asymmetry in the "should we raise the portal at all" gate:
@@ -466,6 +483,7 @@ mod tests {
             driver: "brcmfmac".into(),
             capabilities: 0,
             managed: true,
+            radio_enabled_by_us: false,
         };
         assert!(!d.supports_ap_mode());
 
