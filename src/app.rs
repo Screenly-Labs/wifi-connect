@@ -295,6 +295,12 @@ async fn portal_loop<N: NetworkControl>(
             },
         };
 
+        // The user's own network passphrase is about to go to
+        // NetworkManager too, and is just as unwelcome in a report.
+        if let Some(p) = &request.passphrase {
+            crate::telemetry::redact(p);
+        }
+
         let ssid = request.ssid.to_display_string();
         info!(%ssid, "attempting to join");
 

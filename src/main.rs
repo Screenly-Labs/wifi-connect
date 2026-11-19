@@ -278,6 +278,10 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
                 .unwrap_or_else(passphrase::generate),
         )
     };
+    // Before it goes anywhere near NetworkManager, whose errors can echo it.
+    if let Some(p) = &passphrase {
+        telemetry::redact(p);
+    }
 
     // The one place the configured name becomes the name on the air. Built
     // once per run and passed on from here, so the access point, the QR

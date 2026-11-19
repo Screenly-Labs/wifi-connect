@@ -584,11 +584,12 @@ Panics and errors are reported to Sentry, because a portal that fails
 does so on a device nobody is watching. It is on by default. To turn it
 off, pass `--no-sentry` or set any one of these:
 
-- `WIFI_CONNECT_NO_SENTRY=true` in the environment, `/etc/default/wifi-connect`
-  or the container's `environment:`;
+- `WIFI_CONNECT_NO_SENTRY=true` (or `1`, `yes`, `on`) in the environment,
+  `/etc/default/wifi-connect` or the container's `environment:`;
 - `sudo snap set wifi-connect no-sentry=true` on Ubuntu Core.
 
-An empty `--sentry-dsn` turns it off too. A different DSN sends the reports
+An empty `--sentry-dsn` turns it off too (on the snap,
+`snap set wifi-connect sentry-dsn=""`). A different DSN sends the reports
 to your own Sentry instead.
 
 What is sent:
@@ -601,8 +602,10 @@ What is sent:
 
 A run with no panic and no error sends nothing: there are no sessions,
 traces or heartbeats. `INFO` and lower are never sent, at any `--log-level`. That is the level
-`--log-passphrase` writes at. The setup passphrase is redacted from every
-log line, and so from every report. Some error and warning lines name the
+`--log-passphrase` writes at. The setup passphrase, and the passphrase
+the user submits for their own network, are replaced with `[redacted]` in
+every event and breadcrumb before it is sent, because a NetworkManager
+error can echo a passphrase back. Some error and warning lines name the
 network the user tried to join. `send_default_pii` is off.
 
 Reports go to the device's uplink over HTTPS. The release binary includes
