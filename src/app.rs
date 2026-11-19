@@ -98,25 +98,86 @@ pub async fn preflight<N: NetworkControl>(
     );
 
     let radio_enabled_by_us = device.radio_enabled_by_us;
-    let outcome = decide(nm, config, device).await;
+    let station_device = radio_enabled_by_us.then(|| device.clone());
+    let decision = decide(nm, config, device).await;
 
     // Finding the device is not free of side effects: a soft-blocked radio
     // has to be turned on before NetworkManager will say anything useful
     // about it. Leaving it on is right when we go on to raise the portal,
-    // and wrong on every other path — an operator who disabled WiFi on a
-    // wired screen would find it switched back on by a run that then
-    // decided it had nothing to do, and switched on again at the next
-    // check, and the one after that. On balena, where there is no init
-    // system to gate us and the daemon runs on its own schedule, that is
-    // every five minutes for the life of the device.
+    // and wrong when the run then has nothing to do and the radio played
+    // no part in that — an operator who disabled WiFi on a wired screen
+    // would find it switched back on by a run that decided it had nothing
+    // to do, and switched on again at the next check, and the one after
+    // that. On balena, where there is no init system to gate us and the
+    // daemon runs on its own schedule, that is every five minutes for the
+    // life of the device.
     //
     // Only undone where we are the ones who turned it on: a radio the
-    // operator left enabled stays enabled.
-    if radio_enabled_by_us && !matches!(outcome, Ok(Some(_))) {
-        restore_radio(nm).await;
+    // operator left enabled stays enabled. And never where the radio is
+    // what got us online — a saved network that came up on it during the
+    // autoconnect wait, or a station already associated on it. Turning it
+    // off there takes the device offline, and on a host that soft-blocks
+    // WiFi until a country is set, keeps it offline.
+    if let Some(device) = station_device {
+        let restore = match &decision {
+            Ok(Decision::Portal(_)) => false,
+            Ok(Decision::NotNeeded(NotNeeded::Autoconnected)) => {
+                info!("a saved network came up on the radio we turned on; leaving it on");
+                false
+            }
+            // An error can come from anywhere in the gate, including after
+            // a station came up, so it gets the same check.
+            Ok(Decision::NotNeeded(NotNeeded::AlreadyOnline)) | Err(_) => {
+                !station_carries_us(nm, &device).await
+            }
+        };
+        if restore {
+            restore_radio(nm).await;
+        }
     }
 
-    outcome
+    decision.map(|d| match d {
+        Decision::Portal(device) => Some(device),
+        Decision::NotNeeded(_) => None,
+    })
+}
+
+/// What `decide` concluded.
+enum Decision {
+    /// Raise the portal on this device.
+    Portal(DeviceInfo),
+    /// The portal is not needed, and why — which decides whether the
+    /// radio is part of the reason we are online.
+    NotNeeded(NotNeeded),
+}
+
+enum NotNeeded {
+    /// The connectivity gate said online before we waited for anything.
+    /// That may or may not be through our own radio; see
+    /// `station_carries_us`.
+    AlreadyOnline,
+    /// A saved network came up during the autoconnect wait — on our
+    /// radio, by construction.
+    Autoconnected,
+}
+
+/// Is our own radio carrying a station connection — one that the
+/// "online" verdict may rest on?
+///
+/// A failed read answers yes: leaving the operator's radio on until the
+/// next check is a far smaller harm than taking a device offline.
+async fn station_carries_us<N: NetworkControl>(nm: &N, device: &DeviceInfo) -> bool {
+    match nm.station_activated(device).await {
+        Ok(true) => {
+            info!("the radio we turned on is carrying a connection; leaving it on");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            warn!(error = %e, "could not tell whether the radio is in use; leaving it on");
+            true
+        }
+    }
 }
 
 /// Put the radio back the way we found it, best-effort.
@@ -136,7 +197,7 @@ async fn decide<N: NetworkControl>(
     nm: &N,
     config: &RunConfig,
     device: DeviceInfo,
-) -> Result<Option<DeviceInfo>, NetworkError> {
+) -> Result<Decision, NetworkError> {
     if !device.managed {
         return Err(NetworkError::Unmanaged(device.interface.clone()));
     }
@@ -164,7 +225,7 @@ async fn decide<N: NetworkControl>(
 
     if config.force {
         debug!("--force: skipping the connectivity gate");
-        return Ok(Some(device));
+        return Ok(Decision::Portal(device));
     }
 
     // Not merely "connectivity is Full": where NetworkManager's checking is
@@ -174,7 +235,7 @@ async fn decide<N: NetworkControl>(
     // A wired-only device still gets the portal; see `is_online`.
     if nm.is_online(&device).await? {
         info!("already online; the portal is not needed");
-        return Ok(None);
+        return Ok(Decision::NotNeeded(NotNeeded::AlreadyOnline));
     }
 
     // The asymmetry that stops the portal racing boot-time autoconnect.
@@ -190,14 +251,14 @@ async fn decide<N: NetworkControl>(
             .await?
         {
             info!("a saved network came up; the portal is not needed");
-            return Ok(None);
+            return Ok(Decision::NotNeeded(NotNeeded::Autoconnected));
         }
         info!("no saved network came up");
     } else {
         debug!("no saved WiFi profiles; showing the portal immediately");
     }
 
-    Ok(Some(device))
+    Ok(Decision::Portal(device))
 }
 
 /// Everything that must be undone before exiting, whatever the reason.
@@ -551,6 +612,80 @@ mod tests {
             nm.calls()
                 .contains(&Call::SetRadioEnabled { enabled: false }),
             "bailing out is not a reason to leave the operator's radio switched on"
+        );
+    }
+
+    fn radio_turned_off(nm: &FakeNm) -> bool {
+        nm.calls()
+            .contains(&Call::SetRadioEnabled { enabled: false })
+    }
+
+    /// A saved network that comes up during the autoconnect wait came up
+    /// on the radio we just turned on. Turning it back off takes the
+    /// device straight offline again — and on a host that soft-blocks
+    /// WiFi until a country is set, keeps it there.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_we_turned_on_stays_on_when_a_saved_network_comes_up_on_it() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::None)
+            .with_saved_profiles(1)
+            .with_autoconnect_success(true)
+            .with_radio_enabled_by_us(true);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+        assert!(
+            !radio_turned_off(&nm),
+            "the saved network is on this radio; turning it off drops the connection"
+        );
+    }
+
+    /// Online because our own station is associated: the radio is the
+    /// connection, whatever NetworkManager's verdict was.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_we_turned_on_stays_on_when_it_is_the_connection() {
+        for (connectivity, measured) in [(Connectivity::Full, true), (Connectivity::Unknown, false)]
+        {
+            let nm = FakeNm::new()
+                .with_connectivity(connectivity)
+                .with_connectivity_measured(measured)
+                .with_station_activated(true)
+                .with_radio_enabled_by_us(true);
+
+            assert!(preflight(&nm, &config()).await.unwrap().is_none());
+            assert!(
+                !radio_turned_off(&nm),
+                "{connectivity:?}/measured={measured}: our station is the uplink"
+            );
+        }
+    }
+
+    /// When we cannot tell whether the radio is in use, keep it on: an
+    /// unhonoured radio setting until the next check is the smaller harm.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_we_turned_on_stays_on_when_its_use_cannot_be_read() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Full)
+            .with_unreadable_station()
+            .with_radio_enabled_by_us(true);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+        assert!(!radio_turned_off(&nm));
+    }
+
+    /// The case the restore exists for: online over a cable, radio idle.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_we_turned_on_goes_back_off_on_a_wired_device() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_connectivity_measured(false)
+            .with_station_activated(false)
+            .with_another_device_online(true)
+            .with_radio_enabled_by_us(true);
+
+        assert!(preflight(&nm, &config()).await.unwrap().is_none());
+        assert!(
+            radio_turned_off(&nm),
+            "wired and idle: the radio was ours to put back"
         );
     }
 

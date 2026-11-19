@@ -103,6 +103,8 @@ pub struct FakeNm {
     /// true so existing tests keep asserting what they always did.
     pub connectivity_is_measured: bool,
     pub station_activated: bool,
+    /// Make `station_activated` fail, as a D-Bus error would.
+    pub station_unreadable: bool,
     pub saved_profiles: usize,
     pub autoconnect_succeeds: bool,
     pub networks: Vec<WifiNetwork>,
@@ -132,6 +134,7 @@ impl FakeNm {
             another_device_online: false,
             connectivity_is_measured: true,
             station_activated: false,
+            station_unreadable: false,
             saved_profiles: 0,
             autoconnect_succeeds: false,
             networks: Vec::new(),
@@ -201,6 +204,11 @@ impl FakeNm {
         self
     }
 
+    pub fn with_unreadable_station(mut self) -> Self {
+        self.station_unreadable = true;
+        self
+    }
+
     pub fn with_saved_profiles(mut self, n: usize) -> Self {
         self.saved_profiles = n;
         self
@@ -263,6 +271,9 @@ impl NetworkControl for FakeNm {
 
     async fn station_activated(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {
         self.record(Call::StationActivated);
+        if self.station_unreadable {
+            return Err(NetworkError::Other("scripted D-Bus failure".into()));
+        }
         Ok(self.station_activated)
     }
 
