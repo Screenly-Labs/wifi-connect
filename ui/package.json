@@ -10,9 +10,9 @@
     "format:fix": "bun x prettier --write 'src/**/*.{ts,css,html}' build.ts"
   },
   "devDependencies": {
-    "@happy-dom/global-registrator": "^21.0.1",
+    "@happy-dom/global-registrator": "^21.0.4",
     "@tailwindcss/cli": "^4.3.3",
-    "happy-dom": "^21.0.1",
+    "happy-dom": "^21.0.4",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2"
   }
