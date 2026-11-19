@@ -60,12 +60,13 @@ sudo snap restart wifi-connect
 | `log-format` | `text` (`text`, `json`) |
 | `log-level` | `info` |
 | `no-sentry` | `false` (`true` turns error reporting off) |
-| `sentry-dsn` | this project's DSN |
+| `sentry-dsn` | this project's DSN (`""` turns error reporting off) |
 
 `sudo snap unset wifi-connect <key>` restores a default.
 
 The configure hook validates values when you set them. A passphrase that is
-too short, a non-numeric timeout or a misspelt enum value fails `snap set`
+too short, a non-numeric timeout, a misspelt enum value or a `sentry-dsn`
+that is not shaped like `https://<key>@<host>/<project-id>` fails `snap set`
 and keeps the previous value. Without that check, the bad value would only
 show up when the daemon fails to start on the next boot.
 
