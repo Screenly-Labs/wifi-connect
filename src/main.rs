@@ -296,12 +296,19 @@ async fn run() -> ExitCode {
     // user.
     let portal_ssid = ssid::with_random_suffix(&args.portal_ssid, args.portal_ssid_suffix);
     let ssid = Ssid::from(portal_ssid.as_str());
-    // Held for the rest of the run: dropping it removes the files, so the
-    // passphrase does not outlive the access point. That includes the
-    // exits below which never raise one — the QR is published before
-    // preflight, so a device that turns out to be online already has
-    // written a credential for an access point it will not bring up.
-    let _qr_files = publish_qr(&args, &ssid, passphrase.as_ref());
+    // Dropping this removes the files, so the passphrase does not outlive
+    // the access point. Every exit hands it to `wait_before_exit`, which
+    // drops it *before* waiting: with --recheck-interval or --retry-after
+    // set, the wait is most of the process's life, and a guard held to the
+    // end of `run()` kept the credential on disk for all of it. That
+    // includes the exits below which never raise an access point — the QR
+    // is published before preflight, so a device that turns out to be
+    // online already has written a credential it will not use.
+    //
+    // Published this early on purpose all the same, for the reason the
+    // branding files are read early: a --qr-output that cannot be written
+    // is reported on every run, not only on the day the portal is needed.
+    let qr_files = publish_qr(&args, &ssid, passphrase.as_ref());
 
     let eap_server_check = if args.insecure_eap_skip_server_verification {
         warn!(
@@ -347,6 +354,7 @@ async fn run() -> ExitCode {
     let device = match app::preflight(&nm, &run_config).await {
         Ok(None) => {
             wait_before_exit(
+                qr_files,
                 args.wait_before_exit(cli::ExitKind::Online),
                 "already online",
             )
@@ -357,6 +365,7 @@ async fn run() -> ExitCode {
         Err(e) => {
             let code = app::report(&Err(e)) as u8;
             wait_before_exit(
+                qr_files,
                 args.wait_before_exit(cli::ExitKind::Unproductive),
                 "the portal could not start",
             )
@@ -369,7 +378,7 @@ async fn run() -> ExitCode {
     // written here rather than beside the QR so that a consumer can treat
     // its presence as "a portal run is live". The guard removes it again
     // on every exit from here down, including the error paths.
-    let _state_file = args
+    let state_file = args
         .state_file
         .as_ref()
         .and_then(|path| {
@@ -489,7 +498,7 @@ async fn run() -> ExitCode {
     // process killed too hard to remove its own file — NetworkManager
     // keeps the access point raised in that case, so the radio looks
     // healthy from outside.
-    let heartbeat = _state_file.as_ref().map(|file| {
+    let heartbeat = state_file.as_ref().map(|file| {
         let cancel = cancel.clone();
         let file = std::sync::Arc::clone(file);
         tokio::spawn(async move {
@@ -511,8 +520,11 @@ async fn run() -> ExitCode {
     signals.abort();
     // Before the guard below removes the file: a beat racing the
     // removal would recreate it and leave a dead portal looking live.
+    // Awaited, not just aborted: the task holds its own reference to the
+    // state file, and the file is only removed when the last one goes.
     if let Some(heartbeat) = heartbeat {
         heartbeat.abort();
+        let _ = heartbeat.await;
     }
     let server_failure = servers.await.ok().flatten();
 
@@ -536,7 +548,15 @@ async fn run() -> ExitCode {
         Ok(app::Outcome::Online) => cli::ExitKind::Online,
         _ => cli::ExitKind::Unproductive,
     };
-    wait_before_exit(args.wait_before_exit(kind), "the portal session ended").await;
+    // The state file goes first, then the QR: a consumer that shows the
+    // QR while `state.json` says a portal is live never sees one without
+    // the other.
+    wait_before_exit(
+        (state_file, qr_files),
+        args.wait_before_exit(kind),
+        "the portal session ended",
+    )
+    .await;
 
     ExitCode::from(code)
 }
@@ -556,7 +576,14 @@ async fn run() -> ExitCode {
 ///
 /// SIGTERM cuts the wait short, because a release apply or a reboot
 /// should not have to wait out a six-hour retry window.
-async fn wait_before_exit(duration: std::time::Duration, why: &str) {
+///
+/// `release` is everything the run published that must not outlive it —
+/// the QR files, the portal state file — and is dropped before the wait
+/// starts, not when the process finally exits. Taking it by value is what
+/// makes every exit path hand it over.
+async fn wait_before_exit<R>(release: R, duration: std::time::Duration, why: &str) {
+    drop(release);
+
     if duration.is_zero() {
         return;
     }
@@ -654,6 +681,37 @@ mod tests {
         assert_eq!(
             broadcast_for(Ipv4Addr::new(10, 0, 0, 1)),
             Ipv4Addr::new(10, 0, 0, 255)
+        );
+    }
+
+    /// With --recheck-interval or --retry-after set, the wait is most of
+    /// the process's life. The passphrase files used to be removed only
+    /// when `run()` returned, after it, so they sat on disk for the whole
+    /// wait and the next run rewrote them: on disk nearly all the time.
+    #[tokio::test(start_paused = true)]
+    async fn the_qr_files_are_gone_before_the_wait_starts() {
+        let dir = std::env::temp_dir().join(format!(
+            "wifi-connect-main-{}-qr-before-wait",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("wifi-connect-qr.txt");
+        std::fs::write(&txt, "WIFI:T:WPA;S:Setup;P:secret;H:false;;").unwrap();
+        let mut qr_files = qr::QrFiles::new();
+        qr_files.published(txt.clone());
+
+        let wait = wait_before_exit(qr_files, std::time::Duration::from_secs(3600), "test");
+        tokio::pin!(wait);
+        let still_waiting =
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut wait).await;
+
+        let left_behind = txt.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(still_waiting.is_err(), "the wait should still be running");
+        assert!(
+            !left_behind,
+            "the passphrase must be off disk for the whole wait, not just after it"
         );
     }
 }
