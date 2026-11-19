@@ -331,7 +331,17 @@ pub struct Cli {
     /// On by default: panics and ERROR log lines are reported, with WARN
     /// lines as context. INFO and below, where `--log-passphrase` writes,
     /// are never sent.
-    #[arg(long, env = "WIFI_CONNECT_NO_SENTRY", default_value_t = false)]
+    ///
+    /// From the environment it takes any common spelling of a boolean
+    /// (`1`/`0`, `yes`/`no`, `on`/`off`, `true`/`false`). An opt-out that
+    /// rejected `=1` would stop the portal from starting, which is the one
+    /// thing an opt-out must never do.
+    #[arg(
+        long,
+        env = "WIFI_CONNECT_NO_SENTRY",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub no_sentry: bool,
 
     /// Sentry DSN to report to, for a fork or a self-hosted Sentry.
@@ -921,6 +931,31 @@ mod tests {
             cli(&["--no-sentry", "--sentry-dsn", "https://key@example.com/1"]).sentry_dsn(),
             Ok(None)
         );
+    }
+
+    /// `WIFI_CONNECT_NO_SENTRY=1` (or `yes`, `on`) must turn reporting
+    /// off, not make clap reject the value and the portal exit with 2.
+    /// The environment is what reaches this parser; the flag itself takes
+    /// no value on the command line.
+    #[test]
+    fn no_sentry_accepts_any_common_boolean_spelling_from_the_environment() {
+        use clap::FromArgMatches;
+        // The flag's own value parser, fed through a copy of the command
+        // where it takes its value on the command line, so the test does
+        // not have to set process-wide environment variables.
+        let parse = |raw: &str| {
+            let matches = Cli::command()
+                .mut_arg("no_sentry", |a| a.env(None).action(clap::ArgAction::Set))
+                .try_get_matches_from(["wifi-connect", "--no-sentry", raw])?;
+            Cli::from_arg_matches(&matches).map(|c| c.no_sentry)
+        };
+        for on in ["1", "true", "TRUE", "yes", "y", "on"] {
+            assert_eq!(parse(on).ok(), Some(true), "{on}");
+        }
+        for off in ["0", "false", "no", "n", "off"] {
+            assert_eq!(parse(off).ok(), Some(false), "{off}");
+        }
+        assert!(parse("maybe").is_err());
     }
 
     #[test]
