@@ -30,9 +30,11 @@
 use std::borrow::Cow;
 use std::sync::{Mutex, PoisonError};
 
-use sentry::integrations::tracing::EventFilter;
+use sentry::integrations::tracing::{BreadcrumbLayer, ErrorLayer};
 use sentry::protocol::{Breadcrumb, Context, Event, Map, Value};
 use tracing::{Level, Metadata, Subscriber};
+use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::registry::LookupSpan;
 
 use crate::cli::Cli;
@@ -178,21 +180,26 @@ pub fn layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    sentry::integrations::tracing::layer()
-        .event_filter(event_filter)
-        .span_filter(|_| false)
+    // The breadcrumb layer goes first so a warning logged just before an
+    // error is already recorded when that error is captured.
+    BreadcrumbLayer::new()
+        .with_filter(filter_fn(|m: &Metadata<'_>| {
+            m.is_event() && is_breadcrumb(*m.level())
+        }))
+        .and_then(ErrorLayer::new().with_filter(filter_fn(|m: &Metadata<'_>| {
+            m.is_event() && is_event(*m.level())
+        })))
 }
 
-fn event_filter(metadata: &Metadata<'_>) -> EventFilter {
-    filter_for(*metadata.level())
+/// `ERROR` lines become Sentry events.
+fn is_event(level: Level) -> bool {
+    level == Level::ERROR
 }
 
-fn filter_for(level: Level) -> EventFilter {
-    match level {
-        Level::ERROR => EventFilter::Event,
-        Level::WARN => EventFilter::Breadcrumb,
-        _ => EventFilter::Ignore,
-    }
+/// `WARN` lines become breadcrumbs on the next event. Errors are not also
+/// recorded as breadcrumbs: they are the event.
+fn is_breadcrumb(level: Level) -> bool {
+    level == Level::WARN
 }
 
 #[cfg(test)]
@@ -274,17 +281,13 @@ mod tests {
     /// Nothing at that level may reach Sentry, not even as a breadcrumb.
     #[test]
     fn only_warnings_and_errors_are_sent() {
-        assert_eq!(filter_for(Level::ERROR).bits(), EventFilter::Event.bits());
-        assert_eq!(
-            filter_for(Level::WARN).bits(),
-            EventFilter::Breadcrumb.bits()
-        );
+        assert!(is_event(Level::ERROR));
+        assert!(!is_breadcrumb(Level::ERROR));
+        assert!(is_breadcrumb(Level::WARN));
+        assert!(!is_event(Level::WARN));
         for level in [Level::INFO, Level::DEBUG, Level::TRACE] {
-            assert_eq!(
-                filter_for(level).bits(),
-                EventFilter::Ignore.bits(),
-                "{level}"
-            );
+            assert!(!is_event(level), "{level}");
+            assert!(!is_breadcrumb(level), "{level}");
         }
     }
 }
