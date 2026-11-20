@@ -38,15 +38,19 @@ jobs:
           persist-credentials: false
       - name: the tag matches Cargo.toml
         run: |
+          # CalVer YYYY.0M.MICRO: the tag carries a zero-padded month
+          # (v2026.09.0) that Cargo.toml cannot (2026.9.0), so compare
+          # against the padded form version.sh derives from the crate.
           tag="${GITHUB_REF_NAME#v}"
           crate="$(sh packaging/version.sh)"
-          if [ "${tag}" != "${crate}" ]; then
+          want="$(sh packaging/version.sh --calver)"
+          if [ "${tag}" != "${want}" ]; then
             echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml" \
-                 "version ${crate}. Bump Cargo.toml (and Cargo.lock) or" \
-                 "retag."
+                 "version ${crate} (release v${want}). Bump Cargo.toml" \
+                 "(and Cargo.lock) or retag."
             exit 1
           fi
-          echo "releasing ${crate}"
+          echo "releasing ${want} (crate ${crate})"
 
   build:
     needs: [version]
@@ -156,20 +160,31 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The tag, minus its `v`, and the same with MICRO dropped. Raw
+      # values rather than metadata-action's semver patterns: a
+      # zero-padded month is not valid semver, so those patterns would
+      # either reject v2026.09.0 or strip the zero and tag the image
+      # 2026.9.0, out of step with the release it came from.
+      - id: calver
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "version=${v}" >> "${GITHUB_OUTPUT}"
+          echo "month=${v%.*}" >> "${GITHUB_OUTPUT}"
+
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/screenly-labs/wifi-connect
-          # CalVer, so: 2026.10.0 (exact), 2026.10 (latest patch that
-          # month), latest.
+          # CalVer YYYY.0M.MICRO, so: 2026.09.0 (exact), 2026.09 (latest
+          # patch that month), latest.
           #
           # No bare {{major}}: under CalVer that is `2026`, a tag whose
           # meaning drifts for a whole year and which reads like a semver
           # compatibility promise this project does not make. Pin the exact
           # version or track latest.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.calver.outputs.version }}
+            type=raw,value=${{ steps.calver.outputs.month }}
             type=raw,value=latest
 
       - id: push

@@ -704,15 +704,30 @@ limitation and not a confidentiality boundary between clients.
 
 ## Versioning
 
-CalVer, `YYYY.MM.MICRO`, with release tags `vYYYY.MM.MICRO` — the same
-scheme Anthias uses. Semver would imply a compatibility contract this tool
-does not have: there is no library API, and the surface that needs
-stability is the CLI, which is pinned to upstream's flags by the migration
-table above rather than to a major number.
+CalVer, `YYYY.0M.MICRO` — the same scheme Anthias uses. The month is
+zero-padded, and `MICRO` starts at 0 and goes back to 0 each new month: the
+first release in September 2026 is `v2026.09.0`, the next `v2026.09.1`,
+and October's first is `v2026.10.0`. Semver would imply a compatibility
+contract this tool does not have: there is no library API, and the surface
+that needs stability is the CLI, which is pinned to upstream's flags by the
+migration table above rather than to a major number.
 
-Container tags are `2026.10.0` (exact), `2026.10` (latest patch that month)
-and `latest`. There is deliberately no bare `2026` tag: under CalVer its
-meaning would drift for a whole year while reading like a semver promise.
+| | form | example |
+| --- | --- | --- |
+| Git tag and GitHub Release | `vYYYY.0M.MICRO` | `v2026.09.0` |
+| Container image | `YYYY.0M.MICRO`, `YYYY.0M`, `latest` | `2026.09.0`, `2026.09` |
+| Release tarballs, snap | `YYYY.0M.MICRO` | `wifi-connect-2026.09.0-…` |
+| `Cargo.toml`, `--version` | `YYYY.M.MICRO` | `2026.9.0` |
+
+The last row is the exception. Cargo only accepts strict semver, which does
+not allow a leading zero, so the crate stores the month without its zero.
+That is the only place the version is written down:
+`packaging/version.sh --calver` derives the padded form from it, and the
+release workflow refuses a tag that does not match.
+
+`2026.09` is the latest patch of that month. There is deliberately no bare
+`2026` tag: under CalVer its meaning would drift for a whole year while
+reading like a semver promise.
 
 ## Verifying releases
 

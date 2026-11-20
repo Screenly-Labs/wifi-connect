@@ -84,7 +84,9 @@ parts:
       # its exit status from craftctl, not from the substitution, so an
       # inlined failure sets the empty version and carries on — which is
       # exactly how this broke the last time.
-      VERSION="$(sh packaging/version.sh)" || exit 1
+      # --calver: the release form, zero-padded month (2026.09.0), so the
+      # store shows the same version as the tag and the container image.
+      VERSION="$(sh packaging/version.sh --calver)" || exit 1
       test -n "${VERSION}" || {
         echo "packaging/version.sh produced an empty version" >&2
         exit 1

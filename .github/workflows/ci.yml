@@ -197,7 +197,7 @@ jobs:
       # merely succeeded would not have.
       - name: the snap carries the Cargo.toml version
         run: |
-          want="$(sh packaging/version.sh)"
+          want="$(sh packaging/version.sh --calver)"
           got="$(basename "${{ steps.snapcraft.outputs.snap }}")"
           case "${got}" in
             "wifi-connect_${want}_"*.snap)
