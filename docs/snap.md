@@ -145,7 +145,8 @@ boot.
   restart is the roughly 15-second window where the access point is down
   and the join is in flight.
 - **It exits once the device is online.** Exit code 0 after a successful
-  join, or at preflight if the device is already online, so the service
+  join, at preflight if the device is already online, or once it comes
+  online through another interface while the portal is up, so the service
   shows `inactive` at that point. That is expected, not a failure.
   `restart-condition: on-failure` restarts it only after a genuine error.
 

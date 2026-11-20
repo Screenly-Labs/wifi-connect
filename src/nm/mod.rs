@@ -334,6 +334,15 @@ pub trait NetworkControl: Send + Sync + 'static {
     /// configure a network the device already has.
     async fn another_device_online(&self, device: &DeviceInfo) -> Result<bool, NetworkError>;
 
+    /// Is some interface other than ours still coming up -- a wired link
+    /// waiting on carrier negotiation or DHCP, a modem registering?
+    ///
+    /// Asked by the gate after `is_online` says no, so that a screen
+    /// started a few seconds before its cable came up is not taken for
+    /// one with no network. Best-effort like `another_device_online`: a
+    /// failed read answers `false`, and the gate decides on what it has.
+    async fn another_device_settling(&self, device: &DeviceInfo) -> Result<bool, NetworkError>;
+
     /// Is NetworkManager's connectivity verdict a measurement at all?
     ///
     /// False where NetworkManager was built without connectivity

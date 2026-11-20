@@ -350,6 +350,8 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
         join_budget: args.connection_timeout(),
         activity_timeout: args.activity_timeout(),
         force: args.force,
+        settle_budget: app::SETTLE_BUDGET,
+        online_recheck: app::ONLINE_RECHECK_INTERVAL,
     };
 
     // Decide whether the portal is needed at all before binding a socket.
@@ -535,7 +537,7 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
     // Cancelled outcome the dead server's cancel() produced — otherwise a
     // port-80 collision exits as if the AP did its job.
     let result = match (&result, server_failure) {
-        (Ok(app::Outcome::Online), _) => result,
+        (Ok(app::Outcome::Online | app::Outcome::CameOnline), _) => result,
         (_, Some(what)) => Err(nm::NetworkError::PortalUnavailable(what.to_string())),
         _ => result,
     };
@@ -547,7 +549,7 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
     // for a quarter of an hour and achieved nothing, and should wait
     // longer before taking it again.
     let kind = match &result {
-        Ok(app::Outcome::Online) => cli::ExitKind::Online,
+        Ok(app::Outcome::Online | app::Outcome::CameOnline) => cli::ExitKind::Online,
         _ => cli::ExitKind::Unproductive,
     };
     // The state file goes first, then the QR: a consumer that shows the
