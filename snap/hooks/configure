@@ -41,15 +41,23 @@ whole_number() {
 	esac
 }
 
-# Strict confinement can read the snap itself and its own data directories,
-# and nothing else. A path anywhere else would pass here and then be denied
-# by AppArmor at runtime, so it is refused now with the reason.
+# Strict confinement can read this snap's own `common` data directory, and
+# nothing else (see docs/snap.md). A path anywhere else would pass here and
+# then be denied by AppArmor at runtime, so it is refused now with the
+# reason.
+#
+# Two things the prefix glob alone would wave through: a `..` segment, which
+# starts under the allowed root but resolves out of it; and the rest of the
+# instance tree (`current/`, the hooks, …), which the glob accepted while
+# this message only ever promised `common/`. Both are refused.
 confined_path() {
 	value="$(get "$1")"
 	[ -z "${value}" ] && return 0
+	allowed="/var/snap/${SNAP_INSTANCE_NAME}/common/"
 	case "${value}" in
-		"/var/snap/${SNAP_INSTANCE_NAME}/"*) ;;
-		*) fail "$1 must be under /var/snap/${SNAP_INSTANCE_NAME}/common/, which is where this confined snap can read it (got '${value}')" ;;
+		*..*) fail "$1 must not contain '..' (got '${value}')" ;;
+		"${allowed}"?*) ;;
+		*) fail "$1 must be under ${allowed}, which is where this confined snap can read it (got '${value}')" ;;
 	esac
 }
 

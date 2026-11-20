@@ -209,6 +209,8 @@ pub struct ConnectForm {
 #[derive(Debug, PartialEq, Eq)]
 pub enum FormError {
     NoNetwork,
+    /// The SSID is longer than 802.11 allows; see [`crate::ssid::MAX_BYTES`].
+    SsidTooLong,
     BadPassphrase(String),
     BadServerDomain,
     BadEapMethod,
@@ -223,6 +225,10 @@ impl FormError {
     fn message(&self) -> String {
         match self {
             FormError::NoNetwork => "Choose a network, or enter its name.".into(),
+            FormError::SsidTooLong => format!(
+                "A network name is at most {} bytes; this one is longer.",
+                crate::ssid::MAX_BYTES
+            ),
             FormError::BadPassphrase(m) | FormError::BadIp(m) => m.clone(),
             FormError::BadServerDomain => {
                 "The server domain must be a host name such as radius.example.com.".into()
@@ -319,6 +325,15 @@ pub fn validate(form: &ConnectForm, scanned: &[WifiNetwork]) -> Result<JoinReque
 
     if ssid.is_empty() {
         return Err(FormError::NoNetwork);
+    }
+
+    // 802.11 caps the SSID at 32 octets. NetworkManager would reject a
+    // longer one too, but only as an opaque InvalidProperty after the access
+    // point has already come down; refuse it here, like the passphrase
+    // rules, before the radio is touched. The operator-set AP SSID is
+    // bounded the same way at startup (see [`crate::cli`]).
+    if ssid.as_bytes().len() > crate::ssid::MAX_BYTES {
+        return Err(FormError::SsidTooLong);
     }
 
     let known_security = if hidden {
@@ -843,6 +858,31 @@ mod tests {
         ] {
             assert_eq!(validate(&f, &[]).unwrap_err(), FormError::NoNetwork);
         }
+    }
+
+    /// 802.11 caps the SSID at 32 octets. A longer one — hand-crafted bytes
+    /// or a typed name — is refused here rather than sent to NetworkManager
+    /// as a profile that can only come back InvalidProperty after the access
+    /// point has already dropped.
+    #[test]
+    fn an_over_long_ssid_is_rejected_before_the_radio_is_touched() {
+        // 33 bytes as hex, so one octet past the limit.
+        let too_long_hex = "61".repeat(crate::ssid::MAX_BYTES + 1);
+        assert_eq!(
+            validate(&form(&too_long_hex, "", "abcdefgh"), &[]).unwrap_err(),
+            FormError::SsidTooLong
+        );
+
+        // And a typed (hidden) network the same length.
+        let typed = "a".repeat(crate::ssid::MAX_BYTES + 1);
+        assert_eq!(
+            validate(&form("", &typed, "abcdefgh"), &[]).unwrap_err(),
+            FormError::SsidTooLong
+        );
+
+        // Exactly 32 octets is still accepted.
+        let at_limit = "61".repeat(crate::ssid::MAX_BYTES);
+        assert!(validate(&form(&at_limit, "", "abcdefgh"), &[]).is_ok());
     }
 
     /// A seven-character password is one of the commonest causes of a failed
