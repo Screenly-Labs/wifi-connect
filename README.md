@@ -108,9 +108,10 @@ sudo systemctl enable --now wifi-connect
    default on Debian, Raspberry Pi OS and Ubuntu Server, which ship no check
    URI), the WiFi device already being connected as a station: the access
    point is never raised over a working WiFi connection on that basis; use
-   `--force` to override. A wired link alone does not count when the check
-   is disabled, because nothing then tells a LAN with internet from one
-   without — configure a check URI if ethernet should suppress the portal.
+   `--force` to override. Another interface being up — a wired link, a
+   modem — counts too; see [When the portal comes up](#when-the-portal-comes-up).
+   One that is still coming up (taking a DHCP lease, say) is waited for,
+   for up to 30 seconds, before the device is called offline.
    A probe that positively reports no or limited connectivity still brings
    the portal up, so a device stuck on a dead network can be moved to
    another.
@@ -120,6 +121,8 @@ sudo systemctl enable --now wifi-connect
    DHCP option 114 (RFC 8910); the wildcard DNS resolver points every name
    at us so the OS connectivity probe lands here; the HTTP server answers
    those probes in the way that makes each OS open its sign-in sheet.
+   Every 10 seconds the portal asks the same "are we online?" question
+   again, and stands down if the device has come online another way.
 5. **Join.** The browser is answered *before* the access point comes down,
    because the radio cannot be an AP and a station at once and an unflushed
    response dies with the client's connection.
@@ -383,6 +386,22 @@ through it.
 `--force` raises the portal regardless, for deliberately reconfiguring
 a device that is online.
 
+The question is not only asked once. A wired screen can start before its
+link is up: the cable is still negotiating, or still waiting on DHCP,
+when the check runs. So:
+
+- **An interface that is still coming up is waited for**, for up to 30
+  seconds, before the device is called offline. That covers the slow
+  DHCP lease. It cannot cover a link that has no carrier yet —
+  NetworkManager reports a port mid-negotiation exactly as it reports one
+  with no cable in — which is what the next point is for.
+- **A raised portal keeps asking**, every 10 seconds, and stands down —
+  exit 0, radio back as it was found — once the device is online through
+  another interface. Before this, a cable that came up a few seconds after
+  the portal left the screen in setup mode until the activity timeout,
+  with its admin UI reachable over the LAN the whole time. A join already
+  submitted is still carried out, and `--force` turns the stand-down off.
+
 ## Running without an init system
 
 This daemon does one pass and exits — the right shape when a systemd
@@ -443,6 +462,9 @@ walked away with the phone.
 
 An untouched portal stands down after exactly the configured interval,
 as before.
+
+It also stands down as soon as the device is online some other way,
+idle or not — see [When the portal comes up](#when-the-portal-comes-up).
 
 ## Telling the host application what is going on
 
@@ -570,7 +592,7 @@ failed unit.
 
 | code | meaning | actionable? |
 | --- | --- | --- |
-| 0 | joined, already online, or asked to stop | no |
+| 0 | joined, already online, came online another way while the portal was up, or asked to stop | no |
 | 1 | anything not listed below | yes |
 | 3 | no WiFi device on this machine | no — nothing to configure |
 | 4 | adapter cannot do AP mode, is unmanaged, or the radio is blocked | no — a hardware fact |

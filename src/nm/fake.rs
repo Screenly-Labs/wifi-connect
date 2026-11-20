@@ -33,6 +33,7 @@ pub enum Call {
     FindDevice,
     CheckConnectivity,
     AnotherDeviceOnline,
+    AnotherDeviceSettling,
     StationActivated,
     SavedProfileCount,
     AwaitAutoconnect,
@@ -88,6 +89,13 @@ struct State {
     ap_raises: u32,
     joins: u32,
     profiles: Vec<FakeProfile>,
+    /// Switched at run time with `set_another_device_online`, for a
+    /// cable that comes up while a run is already under way. Overrides
+    /// the builder field once set.
+    another_device_online: Option<bool>,
+    /// Whether some other interface is still coming up. Shared, so a
+    /// test can finish the activation partway through a run.
+    another_device_settling: bool,
 }
 
 /// A scriptable network stack.
@@ -122,6 +130,8 @@ impl FakeNm {
                 ap_raises: 0,
                 joins: 0,
                 profiles: Vec::new(),
+                another_device_online: None,
+                another_device_settling: false,
             })),
             device: DeviceInfo {
                 interface: "wlan0".into(),
@@ -183,6 +193,22 @@ impl FakeNm {
 
     pub fn with_another_device_online(mut self, online: bool) -> Self {
         self.another_device_online = online;
+        self
+    }
+
+    /// Bring another interface up (or down) partway through a run --
+    /// the cable that finishes negotiating after the gate has looked.
+    pub fn set_another_device_online(&self, online: bool) {
+        self.state.lock().unwrap().another_device_online = Some(online);
+    }
+
+    /// Report another interface as still coming up, until switched off.
+    pub fn set_another_device_settling(&self, settling: bool) {
+        self.state.lock().unwrap().another_device_settling = settling;
+    }
+
+    pub fn with_another_device_settling(self, settling: bool) -> Self {
+        self.set_another_device_settling(settling);
         self
     }
 
@@ -283,7 +309,13 @@ impl NetworkControl for FakeNm {
 
     async fn another_device_online(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {
         self.record(Call::AnotherDeviceOnline);
-        Ok(self.another_device_online)
+        let live = self.state.lock().unwrap().another_device_online;
+        Ok(live.unwrap_or(self.another_device_online))
+    }
+
+    async fn another_device_settling(&self, _device: &DeviceInfo) -> Result<bool, NetworkError> {
+        self.record(Call::AnotherDeviceSettling);
+        Ok(self.state.lock().unwrap().another_device_settling)
     }
 
     async fn saved_wifi_profile_count(&self) -> Result<usize, NetworkError> {

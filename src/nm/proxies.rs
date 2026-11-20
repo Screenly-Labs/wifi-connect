@@ -111,6 +111,35 @@ pub fn counts_as_online(device_type: u32, managed: bool, state: u32) -> bool {
     managed && state == DEVICE_STATE_ACTIVATED && ONLINE_DEVICE_TYPES.contains(&device_type)
 }
 
+/// Is one NetworkManager device on its way to proving this host has a
+/// network, but not there yet?
+///
+/// The boot race this exists for: a wired screen whose link is still
+/// negotiating or waiting on DHCP when the gate runs. `counts_as_online`
+/// rightly says no -- it is not carrying traffic yet -- and a device with
+/// no saved WiFi profile used to get an access point raised at it there
+/// and then, a few seconds before the cable came up.
+///
+/// The activating band (40 PREPARE ... 90 SECONDARIES) for every type
+/// that would count once it got there. 30 DISCONNECTED too, but only for
+/// ethernet: NetworkManager holds a wired port in UNAVAILABLE until it
+/// has carrier, so DISCONNECTED there means a cable is in and activation
+/// has not started yet. On a radio it is the ordinary idle state, and
+/// counting it would make every run with a spare radio sit out the wait.
+pub fn is_settling(device_type: u32, managed: bool, state: u32) -> bool {
+    if !managed || !ONLINE_DEVICE_TYPES.contains(&device_type) {
+        return false;
+    }
+    matches!(state, 40 | 50 | 60 | 70 | 80 | 90)
+        || (device_type == DEVICE_TYPE_ETHERNET && state == DEVICE_STATE_DISCONNECTED)
+}
+
+/// `NM_DEVICE_TYPE_ETHERNET`.
+pub const DEVICE_TYPE_ETHERNET: u32 = 1;
+
+/// `NM_DEVICE_STATE_DISCONNECTED`.
+pub const DEVICE_STATE_DISCONNECTED: u32 = 30;
+
 pub const ONLINE_DEVICE_TYPES: [u32; 3] = [
     1, // NM_DEVICE_TYPE_ETHERNET
     2, // NM_DEVICE_TYPE_WIFI -- a second radio, already associated
@@ -182,6 +211,44 @@ mod tests {
     #[test]
     fn an_unmanaged_interface_is_not_a_network() {
         assert!(!counts_as_online(1, false, DEVICE_STATE_ACTIVATED));
+    }
+
+    /// A wired link mid-activation -- getting a DHCP lease, say -- is
+    /// worth waiting for, and so is one with carrier that has not
+    /// started activating yet.
+    #[test]
+    fn a_wired_link_coming_up_is_settling() {
+        for state in [30, 40, 50, 60, 70, 80, 90] {
+            assert!(
+                is_settling(1, true, state),
+                "ethernet in state {state} was not settling"
+            );
+        }
+    }
+
+    /// A modem or second radio mid-activation is settling, but an idle
+    /// one is not: DISCONNECTED is where a spare radio lives.
+    #[test]
+    fn an_idle_radio_is_not_settling() {
+        assert!(is_settling(2, true, 70));
+        assert!(is_settling(8, true, 50));
+        assert!(!is_settling(2, true, 30));
+        assert!(!is_settling(8, true, 30));
+    }
+
+    /// Nothing to wait for: no cable, already up, failed, going down, or
+    /// not a kind of device that would count once it got there.
+    #[test]
+    fn links_that_are_not_on_their_way_up_are_not_settling() {
+        for state in [10, 20, 100, 110, 120] {
+            assert!(
+                !is_settling(1, true, state),
+                "ethernet in state {state} counted as settling"
+            );
+        }
+        assert!(!is_settling(1, false, 70), "an unmanaged port");
+        assert!(!is_settling(20, true, 70), "a container veth");
+        assert!(!is_settling(13, true, 70), "a bridge");
     }
 
     /// Anything short of activated is a link that is not carrying

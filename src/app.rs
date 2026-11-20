@@ -25,6 +25,17 @@
 //!    SSID comes from whoever is on the portal, and a name can equal an
 //!    unrelated saved profile's.
 //!
+//! Two more keep a wired screen from being stranded on a setup page, and
+//! both turn on the same `is_online` question the gate asks:
+//!
+//! 4. **The gate waits for another interface that is still coming up.**
+//!    A screen started a few seconds before its cable has a DHCP lease is
+//!    not a screen with no network.
+//! 5. **A raised portal keeps asking.** If the device comes online some
+//!    other way while the portal waits -- the cable finishes negotiating
+//!    after the gate looked -- the portal stands down instead of holding
+//!    the radio, and the display, until the activity timeout.
+//!
 //! The retry loop and the connectivity probe live here, in the binary,
 //! rather than in a shell wrapper. The previous integration learned that the
 //! hard way: its wrapper ran `wget` under `set -euo pipefail`, so the
@@ -50,6 +61,11 @@ use crate::state::{PortalState, Shared};
 pub enum Outcome {
     /// Joined a network, or was already online.
     Online,
+    /// The portal was up and the device came online through another
+    /// interface -- typically a wired link that finished coming up after
+    /// the gate looked. Nobody joined anything, but there is nothing left
+    /// for the portal to do.
+    CameOnline,
     /// The activity timeout elapsed with no successful join.
     TimedOut,
     /// Asked to stop (SIGTERM, SIGINT).
@@ -59,7 +75,7 @@ pub enum Outcome {
 impl Outcome {
     pub fn exit_code(&self) -> i32 {
         match self {
-            Outcome::Online | Outcome::Cancelled => 0,
+            Outcome::Online | Outcome::CameOnline | Outcome::Cancelled => 0,
             Outcome::TimedOut => 6,
         }
     }
@@ -79,9 +95,31 @@ pub struct RunConfig {
     pub join_budget: Duration,
     /// Exit after this long with no successful join. Zero means never.
     pub activity_timeout: Duration,
-    /// Skip the connectivity gate entirely.
+    /// Skip the connectivity gate entirely. Also stops a raised portal
+    /// standing down when the device comes online another way: forcing
+    /// is how an operator configures WiFi on a screen that is online.
     pub force: bool,
+    /// How long the gate waits for another interface that is still coming
+    /// up before deciding the device is offline. Zero means do not wait.
+    pub settle_budget: Duration,
+    /// How often a raised portal re-checks whether the device came online
+    /// through another interface. Zero means never.
+    pub online_recheck: Duration,
 }
+
+/// Long enough for a wired link to take a DHCP lease on a cold boot,
+/// which is a few seconds on every board measured; short
+/// enough that a first-boot screen with a cable in a dead port does not
+/// hold off its setup page for long.
+pub const SETTLE_BUDGET: Duration = Duration::from_secs(30);
+
+/// How often a raised portal asks whether it is still needed. Each check
+/// is a handful of D-Bus reads, plus a connectivity probe where
+/// NetworkManager has one configured.
+pub const ONLINE_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often the gate re-reads the interfaces while one settles.
+const SETTLE_POLL: Duration = Duration::from_secs(1);
 
 /// Run preflight and decide whether the portal is needed at all.
 ///
@@ -238,6 +276,23 @@ async fn decide<N: NetworkControl>(
         return Ok(Decision::NotNeeded(NotNeeded::AlreadyOnline));
     }
 
+    // Offline right now is not offline. On a cold boot the gate can run
+    // while the cable is still waiting on DHCP, and raising the portal
+    // there puts a setup page on a screen that is on the network a few
+    // seconds later. A link still negotiating carrier cannot be told from
+    // no cable at all; the re-check in the portal loop covers that one.
+    if !config.settle_budget.is_zero() && nm.another_device_settling(&device).await? {
+        info!(
+            budget_s = config.settle_budget.as_secs(),
+            "another network interface is still coming up; waiting for it before showing the portal"
+        );
+        if await_settled(nm, &device, config.settle_budget).await? {
+            info!("another network interface came up; the portal is not needed");
+            return Ok(Decision::NotNeeded(NotNeeded::AlreadyOnline));
+        }
+        info!("no other network interface came up");
+    }
+
     // The asymmetry that stops the portal racing boot-time autoconnect.
     let saved = nm.saved_wifi_profile_count().await?;
     if saved > 0 {
@@ -259,6 +314,51 @@ async fn decide<N: NetworkControl>(
     }
 
     Ok(Decision::Portal(device))
+}
+
+/// Wait for a settling interface to bring the device online.
+///
+/// `true` as soon as `is_online` says so; `false` once nothing is
+/// settling any more, or the budget is spent.
+async fn await_settled<N: NetworkControl>(
+    nm: &N,
+    device: &DeviceInfo,
+    budget: Duration,
+) -> Result<bool, NetworkError> {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        tokio::time::sleep(SETTLE_POLL).await;
+        if nm.is_online(device).await? {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline || !nm.another_device_settling(device).await? {
+            return Ok(false);
+        }
+    }
+}
+
+/// Resolve once the device is online through something other than the
+/// portal's radio.
+///
+/// The same `is_online` the gate asks, so the two cannot disagree: a
+/// device the gate would not have raised a portal on does not keep one.
+/// Our radio is an access point while this runs, so it never counts as
+/// the station that got us online.
+///
+/// Never resolves under `--force`, or with the interval set to zero.
+async fn came_online_elsewhere<N: NetworkControl>(nm: &N, device: &DeviceInfo, config: &RunConfig) {
+    if config.force || config.online_recheck.is_zero() {
+        std::future::pending::<()>().await;
+    }
+    loop {
+        tokio::time::sleep(config.online_recheck).await;
+        match nm.is_online(device).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            // Keep the portal: a failed read is not evidence of a network.
+            Err(e) => debug!(error = %e, "could not re-check connectivity while the portal is up"),
+        }
+    }
 }
 
 /// Everything that must be undone before exiting, whatever the reason.
@@ -329,6 +429,14 @@ pub async fn run_portal<N: NetworkControl>(
     )
     .await;
     teardown.run().await;
+
+    // A radio we switched on to raise the portal goes back off when the
+    // device turned out to be online without it -- the same courtesy the
+    // gate extends when it decides up front.
+    if matches!(outcome, Ok(Outcome::CameOnline)) && device.radio_enabled_by_us {
+        restore_radio(nm).await;
+    }
+
     outcome
 }
 
@@ -394,6 +502,15 @@ async fn portal_loop<N: NetworkControl>(
                 // shutdown.
                 None => return Ok(Outcome::Cancelled),
             },
+            // After joins: a request already submitted is somebody's
+            // explicit choice, and is honoured.
+            () = came_online_elsewhere(nm, device, config) => {
+                info!(
+                    "the device came online through another interface; \
+                     the portal is no longer needed"
+                );
+                return Ok(Outcome::CameOnline);
+            }
         };
 
         // The user's own network passphrase is about to go to
@@ -528,6 +645,8 @@ mod tests {
             join_budget: Duration::from_secs(45),
             activity_timeout: Duration::ZERO,
             force: false,
+            settle_budget: SETTLE_BUDGET,
+            online_recheck: ONLINE_RECHECK_INTERVAL,
         }
     }
 
@@ -1433,6 +1552,7 @@ mod tests {
     #[test]
     fn exit_codes_distinguish_the_failure_modes() {
         assert_eq!(report(&Ok(Outcome::Online)), 0);
+        assert_eq!(report(&Ok(Outcome::CameOnline)), 0);
         assert_eq!(report(&Ok(Outcome::Cancelled)), 0);
         assert_eq!(report(&Ok(Outcome::TimedOut)), 6);
         assert_eq!(report(&Err(NetworkError::NoWifiDevice)), 3);
@@ -1457,5 +1577,232 @@ mod tests {
         let unavailable = report(&Err(NetworkError::PortalUnavailable("in use".into())));
 
         assert_ne!(timed_out, unavailable);
+    }
+
+    // ---- a wired link that comes up late ---------------------------------
+
+    /// A wired screen where NetworkManager cannot measure connectivity:
+    /// the configuration every Debian, Raspberry Pi OS and balenaOS device
+    /// runs in.
+    fn wired_unmeasured() -> FakeNm {
+        FakeNm::new()
+            .with_connectivity(Connectivity::Unknown)
+            .with_connectivity_measured(false)
+    }
+
+    /// The boot race. The gate runs while the cable is still taking its
+    /// DHCP lease; it used to see "nothing is up" and raise the portal at
+    /// a screen that was on the network a few seconds later.
+    #[tokio::test(start_paused = true)]
+    async fn a_cable_still_coming_up_is_waited_for_not_given_a_portal() {
+        let nm = wired_unmeasured().with_another_device_settling(true);
+        let cable = {
+            let nm = nm.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                nm.set_another_device_settling(false);
+                nm.set_another_device_online(true);
+            })
+        };
+
+        let started = tokio::time::Instant::now();
+        let device = preflight(&nm, &config()).await.unwrap();
+        cable.await.unwrap();
+
+        assert!(device.is_none(), "a portal was raised at a wired screen");
+        assert!(started.elapsed() <= Duration::from_secs(6));
+    }
+
+    /// The wait is bounded: a cable in a port that never gives it an
+    /// address is still a screen that needs setting up.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_that_never_comes_up_still_gets_the_portal() {
+        let nm = wired_unmeasured().with_another_device_settling(true);
+
+        let started = tokio::time::Instant::now();
+        let device = preflight(&nm, &config()).await.unwrap();
+
+        assert!(device.is_some());
+        let waited = started.elapsed();
+        assert!(
+            waited >= SETTLE_BUDGET && waited <= SETTLE_BUDGET + SETTLE_POLL,
+            "waited {waited:?}"
+        );
+    }
+
+    /// A link that stops trying -- DHCP gave up, the cable came out --
+    /// ends the wait at once rather than sitting out the budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_link_that_gives_up_ends_the_wait_early() {
+        let nm = wired_unmeasured().with_another_device_settling(true);
+        let failed = {
+            let nm = nm.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                nm.set_another_device_settling(false);
+            })
+        };
+
+        let started = tokio::time::Instant::now();
+        let device = preflight(&nm, &config()).await.unwrap();
+        failed.await.unwrap();
+
+        assert!(device.is_some());
+        assert!(started.elapsed() <= Duration::from_secs(4));
+    }
+
+    /// The first-boot screen with nothing plugged in, which the portal is
+    /// for, gets it without a moment's delay.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_coming_up_means_no_wait() {
+        let nm = wired_unmeasured();
+
+        let started = tokio::time::Instant::now();
+        let device = preflight(&nm, &config()).await.unwrap();
+
+        assert!(device.is_some());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// The bug as reported: a screen on the network, its admin UI
+    /// reachable, showing a setup page for a quarter of an hour because
+    /// the cable came up after the portal did. Reproduced on a Pi 5 by
+    /// starting the daemon with ethernet down and bringing it up four
+    /// seconds later.
+    #[tokio::test(start_paused = true)]
+    async fn a_cable_that_comes_up_under_a_raised_portal_stands_it_down() {
+        let nm = wired_unmeasured();
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+        let mut cfg = config();
+        cfg.activity_timeout = Duration::from_secs(900);
+
+        let cable = {
+            let nm = nm.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(25)).await;
+                nm.set_another_device_online(true);
+            })
+        };
+
+        let started = tokio::time::Instant::now();
+        let outcome = run_portal(&nm, &device, &cfg, &shared, rx, CancellationToken::new())
+            .await
+            .unwrap();
+        cable.await.unwrap();
+
+        assert_eq!(outcome, Outcome::CameOnline);
+        assert_eq!(outcome.exit_code(), 0);
+        // The first re-check after the cable came up, not the activity
+        // timeout.
+        assert_eq!(started.elapsed(), Duration::from_secs(30));
+        let calls = nm.calls();
+        assert!(calls.iter().any(|c| matches!(c, Call::TearDownAp { .. })));
+        assert!(calls.contains(&Call::Restore), "radio left in AP mode");
+        assert!(
+            !calls.contains(&Call::SetRadioEnabled { enabled: false }),
+            "a radio the operator left on was switched off"
+        );
+    }
+
+    /// The radio we switched on to raise the portal goes back off.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_we_turned_on_goes_back_off_when_the_cable_comes_up() {
+        let nm = wired_unmeasured().with_radio_enabled_by_us(true);
+        nm.set_another_device_online(true);
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+
+        let outcome = run_portal(
+            &nm,
+            &device,
+            &config(),
+            &shared,
+            rx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::CameOnline);
+        let restore = nm.position(|c| *c == Call::Restore).unwrap();
+        let off = nm
+            .position(|c| *c == Call::SetRadioEnabled { enabled: false })
+            .expect("the radio was left on");
+        assert!(off > restore, "the radio went off before the AP came down");
+    }
+
+    /// `--force` is how an operator sets up WiFi on a screen that is
+    /// online. Standing down because it is online would make it useless.
+    #[tokio::test(start_paused = true)]
+    async fn a_forced_portal_is_not_stood_down_by_a_cable() {
+        let nm = wired_unmeasured().with_another_device_online(true);
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+        let mut cfg = config();
+        cfg.force = true;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            run_portal(&nm, &device, &cfg, &shared, rx, CancellationToken::new()),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "a forced portal stood down: {outcome:?}");
+    }
+
+    /// A measured "limited" verdict is the user's reason to be on the
+    /// portal -- the wired LAN goes nowhere -- and a cable being in does
+    /// not change it. Same answer as the gate gives.
+    #[tokio::test(start_paused = true)]
+    async fn a_measured_limited_verdict_keeps_the_portal_up_with_a_cable_in() {
+        let nm = FakeNm::new()
+            .with_connectivity(Connectivity::Limited)
+            .with_connectivity_measured(true)
+            .with_another_device_online(true);
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            run_portal(
+                &nm,
+                &device,
+                &config(),
+                &shared,
+                rx,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "the portal stood down: {outcome:?}");
+    }
+
+    /// A join already submitted wins over a cable arriving at the same
+    /// moment: it is somebody's explicit choice.
+    #[tokio::test(start_paused = true)]
+    async fn a_submitted_join_is_honoured_even_if_a_cable_comes_up() {
+        let nm = wired_unmeasured().with_join_results(vec![JoinOutcome::Joined]);
+        nm.set_another_device_online(true);
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+        shared.submit(request("Home")).await;
+
+        let outcome = run_portal(
+            &nm,
+            &device,
+            &config(),
+            &shared,
+            rx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Online);
+        assert!(nm.calls().contains(&Call::Join {
+            ssid: "Home".into()
+        }));
     }
 }

@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 
 use super::proxies::{
     DEVICE_STATE_ACTIVATED, DeviceProxy, DeviceWirelessProxy, NetworkManagerRootProxy,
-    WIFI_MODE_AP, WIFI_MODE_INFRA, counts_as_online, is_device_busy,
+    WIFI_MODE_AP, WIFI_MODE_INFRA, counts_as_online, is_device_busy, is_settling,
 };
 use super::security;
 use super::settings::{ApProfile, ap_settings, apply_station_ip};
@@ -83,6 +83,61 @@ impl NmrsControl {
 
     fn bus(&self) -> &zbus::Connection {
         self.nm.dbus_connection()
+    }
+
+    /// The first NetworkManager device other than ours that `matches`,
+    /// as its interface name and device type.
+    ///
+    /// `matches` is handed `(DeviceType, Managed, State)`. Every failed
+    /// read is skipped, and a failure to list devices at all answers
+    /// `None`: callers treat that as "nothing else is up", which is the
+    /// behaviour from before they existed.
+    async fn find_other_device(
+        &self,
+        device: &DeviceInfo,
+        matches: impl Fn(u32, bool, u32) -> bool,
+    ) -> Option<(String, u32)> {
+        let root = match NetworkManagerRootProxy::builder(self.bus()).build().await {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(error = %e, "could not reach NetworkManager to list devices");
+                return None;
+            }
+        };
+        let paths = match root.get_devices().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                debug!(error = %e, "could not list NetworkManager's devices");
+                return None;
+            }
+        };
+
+        for path in paths {
+            let Ok(builder) = DeviceProxy::builder(self.bus()).path(path) else {
+                continue;
+            };
+            let Ok(proxy) = builder.build().await else {
+                continue;
+            };
+
+            // Our own radio is not evidence that the host has a network:
+            // it is the thing we are about to take over, or already have.
+            let interface = match proxy.interface().await {
+                Ok(name) if name == device.interface => continue,
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+
+            let managed = proxy.managed().await.unwrap_or(false);
+            let state = proxy.state().await.unwrap_or(0);
+            let device_type = proxy.device_type().await.unwrap_or(0);
+
+            if matches(device_type, managed, state) {
+                return Some((interface, device_type));
+            }
+        }
+
+        None
     }
 
     /// Read the properties nmrs does not expose, over its own connection.
@@ -782,54 +837,28 @@ impl NetworkControl for NmrsControl {
         // Best-effort, like station_activated: every failed read answers
         // "no other network", which is the behaviour from before this
         // existed -- the portal comes up.
-        let root = match NetworkManagerRootProxy::builder(self.bus()).build().await {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(error = %e, "could not reach NetworkManager to list devices");
-                return Ok(false);
-            }
-        };
-        let paths = match root.get_devices().await {
-            Ok(paths) => paths,
-            Err(e) => {
-                debug!(error = %e, "could not list NetworkManager's devices");
-                return Ok(false);
-            }
-        };
-
-        for path in paths {
-            let Ok(builder) = DeviceProxy::builder(self.bus()).path(path) else {
-                continue;
-            };
-            let Ok(proxy) = builder.build().await else {
-                continue;
-            };
-
-            // Our own radio is not evidence that the host has a network:
-            // it is the thing we are about to take over.
-            match proxy.interface().await {
-                Ok(name) if name == device.interface => continue,
-                Ok(_) => {}
-                Err(_) => continue,
-            }
-
-            let managed = proxy.managed().await.unwrap_or(false);
-            let state = proxy.state().await.unwrap_or(0);
-            let device_type = proxy.device_type().await.unwrap_or(0);
-
-            if counts_as_online(device_type, managed, state) {
-                let interface = proxy.interface().await.unwrap_or_default();
-                debug!(
-                    %interface,
-                    device_type,
-                    "connectivity unknown; another interface is up, so the \
-                     portal is not needed"
-                );
-                return Ok(true);
-            }
+        let found = self
+            .find_other_device(device, |t, managed, state| {
+                counts_as_online(t, managed, state)
+            })
+            .await;
+        if let Some((interface, device_type)) = &found {
+            debug!(
+                %interface,
+                device_type,
+                "connectivity unknown; another interface is up, so the \
+                 portal is not needed"
+            );
         }
+        Ok(found.is_some())
+    }
 
-        Ok(false)
+    async fn another_device_settling(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
+        let found = self.find_other_device(device, is_settling).await;
+        if let Some((interface, device_type)) = &found {
+            debug!(%interface, device_type, "another interface is still coming up");
+        }
+        Ok(found.is_some())
     }
 
     async fn saved_wifi_profile_count(&self) -> Result<usize, NetworkError> {
