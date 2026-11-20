@@ -52,7 +52,7 @@ itself covers DHCP and DNS too, not merely an HTTPS credential POST.
 ```yaml
 services:
   wifi-connect:
-    image: ghcr.io/screenly-labs/wifi-connect:2026.10
+    image: ghcr.io/screenly-labs/wifi-connect:26.11
     network_mode: host        # required: see docker-compose.balena.yml
     labels:
       io.balena.features.dbus: '1'
@@ -704,15 +704,20 @@ limitation and not a confidentiality boundary between clients.
 
 ## Versioning
 
-CalVer, `YYYY.MM.MICRO`, with release tags `vYYYY.MM.MICRO` — the same
-scheme Anthias uses. Semver would imply a compatibility contract this tool
+CalVer, `YY.M.MICRO`, with release tags `vYY.M.MICRO`: a two-digit year,
+the month without a leading zero, and a `MICRO` that starts at 0 each month.
+November 2026's releases are `v26.11.0`, `v26.11.1`, …, and March 2027's
+first is `v27.3.0`. Semver would imply a compatibility contract this tool
 does not have: there is no library API, and the surface that needs
 stability is the CLI, which is pinned to upstream's flags by the migration
 table above rather than to a major number.
 
-Container tags are `2026.10.0` (exact), `2026.10` (latest patch that month)
-and `latest`. There is deliberately no bare `2026` tag: under CalVer its
+Container tags are `26.11.2` (exact), `26.11` (latest patch that month)
+and `latest`. There is deliberately no bare `26` tag: under CalVer its
 meaning would drift for a whole year while reading like a semver promise.
+
+Releases up to and including `v2026.11.1` used a four-digit year; their tags
+and images stay where they are.
 
 ## Verifying releases
 
@@ -729,7 +734,7 @@ under it):
 cosign verify \
   --certificate-identity-regexp '^https://github\.com/Screenly-Labs/wifi-connect/\.github/workflows/release\.yml@refs/tags/v.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/screenly-labs/wifi-connect:2026.10.0
+  ghcr.io/screenly-labs/wifi-connect:26.11.2
 ```
 
 Every file on a GitHub Release (binaries, tarballs, snaps and
@@ -737,10 +742,10 @@ Every file on a GitHub Release (binaries, tarballs, snaps and
 
 ```bash
 cosign verify-blob \
-  --bundle wifi-connect-2026.10.0-aarch64-unknown-linux-musl.tar.gz.sigstore.json \
+  --bundle wifi-connect-26.11.2-aarch64-unknown-linux-musl.tar.gz.sigstore.json \
   --certificate-identity-regexp '^https://github\.com/Screenly-Labs/wifi-connect/\.github/workflows/release\.yml@refs/tags/v.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  wifi-connect-2026.10.0-aarch64-unknown-linux-musl.tar.gz
+  wifi-connect-26.11.2-aarch64-unknown-linux-musl.tar.gz
 ```
 
 Verifying `SHA256SUMS` this way and then running `sha256sum -c SHA256SUMS
@@ -755,8 +760,8 @@ attestations, which record the commit and workflow run they were built
 from:
 
 ```bash
-gh attestation verify oci://ghcr.io/screenly-labs/wifi-connect:2026.10.0 -R Screenly-Labs/wifi-connect
-gh attestation verify wifi-connect-2026.10.0-aarch64-unknown-linux-musl.tar.gz -R Screenly-Labs/wifi-connect
+gh attestation verify oci://ghcr.io/screenly-labs/wifi-connect:26.11.2 -R Screenly-Labs/wifi-connect
+gh attestation verify wifi-connect-26.11.2-aarch64-unknown-linux-musl.tar.gz -R Screenly-Labs/wifi-connect
 ```
 
 Snaps installed from the Snap Store are additionally verified by `snapd`
