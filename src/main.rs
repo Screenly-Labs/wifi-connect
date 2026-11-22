@@ -325,13 +325,10 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
     let nm = match NmrsControl::connect(eap_server_check).await {
         Ok(nm) => nm,
         Err(e) => {
-            error!("{e}");
-            error!(
-                "the bus address comes from $DBUS_SYSTEM_BUS_ADDRESS, defaulting \
-                 to /var/run/dbus/system_bus_socket. In a balena container set the \
-                 io.balena.features.dbus label and point it at \
-                 unix:path=/host/run/dbus/system_bus_socket."
-            );
+            // One failure, one line: the hint rides along as a field. As a
+            // second `error!` it became a second Sentry event, and so a
+            // second issue, for every device that could not reach the bus.
+            error!(hint = DBUS_ADDRESS_HINT, "{e}");
             return ExitCode::from(5);
         }
     };
@@ -664,6 +661,13 @@ fn read_brand_logo(path: &std::path::Path) -> std::io::Result<state::BrandLogo> 
         content_type,
     })
 }
+
+/// How to point this process at NetworkManager, logged with the error when
+/// it cannot.
+const DBUS_ADDRESS_HINT: &str = "the bus address comes from $DBUS_SYSTEM_BUS_ADDRESS, \
+     defaulting to /var/run/dbus/system_bus_socket. In a balena container set the \
+     io.balena.features.dbus label and point it at \
+     unix:path=/host/run/dbus/system_bus_socket.";
 
 fn main() -> ExitCode {
     let args = Cli::parse_with_legacy_env();
