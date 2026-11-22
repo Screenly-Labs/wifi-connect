@@ -614,6 +614,10 @@ An empty `--sentry-dsn` turns it off too (on the snap,
 `snap set wifi-connect sentry-dsn=""`). A different DSN sends the reports
 to your own Sentry instead.
 
+A debug build (`cargo build` without `--release`) does not report to this
+project's DSN, so development and test runs stay out of its issue list.
+Pass `--sentry-dsn` explicitly to test reporting from one.
+
 What is sent:
 
 - a panic, with its message and source location;

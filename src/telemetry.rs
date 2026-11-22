@@ -37,7 +37,7 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::registry::LookupSpan;
 
-use crate::cli::Cli;
+use crate::cli::{Cli, DEFAULT_SENTRY_DSN};
 use crate::secret::Secret;
 
 /// What a redacted secret is replaced with.
@@ -74,6 +74,9 @@ pub fn redact(secret: &Secret) {
 ///
 /// Call after [`Cli::validate`], which rejects a DSN that does not parse.
 pub fn init(args: &Cli) -> Option<sentry::ClientInitGuard> {
+    if !reports_to(&args.sentry_dsn, cfg!(debug_assertions)) {
+        return None;
+    }
     let dsn = args.sentry_dsn().ok().flatten()?;
     Some(sentry::init((
         dsn,
@@ -86,6 +89,19 @@ pub fn init(args: &Cli) -> Option<sentry::ClientInitGuard> {
             .before_send(|event| Some(scrub_event(event)))
             .before_breadcrumb(|crumb| Some(scrub_breadcrumb(crumb))),
     )))
+}
+
+/// Should a build report to `dsn`?
+///
+/// A debug build is a developer's or a test rig's, never a device's: the
+/// release images and the snap are built with `--release`. Sentry tags
+/// such a build `environment=development`, but the events still land in
+/// this project's issue list, where a deliberately broken bus address on
+/// a CI box reads exactly like a fleet of devices that cannot reach
+/// NetworkManager. So a debug build does not use the project's own DSN.
+/// Passing one explicitly still works, for testing the reporting itself.
+fn reports_to(dsn: &str, debug_build: bool) -> bool {
+    !(debug_build && dsn == DEFAULT_SENTRY_DSN)
 }
 
 /// Run `f` with the registered secrets, unless there are none.
@@ -266,6 +282,15 @@ mod tests {
         });
         let sent = serde_json::to_string(&crumb).unwrap();
         assert!(!sent.contains(psk), "{sent}");
+    }
+
+    #[test]
+    fn a_debug_build_does_not_report_to_the_project_dsn() {
+        assert!(reports_to(DEFAULT_SENTRY_DSN, false));
+        assert!(!reports_to(DEFAULT_SENTRY_DSN, true));
+        // An explicit DSN is a deliberate choice, in any build.
+        assert!(reports_to("https://key@example.com/1", true));
+        assert!(reports_to("https://key@example.com/1", false));
     }
 
     #[test]
