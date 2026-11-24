@@ -160,10 +160,10 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/screenly-labs/wifi-connect
-          # CalVer, so: 2026.10.0 (exact), 2026.10 (latest patch that
-          # month), latest.
+          # CalVer YY.M.MICRO, so: 26.11.2 (exact), 26.11 (latest patch
+          # that month), latest.
           #
-          # No bare {{major}}: under CalVer that is `2026`, a tag whose
+          # No bare {{major}}: under CalVer that is `26`, a tag whose
           # meaning drifts for a whole year and which reads like a semver
           # compatibility promise this project does not make. Pin the exact
           # version or track latest.
