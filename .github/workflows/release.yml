@@ -95,7 +95,7 @@ jobs:
       # workflow run, and a release binary must not be linked against
       # build outputs this run did not produce. A clean build costs a few
       # minutes per tag; a poisoned cache would ship in every artifact.
-      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cross
       - run: cross build --release --locked --target ${{ matrix.target }}
