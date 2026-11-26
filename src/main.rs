@@ -667,7 +667,9 @@ fn read_brand_logo(path: &std::path::Path) -> std::io::Result<state::BrandLogo> 
 const DBUS_ADDRESS_HINT: &str = "the bus address comes from $DBUS_SYSTEM_BUS_ADDRESS, \
      defaulting to /var/run/dbus/system_bus_socket. In a balena container set the \
      io.balena.features.dbus label and point it at \
-     unix:path=/host/run/dbus/system_bus_socket.";
+     unix:path=/host/run/dbus/system_bus_socket. Under plain Docker, bind-mount \
+     the host's /run/dbus/system_bus_socket into the container and point it at \
+     unix:path=/run/dbus/system_bus_socket.";
 
 fn main() -> ExitCode {
     let args = Cli::parse_with_legacy_env();
