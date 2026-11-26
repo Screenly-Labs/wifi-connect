@@ -47,7 +47,7 @@ itself covers DHCP and DNS too, not merely an HTTPS credential POST.
 
 ## Quick start
 
-### Docker / balenaOS
+### balenaOS
 
 ```yaml
 services:
@@ -60,6 +60,28 @@ services:
       DBUS_SYSTEM_BUS_ADDRESS: 'unix:path=/host/run/dbus/system_bus_socket'
       PORTAL_SSID: 'Device Setup'
 ```
+
+### Docker
+
+The `io.balena.features.dbus` label only does something on balenaOS. Under
+plain Docker, bind-mount the host's system bus socket yourself. Without it
+the container has no bus to reach, and the run ends with exit code 5:
+
+```yaml
+services:
+  wifi-connect:
+    image: ghcr.io/screenly-labs/wifi-connect:26.11
+    network_mode: host        # required: see docker-compose.balena.yml
+    volumes:
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+    environment:
+      DBUS_SYSTEM_BUS_ADDRESS: 'unix:path=/run/dbus/system_bus_socket'
+      PORTAL_SSID: 'Device Setup'
+```
+
+Set `DBUS_SYSTEM_BUS_ADDRESS` explicitly as above. The image is built
+`FROM scratch`, so it has no `/var/run -> /run` symlink and the built-in
+default (`/var/run/dbus/system_bus_socket`) would not find the mounted socket.
 
 ### Ubuntu Core
 
