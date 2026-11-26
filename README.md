@@ -70,7 +70,7 @@ the container has no bus to reach, and the run ends with exit code 5:
 ```yaml
 services:
   wifi-connect:
-    image: ghcr.io/screenly-labs/wifi-connect:26.11
+    image: ghcr.io/screenly-labs/wifi-connect:2026.11
     network_mode: host        # required: see docker-compose.balena.yml
     volumes:
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
