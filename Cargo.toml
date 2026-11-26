@@ -47,7 +47,7 @@ hex = "0.4.3"
 hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
 ipnet = "2.12.2"
-qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+qrcode = { version = "0.15.0", default-features = false, features = ["svg"] }
 rand = "0.10.3"
 rust-embed = { version = "8.13.0", features = ["mime-guess", "debug-embed"] }
 serde = { version = "1.0.229", features = ["derive"] }
