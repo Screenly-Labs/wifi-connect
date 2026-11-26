@@ -2925,7 +2925,7 @@ dependencies = [
 
 [[package]]
 name = "wifi-connect"
-version = "26.11.2"
+version = "2026.11.1"
 dependencies = [
  "async-trait",
  "axum",
