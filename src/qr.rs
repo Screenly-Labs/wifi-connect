@@ -179,11 +179,17 @@ pub const SVG_FILE: &str = "wifi-connect-qr.svg";
 pub const TXT_FILE: &str = "wifi-connect-qr.txt";
 
 /// Remove QR files left in `dir` by a run that never got to drop its
-/// guard (killed, or the power went). Absent files are the normal case
-/// and cost nothing: no write reaches the disk.
+/// guard (killed, or the power went), including temporary files left
+/// before an atomic rename. Absent files are the normal case and cost
+/// nothing: no write reaches the disk.
 pub fn remove_stale(dir: &Path) {
     for name in [SVG_FILE, TXT_FILE] {
-        remove_published(&dir.join(name));
+        let path = dir.join(name);
+        remove_published(&path);
+        // Both names above have a filename, so temp_path cannot fail.
+        if let Ok(tmp) = crate::private_file::temp_path(&path) {
+            remove_published(&tmp);
+        }
     }
 }
 
@@ -396,5 +402,23 @@ mod tests {
         remove_stale(&dir.0);
 
         assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn interrupted_atomic_writes_leave_no_temporary_credentials() {
+        let dir = Scratch::new("stale-temp");
+        for name in [SVG_FILE, TXT_FILE] {
+            let tmp = dir.join(&format!(".{name}.tmp"));
+            fs::write(&tmp, b"WIFI:T:WPA;S:Setup;P:old;H:false;;").unwrap();
+        }
+        let unrelated = dir.join(".other.tmp");
+        fs::write(&unrelated, b"not ours").unwrap();
+
+        remove_stale(&dir.0);
+
+        for name in [SVG_FILE, TXT_FILE] {
+            assert!(!dir.join(&format!(".{name}.tmp")).exists());
+        }
+        assert!(unrelated.exists());
     }
 }

@@ -75,7 +75,7 @@ pub fn write(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// `dir/.name.tmp` — in the same directory, so the rename cannot cross a
 /// filesystem boundary and is atomic.
-fn temp_path(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn temp_path(path: &Path) -> io::Result<PathBuf> {
     let name = path.file_name().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,

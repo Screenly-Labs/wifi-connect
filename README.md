@@ -237,7 +237,8 @@ the network and therefore cannot be served over it:
   is the primary path. They are written only on a run that is going to
   raise the portal, never on one that finds the device already online, and
   a run clears any left by a predecessor that was killed before it could
-  remove its own. Both files contain the passphrase, so they are
+  remove its own, including temporary files from interrupted atomic writes.
+  Both files contain the passphrase, so they are
   written mode `0640` (a directory wifi-connect creates is `0750`),
   atomically, and never through a symlink at the target. The application
   displaying them must run as the same user or group as wifi-connect. The
