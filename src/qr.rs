@@ -137,10 +137,8 @@ impl JoinQr {
 /// lifetimes: the state file goes, the credential stays.
 ///
 /// A guard rather than a call at the end of `run()` for the same reason
-/// as the state file: the run has several exits, including the one taken
-/// before the portal is ever raised — the QR files are written *before*
-/// preflight decides a device is already online, so that path publishes
-/// a passphrase for an access point that never goes up.
+/// as the state file: the run has several exits after the QR is
+/// published, including every failure while the portal is up.
 ///
 /// Only the paths actually written are recorded, so a failed write or a
 /// file left by someone else is never removed.
@@ -172,6 +170,20 @@ impl Drop for QrFiles {
         for path in &self.paths {
             remove_published(path);
         }
+    }
+}
+
+/// The rendered join QR, published under `--qr-output`.
+pub const SVG_FILE: &str = "wifi-connect-qr.svg";
+/// The raw join payload, published beside [`SVG_FILE`].
+pub const TXT_FILE: &str = "wifi-connect-qr.txt";
+
+/// Remove QR files left in `dir` by a run that never got to drop its
+/// guard (killed, or the power went). Absent files are the normal case
+/// and cost nothing: no write reaches the disk.
+pub fn remove_stale(dir: &Path) {
+    for name in [SVG_FILE, TXT_FILE] {
+        remove_published(&dir.join(name));
     }
 }
 
@@ -356,5 +368,33 @@ mod tests {
         drop(files);
 
         assert!(blocker.exists());
+    }
+
+    /// A run killed before its guard dropped leaves the passphrase
+    /// behind; the next run clears it before doing anything else.
+    #[test]
+    fn stale_qr_files_from_a_killed_run_are_removed() {
+        let dir = Scratch::new("stale");
+        fs::write(dir.join(SVG_FILE), b"<svg/>").unwrap();
+        fs::write(dir.join(TXT_FILE), b"WIFI:T:WPA;S:Setup;P:old;H:false;;").unwrap();
+        let theirs = dir.join("something-else.txt");
+        fs::write(&theirs, b"not ours").unwrap();
+
+        remove_stale(&dir.0);
+
+        assert!(!dir.join(SVG_FILE).exists());
+        assert!(!dir.join(TXT_FILE).exists());
+        assert!(theirs.exists(), "removed a file wifi-connect never writes");
+    }
+
+    /// The common case on a device that is online: nothing to clear,
+    /// and nothing created.
+    #[test]
+    fn clearing_an_empty_directory_writes_nothing() {
+        let dir = Scratch::new("clean");
+
+        remove_stale(&dir.0);
+
+        assert_eq!(fs::read_dir(&dir.0).unwrap().count(), 0);
     }
 }
