@@ -104,7 +104,7 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) -> qr::QrFil
         if let Err(e) = private_file::create_dir(dir) {
             error!(error = %e, path = %dir.display(), "could not create the QR output directory");
         } else {
-            let svg = dir.join("wifi-connect-qr.svg");
+            let svg = dir.join(qr::SVG_FILE);
             match private_file::write(&svg, code.to_svg(512).as_bytes()) {
                 Ok(()) => {
                     info!(path = %svg.display(), "wrote the join QR code");
@@ -114,7 +114,7 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) -> qr::QrFil
             }
             // The raw payload too, so a host application can render the
             // code itself at whatever size its screen wants.
-            let txt = dir.join("wifi-connect-qr.txt");
+            let txt = dir.join(qr::TXT_FILE);
             match private_file::write(&txt, payload.as_bytes()) {
                 Ok(()) => qr_files.published(txt),
                 Err(e) => {
@@ -171,6 +171,27 @@ fn publish_qr(args: &Cli, ssid: &Ssid, passphrase: Option<&Secret>) -> qr::QrFil
     }
 
     qr_files
+}
+
+/// Make sure --qr-output is usable, and clear QR files a previous run left.
+///
+/// Runs before preflight on every start, so a directory that cannot be
+/// created is reported even on the runs that never raise a portal. Writes
+/// nothing when the directory exists: the QR itself is published only
+/// once a portal is needed.
+///
+/// A run that is killed (SIGKILL, power loss) never drops its `QrFiles`
+/// guard, so its passphrase would otherwise stay on disk until the next
+/// portal overwrote it. Removing it here keeps it to that one run.
+fn check_qr_output(args: &Cli) {
+    let Some(dir) = &args.qr_output else {
+        return;
+    };
+    if let Err(e) = private_file::create_dir(dir) {
+        error!(error = %e, path = %dir.display(), "could not create the QR output directory");
+        return;
+    }
+    qr::remove_stale(dir);
 }
 
 /// The /24 broadcast address for a gateway.
@@ -298,19 +319,11 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
     // user.
     let portal_ssid = ssid::with_random_suffix(&args.portal_ssid, args.portal_ssid_suffix);
     let ssid = Ssid::from(portal_ssid.as_str());
-    // Dropping this removes the files, so the passphrase does not outlive
-    // the access point. Every exit hands it to `wait_before_exit`, which
-    // drops it *before* waiting: with --recheck-interval or --retry-after
-    // set, the wait is most of the process's life, and a guard held to the
-    // end of `run()` kept the credential on disk for all of it. That
-    // includes the exits below which never raise an access point — the QR
-    // is published before preflight, so a device that turns out to be
-    // online already has written a credential it will not use.
-    //
-    // Published this early on purpose all the same, for the reason the
-    // branding files are read early: a --qr-output that cannot be written
-    // is reported on every run, not only on the day the portal is needed.
-    let qr_files = publish_qr(&args, &ssid, passphrase.as_ref());
+    // A --qr-output that cannot be used is reported here, on every run,
+    // for the reason the branding files are read early: otherwise it
+    // surfaces only on the day the portal is needed. The QR itself is not
+    // written until preflight has decided a portal is needed -- see below.
+    check_qr_output(&args);
 
     let eap_server_check = if args.insecure_eap_skip_server_verification {
         warn!(
@@ -355,7 +368,7 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
     let device = match app::preflight(&nm, &run_config).await {
         Ok(None) => {
             wait_before_exit(
-                qr_files,
+                (),
                 args.wait_before_exit(cli::ExitKind::Online),
                 "already online",
             )
@@ -366,7 +379,7 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
         Err(e) => {
             let code = app::report(&Err(e)) as u8;
             wait_before_exit(
-                qr_files,
+                (),
                 args.wait_before_exit(cli::ExitKind::Unproductive),
                 "the portal could not start",
             )
@@ -374,6 +387,20 @@ async fn run(args: Cli, dhcp_range: cli::DhcpRange) -> ExitCode {
             return ExitCode::from(code);
         }
     };
+
+    // Published only now that preflight has committed to a portal. As a
+    // schedule (`restart: always` plus --recheck-interval) this binary
+    // runs every few minutes on a device that is almost always online;
+    // writing the QR before preflight put a fresh passphrase on disk and
+    // unlinked it again on every one of those runs, for an access point
+    // that never went up -- around a thousand writes a day to an SD card.
+    //
+    // Dropping the guard removes the files, so the passphrase does not
+    // outlive the access point. Every exit from here hands it to
+    // `wait_before_exit`, which drops it *before* waiting: with
+    // --recheck-interval or --retry-after set, the wait is most of the
+    // process's life.
+    let qr_files = publish_qr(&args, &ssid, passphrase.as_ref());
 
     // The portal is going to come up: preflight said so, and the file is
     // written here rather than beside the QR so that a consumer can treat

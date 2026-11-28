@@ -234,7 +234,11 @@ the network and therefore cannot be served over it:
 
 - `--qr-output <dir>` writes `wifi-connect-qr.svg` plus the raw payload
   (`wifi-connect-qr.txt`), for a host application to show full-screen. This
-  is the primary path. Both files contain the passphrase, so they are
+  is the primary path. They are written only on a run that is going to
+  raise the portal, never on one that finds the device already online, and
+  a run clears any left by a predecessor that was killed before it could
+  remove its own, including temporary files from interrupted atomic writes.
+  Both files contain the passphrase, so they are
   written mode `0640` (a directory wifi-connect creates is `0750`),
   atomically, and never through a symlink at the target. The application
   displaying them must run as the same user or group as wifi-connect. The
@@ -523,9 +527,9 @@ wifi-connect --state-file /data/hotspot/state.json
 committed to raising the access point and is removed when the run ends,
 on every exit including the failures. It is deliberately not written by
 the runs that exit immediately because the device turned out to be
-online — which is exactly why `--qr-output`'s files cannot answer the
-question: they are written *before* that check, so a healthy device also
-has them.
+online. The `--qr-output` files follow the same rule (they are written
+only once a run has committed to a portal), but they are written before
+the access point is up, so `state.json` remains the signal to read.
 
 Do not probe the portal's HTTP listener to find out whether it is up.
 It is bound to the gateway address scoped to the wireless device, so
