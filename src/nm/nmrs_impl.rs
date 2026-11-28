@@ -128,6 +128,16 @@ impl NmrsControl {
         self.nm.dbus_connection()
     }
 
+    /// nmrs's `list_wifi_devices`, retried past a device vanishing
+    /// mid-listing; see [`retry_listing`].
+    async fn list_wifi_devices(&self) -> Result<Vec<nmrs::WifiDevice>, NetworkError> {
+        retry_listing(DEVICE_LIST_ATTEMPTS, DEVICE_LIST_RETRY_DELAY, || {
+            self.nm.list_wifi_devices()
+        })
+        .await
+        .map_err(|e| NetworkError::Other(e.to_string()))
+    }
+
     /// The first NetworkManager device other than ours that `matches`,
     /// as its interface name and device type.
     ///
@@ -728,22 +738,17 @@ fn features_of(s: &nmrs::SecurityFeatures) -> security::Features {
 #[async_trait::async_trait]
 impl NetworkControl for NmrsControl {
     async fn find_device(&self, interface: Option<&str>) -> Result<DeviceInfo, NetworkError> {
-        let devices = retry_listing(DEVICE_LIST_ATTEMPTS, DEVICE_LIST_RETRY_DELAY, || {
-            self.nm.list_wifi_devices()
-        })
-        .await;
+        let devices = self.list_wifi_devices().await;
         let device = match interface {
             // Any failure here used to read as "no such interface", which
             // sends someone checking cable and driver for what was a bus
             // error. It is still NoWifiDevice when the listing worked and
             // the name is simply not in it.
-            Some(name) => devices
-                .map_err(|e| NetworkError::Other(e.to_string()))?
+            Some(name) => devices?
                 .into_iter()
                 .find(|d| d.interface == name)
                 .ok_or(NetworkError::NoWifiDevice)?,
-            None => devices
-                .map_err(|e| NetworkError::Other(e.to_string()))?
+            None => devices?
                 .into_iter()
                 .next()
                 .ok_or(NetworkError::NoWifiDevice)?,
@@ -823,9 +828,19 @@ impl NetworkControl for NmrsControl {
     async fn station_activated(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
         // Best-effort: every failed read answers "not a station", which is
         // the behaviour from before this fallback existed — the portal
-        // comes up.
-        let dev = match self.nm.wifi_device_by_interface(&device.interface).await {
-            Ok(dev) => dev,
+        // comes up. The lookup is retried first, so a veth vanishing
+        // mid-listing does not raise a portal at a screen that is online.
+        let dev = match self.list_wifi_devices().await {
+            Ok(devices) => match devices
+                .into_iter()
+                .find(|d| d.interface == device.interface)
+            {
+                Some(dev) => dev,
+                None => {
+                    debug!(interface = %device.interface, "the WiFi device is no longer listed");
+                    return Ok(false);
+                }
+            },
             Err(e) => {
                 debug!(error = %e, "could not look up the WiFi device");
                 return Ok(false);
