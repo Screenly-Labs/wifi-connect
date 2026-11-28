@@ -440,6 +440,40 @@ pub async fn run_portal<N: NetworkControl>(
     outcome
 }
 
+/// Pauses before the second and third attempt to raise the access point.
+const AP_RAISE_BACKOFF: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
+
+/// Raise the access point, trying again when activation fails.
+///
+/// NetworkManager abandons an AP activation with "device disconnected"
+/// when something else takes the radio partway through: the scan that
+/// ran just before, a saved network's autoconnect, or the driver
+/// resetting. Those are momentary. Giving up on the first one ended the
+/// run with an error at exactly the moment the device needs a portal, and
+/// as a schedule that means `--retry-after` (hours) offline with no way
+/// back on. Each failed attempt removes its own profile, so trying again
+/// starts clean.
+async fn raise_ap_retrying<N: NetworkControl>(
+    nm: &N,
+    device: &DeviceInfo,
+    ap: &ApConfig,
+) -> Result<ApHandle, NetworkError> {
+    let mut backoff = AP_RAISE_BACKOFF.iter();
+    loop {
+        match nm.raise_ap(device, ap).await {
+            Ok(handle) => return Ok(handle),
+            Err(e @ NetworkError::ApFailed(_)) => match backoff.next() {
+                Some(delay) => {
+                    warn!(error = %e, retry_in_s = delay.as_secs(), "could not raise the access point; trying again");
+                    tokio::time::sleep(*delay).await;
+                }
+                None => return Err(e),
+            },
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn portal_loop<N: NetworkControl>(
     nm: &N,
     device: &DeviceInfo,
@@ -466,7 +500,7 @@ async fn portal_loop<N: NetworkControl>(
         // Raise (or re-raise) the access point. The SSID and passphrase are
         // byte-identical every time, which is what lets a phone that joined
         // once reassociate automatically after a failed attempt.
-        teardown.ap = Some(nm.raise_ap(device, &config.ap).await?);
+        teardown.ap = Some(raise_ap_retrying(nm, device, &config.ap).await?);
         shared.mark_ap_raised();
         info!(ssid = %config.ap.ssid, "access point is up; portal is live");
 
@@ -1269,6 +1303,63 @@ mod tests {
              autoconnect fights the portal for the radio: {calls:?}"
         );
         assert_eq!(nm.ap_raise_count(), 2);
+    }
+
+    /// WIFI-CONNECT-A: an AP activation NetworkManager abandons part-way
+    /// is momentary, and must not cost the device its portal.
+    #[tokio::test(start_paused = true)]
+    async fn an_access_point_that_fails_to_come_up_is_tried_again() {
+        let nm = FakeNm::new().with_failing_ap_raises(2);
+        let device = nm.find_device(None).await.unwrap();
+        let started = tokio::time::Instant::now();
+
+        let handle = raise_ap_retrying(&nm, &device, &config().ap).await;
+
+        assert!(handle.is_ok(), "{handle:?}");
+        let raises = nm
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::RaiseAp { .. }))
+            .count();
+        assert_eq!(raises, 3);
+        assert_eq!(started.elapsed(), Duration::from_secs(7));
+    }
+
+    /// A radio that never takes AP mode is still reported, after a
+    /// bounded number of attempts.
+    #[tokio::test(start_paused = true)]
+    async fn an_access_point_that_never_comes_up_is_reported() {
+        let mut nm = FakeNm::new();
+        nm.ap_fails = true;
+        let device = nm.find_device(None).await.unwrap();
+
+        let handle = raise_ap_retrying(&nm, &device, &config().ap).await;
+
+        assert!(matches!(handle, Err(NetworkError::ApFailed(_))));
+        let raises = nm
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::RaiseAp { .. }))
+            .count();
+        assert_eq!(raises, 1 + AP_RAISE_BACKOFF.len());
+    }
+
+    /// The portal loop itself survives a first raise that fails.
+    #[tokio::test(start_paused = true)]
+    async fn the_portal_comes_up_after_a_failed_first_raise() {
+        let nm = FakeNm::new().with_failing_ap_raises(1);
+        let (shared, rx) = shared();
+        let device = nm.find_device(None).await.unwrap();
+        let cancel = CancellationToken::new();
+        let handle = {
+            let (nm, shared, cancel, cfg) = (nm.clone(), shared.clone(), cancel.clone(), config());
+            tokio::spawn(async move { run_portal(&nm, &device, &cfg, &shared, rx, cancel).await })
+        };
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(nm.ap_raise_count(), 1, "the second raise must succeed");
+        cancel.cancel();
+        assert_eq!(handle.await.unwrap().unwrap(), Outcome::Cancelled);
     }
 
     /// Submit one join that fails, let the portal come back, then stop.
