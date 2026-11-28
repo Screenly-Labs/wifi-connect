@@ -65,6 +65,49 @@ pub enum EapServerCheck {
     Insecure,
 }
 
+/// How many times to list NetworkManager's devices before giving up.
+const DEVICE_LIST_ATTEMPTS: u32 = 4;
+/// The pause between those attempts.
+const DEVICE_LIST_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Run a device listing, retrying it when it fails.
+///
+/// nmrs lists devices by fetching NetworkManager's device paths and then
+/// reading each one, and any read that fails fails the whole listing. A
+/// device that goes away between the two steps does exactly that, with
+/// `org.freedesktop.DBus.Error.UnknownMethod: Object does not exist at
+/// path /org/freedesktop/NetworkManager/Devices/N`. Devices go away all
+/// the time on a container host: every container start and stop adds or
+/// removes a veth interface, which NetworkManager tracks as a device.
+///
+/// Losing that race ended the run at preflight with an error, which as a
+/// schedule means `--retry-after` (hours) before the next check of whether
+/// a portal is needed. Listing is a read, so trying again is safe; by the
+/// next attempt the vanished device is no longer in the list.
+async fn retry_listing<T, E, F, Fut>(attempts: u32, delay: Duration, mut list: F) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut attempt = 1;
+    loop {
+        match list().await {
+            Ok(devices) => return Ok(devices),
+            Err(e) if attempt < attempts => {
+                debug!(
+                    error = %e,
+                    attempt,
+                    "listing NetworkManager's devices failed; trying again"
+                );
+                attempt += 1;
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl NmrsControl {
     pub async fn connect(eap_server_check: EapServerCheck) -> Result<Self, NetworkError> {
         // nmrs calls zbus's `Connection::system()`, which honours
@@ -83,6 +126,16 @@ impl NmrsControl {
 
     fn bus(&self) -> &zbus::Connection {
         self.nm.dbus_connection()
+    }
+
+    /// nmrs's `list_wifi_devices`, retried past a device vanishing
+    /// mid-listing; see [`retry_listing`].
+    async fn list_wifi_devices(&self) -> Result<Vec<nmrs::WifiDevice>, NetworkError> {
+        retry_listing(DEVICE_LIST_ATTEMPTS, DEVICE_LIST_RETRY_DELAY, || {
+            self.nm.list_wifi_devices()
+        })
+        .await
+        .map_err(|e| NetworkError::Other(e.to_string()))
     }
 
     /// The first NetworkManager device other than ours that `matches`,
@@ -685,17 +738,17 @@ fn features_of(s: &nmrs::SecurityFeatures) -> security::Features {
 #[async_trait::async_trait]
 impl NetworkControl for NmrsControl {
     async fn find_device(&self, interface: Option<&str>) -> Result<DeviceInfo, NetworkError> {
+        let devices = self.list_wifi_devices().await;
         let device = match interface {
-            Some(name) => self
-                .nm
-                .wifi_device_by_interface(name)
-                .await
-                .map_err(|_| NetworkError::NoWifiDevice)?,
-            None => self
-                .nm
-                .list_wifi_devices()
-                .await
-                .map_err(|e| NetworkError::Other(e.to_string()))?
+            // Any failure here used to read as "no such interface", which
+            // sends someone checking cable and driver for what was a bus
+            // error. It is still NoWifiDevice when the listing worked and
+            // the name is simply not in it.
+            Some(name) => devices?
+                .into_iter()
+                .find(|d| d.interface == name)
+                .ok_or(NetworkError::NoWifiDevice)?,
+            None => devices?
                 .into_iter()
                 .next()
                 .ok_or(NetworkError::NoWifiDevice)?,
@@ -775,9 +828,19 @@ impl NetworkControl for NmrsControl {
     async fn station_activated(&self, device: &DeviceInfo) -> Result<bool, NetworkError> {
         // Best-effort: every failed read answers "not a station", which is
         // the behaviour from before this fallback existed — the portal
-        // comes up.
-        let dev = match self.nm.wifi_device_by_interface(&device.interface).await {
-            Ok(dev) => dev,
+        // comes up. The lookup is retried first, so a veth vanishing
+        // mid-listing does not raise a portal at a screen that is online.
+        let dev = match self.list_wifi_devices().await {
+            Ok(devices) => match devices
+                .into_iter()
+                .find(|d| d.interface == device.interface)
+            {
+                Some(dev) => dev,
+                None => {
+                    debug!(interface = %device.interface, "the WiFi device is no longer listed");
+                    return Ok(false);
+                }
+            },
             Err(e) => {
                 debug!(error = %e, "could not look up the WiFi device");
                 return Ok(false);
@@ -1690,5 +1753,57 @@ mod tests {
         // The startup sweep matches on it, so renaming it would orphan
         // profiles left behind by an older build.
         assert_eq!(AP_PROFILE_ID, "wifi-connect-portal");
+    }
+
+    /// The field failure: a veth goes away mid-listing, and the next
+    /// listing no longer contains it.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_vanishing_mid_listing_is_retried() {
+        let calls = std::cell::Cell::new(0);
+        let listed = retry_listing(4, Duration::from_millis(250), || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move {
+                if n == 1 {
+                    Err("Object does not exist at path /org/freedesktop/NetworkManager/Devices/21")
+                } else {
+                    Ok(vec!["wlan0"])
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(listed, Ok(vec!["wlan0"]));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// A bus that is really gone is still reported, after a bounded
+    /// number of tries rather than forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_that_keeps_failing_gives_up() {
+        let calls = std::cell::Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let listed: Result<Vec<&str>, &str> = retry_listing(4, Duration::from_millis(250), || {
+            calls.set(calls.get() + 1);
+            async { Err("the bus went away") }
+        })
+        .await;
+
+        assert_eq!(listed, Err("the bus went away"));
+        assert_eq!(calls.get(), 4);
+        assert_eq!(started.elapsed(), Duration::from_millis(750));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_that_works_is_not_repeated() {
+        let calls = std::cell::Cell::new(0);
+        let listed: Result<u8, &str> = retry_listing(4, Duration::from_millis(250), || {
+            calls.set(calls.get() + 1);
+            async { Ok(1) }
+        })
+        .await;
+
+        assert_eq!(listed, Ok(1));
+        assert_eq!(calls.get(), 1);
     }
 }
