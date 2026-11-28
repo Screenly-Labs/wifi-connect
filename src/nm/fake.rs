@@ -87,6 +87,8 @@ struct State {
     calls: Vec<Call>,
     join_results: Vec<JoinOutcome>,
     ap_raises: u32,
+    /// How many of the next raises fail before one succeeds.
+    ap_failures_left: u32,
     joins: u32,
     profiles: Vec<FakeProfile>,
     /// Switched at run time with `set_another_device_online`, for a
@@ -128,6 +130,7 @@ impl FakeNm {
                 calls: Vec::new(),
                 join_results: Vec::new(),
                 ap_raises: 0,
+                ap_failures_left: 0,
                 joins: 0,
                 profiles: Vec::new(),
                 another_device_online: None,
@@ -260,6 +263,13 @@ impl FakeNm {
         self
     }
 
+    /// Make the next `n` raises fail, as an activation NetworkManager
+    /// abandons would, and the ones after succeed.
+    pub fn with_failing_ap_raises(self, n: u32) -> Self {
+        self.state.lock().unwrap().ap_failures_left = n;
+        self
+    }
+
     pub fn calls(&self) -> Vec<Call> {
         self.state.lock().unwrap().calls.clone()
     }
@@ -346,10 +356,11 @@ impl NetworkControl for FakeNm {
             ssid: config.ssid.to_display_string(),
             encrypted: config.passphrase.is_some(),
         });
-        if self.ap_fails {
+        let mut state = self.state.lock().unwrap();
+        if self.ap_fails || state.ap_failures_left > 0 {
+            state.ap_failures_left = state.ap_failures_left.saturating_sub(1);
             return Err(NetworkError::ApFailed("scripted failure".into()));
         }
-        let mut state = self.state.lock().unwrap();
         state.ap_raises += 1;
         // A fresh UUID per raise, as the real implementation mints one, so
         // a test can tell which raise a teardown was aimed at.

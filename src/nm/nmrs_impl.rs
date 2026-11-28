@@ -956,6 +956,11 @@ impl NetworkControl for NmrsControl {
         };
         let settings = ap_settings(&profile);
 
+        // The scan that runs just before this, or a retry after a failed
+        // activation, can leave the radio busy; activating then is what
+        // NetworkManager abandons with "device disconnected".
+        self.wait_until_device_idle(&device.interface).await;
+
         // `specific_object` is "/" for AP mode: there is no access point to
         // target, we are becoming one.
         if let Err(e) = self
