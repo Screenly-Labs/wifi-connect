@@ -108,6 +108,40 @@ where
     }
 }
 
+/// How many times to look for the radio before reporting there is none.
+const RADIO_ATTEMPTS: u32 = 3;
+/// The pause between those looks.
+const RADIO_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Look for the radio, and look again if it is not there.
+///
+/// A radio can drop out of NetworkManager's device list for a moment, as
+/// when its driver restarts the firmware and the interface registers anew.
+/// Concluding "no WiFi device" from one look ended the run, and as a
+/// schedule that is `--retry-after` (hours) before the next check. A
+/// machine that has no radio at all only pays the few seconds of the
+/// second and third look, once per run.
+async fn wait_for_radio<T, F, Fut>(
+    attempts: u32,
+    delay: Duration,
+    mut find: F,
+) -> Result<Option<T>, NetworkError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, NetworkError>>,
+{
+    for attempt in 1..=attempts {
+        if let Some(found) = find().await? {
+            return Ok(Some(found));
+        }
+        if attempt < attempts {
+            debug!(attempt, "no WiFi device listed yet; looking again");
+            tokio::time::sleep(delay).await;
+        }
+    }
+    Ok(None)
+}
+
 impl NmrsControl {
     pub async fn connect(eap_server_check: EapServerCheck) -> Result<Self, NetworkError> {
         // nmrs calls zbus's `Connection::system()`, which honours
@@ -738,21 +772,19 @@ fn features_of(s: &nmrs::SecurityFeatures) -> security::Features {
 #[async_trait::async_trait]
 impl NetworkControl for NmrsControl {
     async fn find_device(&self, interface: Option<&str>) -> Result<DeviceInfo, NetworkError> {
-        let devices = self.list_wifi_devices().await;
-        let device = match interface {
-            // Any failure here used to read as "no such interface", which
-            // sends someone checking cable and driver for what was a bus
-            // error. It is still NoWifiDevice when the listing worked and
-            // the name is simply not in it.
-            Some(name) => devices?
-                .into_iter()
-                .find(|d| d.interface == name)
-                .ok_or(NetworkError::NoWifiDevice)?,
-            None => devices?
-                .into_iter()
-                .next()
-                .ok_or(NetworkError::NoWifiDevice)?,
-        };
+        // Any listing failure used to read as "no such interface", which
+        // sends someone checking cable and driver for what was a bus
+        // error. It is still NoWifiDevice when the listing worked and the
+        // radio is simply not in it -- after a short second look.
+        let device = wait_for_radio(RADIO_ATTEMPTS, RADIO_RETRY_DELAY, || async {
+            let devices = self.list_wifi_devices().await?;
+            Ok(match interface {
+                Some(name) => devices.into_iter().find(|d| d.interface == name),
+                None => devices.into_iter().next(),
+            })
+        })
+        .await?
+        .ok_or(NetworkError::NoWifiDevice)?;
 
         let (capabilities, mode, driver_extra) = self.device_extras(&device.path).await;
         if mode == WIFI_MODE_AP {
@@ -1792,6 +1824,54 @@ mod tests {
         assert_eq!(listed, Err("the bus went away"));
         assert_eq!(calls.get(), 4);
         assert_eq!(started.elapsed(), Duration::from_millis(750));
+    }
+
+    /// A radio that re-registers is found on a later look.
+    #[tokio::test(start_paused = true)]
+    async fn a_radio_missing_for_a_moment_is_found() {
+        let calls = std::cell::Cell::new(0);
+        let found = wait_for_radio(3, Duration::from_secs(2), || {
+            calls.set(calls.get() + 1);
+            let n = calls.get();
+            async move { Ok((n == 2).then_some("wlan0")) }
+        })
+        .await;
+
+        assert_eq!(found.unwrap(), Some("wlan0"));
+        assert_eq!(calls.get(), 2);
+    }
+
+    /// A machine with no radio gets its answer after a bounded wait.
+    #[tokio::test(start_paused = true)]
+    async fn no_radio_is_reported_after_a_bounded_wait() {
+        let calls = std::cell::Cell::new(0);
+        let started = tokio::time::Instant::now();
+        let found: Result<Option<&str>, NetworkError> =
+            wait_for_radio(3, Duration::from_secs(2), || {
+                calls.set(calls.get() + 1);
+                async { Ok(None) }
+            })
+            .await;
+
+        assert_eq!(found.unwrap(), None);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+    }
+
+    /// A listing error is not a missing radio: it is returned at once,
+    /// not looked at again here (the listing retries its own errors).
+    #[tokio::test(start_paused = true)]
+    async fn a_listing_error_is_not_retried_as_a_missing_radio() {
+        let calls = std::cell::Cell::new(0);
+        let found: Result<Option<&str>, NetworkError> =
+            wait_for_radio(3, Duration::from_secs(2), || {
+                calls.set(calls.get() + 1);
+                async { Err(NetworkError::Other("bus".into())) }
+            })
+            .await;
+
+        assert!(matches!(found, Err(NetworkError::Other(_))));
+        assert_eq!(calls.get(), 1);
     }
 
     #[tokio::test(start_paused = true)]
