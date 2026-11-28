@@ -629,7 +629,10 @@ failed unit.
 ## Error reporting
 
 Panics and errors are reported to Sentry, because a portal that fails
-does so on a device nobody is watching. It is on by default. To turn it
+does so on a device nobody is watching. It is on by default. Exits 3 and
+4 are not reported: they describe the machine (no radio, or one that
+cannot host the portal), so they are logged as warnings rather than
+filed as errors on every scheduled run. To turn it
 off, pass `--no-sentry` or set any one of these:
 
 - `WIFI_CONNECT_NO_SENTRY=true` (or `1`, `yes`, `on`) in the environment,

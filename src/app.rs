@@ -590,6 +590,24 @@ async fn delete_profiles_created_since<N: NetworkControl>(
     }
 }
 
+/// Whether a failure describes the machine rather than a fault: no radio,
+/// a radio that cannot host an access point, one NetworkManager does not
+/// manage, or one that is blocked. Exit codes 3 and 4, which the README
+/// lists as endings nobody can act on.
+///
+/// These are logged, but as warnings, so they do not reach Sentry as
+/// errors: they are the steady state of the device, not something that
+/// went wrong on it.
+fn is_hardware_fact(e: &NetworkError) -> bool {
+    matches!(
+        e,
+        NetworkError::NoWifiDevice
+            | NetworkError::ApUnsupported { .. }
+            | NetworkError::Unmanaged(_)
+            | NetworkError::RadioBlocked
+    )
+}
+
 /// Resolve the exit code and log the reason.
 pub fn report(result: &Result<Outcome, NetworkError>) -> i32 {
     match result {
@@ -598,7 +616,14 @@ pub fn report(result: &Result<Outcome, NetworkError>) -> i32 {
             outcome.exit_code()
         }
         Err(e) => {
-            error!("{e}");
+            if is_hardware_fact(e) {
+                // Still a breadcrumb on any later error, but not an event:
+                // a Pi 2 without a radio would otherwise report the same
+                // "error" on every scheduled run, forever.
+                warn!("{e}");
+            } else {
+                error!("{e}");
+            }
             match e {
                 NetworkError::NoWifiDevice => 3,
                 NetworkError::ApUnsupported { .. }
@@ -1547,6 +1572,38 @@ mod tests {
         handle.await.unwrap().unwrap();
 
         assert!(nm.ap_raise_count() >= 1);
+    }
+
+    /// Exactly the non-actionable endings (exit 3 and 4) stay out of
+    /// error reporting; everything someone can fix is still an error.
+    #[test]
+    fn only_hardware_facts_are_kept_out_of_error_reporting() {
+        let facts = || {
+            [
+                NetworkError::NoWifiDevice,
+                NetworkError::ApUnsupported {
+                    interface: "wlan0".into(),
+                    driver: "x".into(),
+                },
+                NetworkError::Unmanaged("wlan0".into()),
+                NetworkError::RadioBlocked,
+            ]
+        };
+        for e in facts() {
+            assert!(is_hardware_fact(&e), "{e}");
+        }
+        for e in facts() {
+            assert!(matches!(report(&Err(e)), 3 | 4));
+        }
+
+        for e in [
+            NetworkError::Unreachable("bus".into()),
+            NetworkError::PortalUnavailable("in use".into()),
+            NetworkError::ApFailed("x".into()),
+            NetworkError::Other("x".into()),
+        ] {
+            assert!(!is_hardware_fact(&e), "{e}");
+        }
     }
 
     #[test]
